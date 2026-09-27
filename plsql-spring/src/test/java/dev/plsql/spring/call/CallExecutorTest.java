@@ -178,9 +178,26 @@ class CallExecutorTest {
     void nullsAreTypedNulls() throws SQLException {
         CallPlan p = planner.plan(m("insert"), proc(null, "P_INSERT").in("NTENANT", "NUMBER").in("SNAME", "VARCHAR2")
                 .out("NRN", "NUMBER").build());
+        when(cs.getBigDecimal(3)).thenReturn(BigDecimal.ONE);
         new CallExecutor(100).execute(con, p, new Object[]{null, null});
         verify(cs).setNull(1, Types.NUMERIC);
         verify(cs).setNull(2, Types.VARCHAR);
+    }
+
+    /**
+     * Проверяет, что {@code NULL} в результате, который объявлен примитивом ({@code long}), —
+     * ошибка с именем OUT-аргумента, как в Spring Data, а не молчаливый 0.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void nullIntoAPrimitiveResultIsAnError() throws SQLException {
+        CallPlan p = planner.plan(m("insert"), proc(null, "P_INSERT").in("NTENANT", "NUMBER").in("SNAME", "VARCHAR2")
+                .out("NRN", "NUMBER").build());
+        assertThatThrownBy(() -> new CallExecutor(100).execute(con, p, new Object[]{1L, "x"}))
+                .isInstanceOf(org.springframework.dao.EmptyResultDataAccessException.class)
+                .hasMessageContaining("OUT argument NRN returned NULL")
+                .hasMessageContaining("declare Long or Optional");
     }
 
     /**

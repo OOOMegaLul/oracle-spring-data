@@ -93,8 +93,8 @@ class ValuesTest {
 
     /**
      * Проверяет числа и логические значения. Из базы: {@code BigDecimal} становится
-     * {@code long}, 1 и {@code "Y"} — {@code true}, {@code null} для примитива — ноль, для
-     * обёртки — {@code null}. В базу: дробное число и {@code boolean} становятся
+     * {@code long}, 1 и {@code "Y"} — {@code true}, {@code null} для обёртки — {@code null}, а
+     * для примитива — ошибка, как в Spring Data (а не молчаливый ноль). В базу: дробное число и {@code boolean} становятся
      * {@code BigDecimal}, а {@code "true"} для аргумента {@code BOOLEAN} — числом 1 ({@code null}
      * так и остаётся {@code null}).
      */
@@ -103,7 +103,10 @@ class ValuesTest {
         assertThat(convert(new BigDecimal("42"), long.class)).isEqualTo(42L);
         assertThat(convert(BigDecimal.ONE, boolean.class)).isEqualTo(true);
         assertThat(convert("Y", Boolean.class)).isEqualTo(true);
-        assertThat(convert(null, int.class)).isEqualTo(0);
+        assertThat(convert(null, Integer.class)).isNull();
+        assertThatThrownBy(() -> convert(null, int.class))
+                .isInstanceOf(org.springframework.dao.EmptyResultDataAccessException.class)
+                .hasMessageContaining("NULL cannot be returned as int; declare Integer or Optional");
         assertThat(convert(null, Long.class)).isNull();
         assertThat(Values.toNumber(3.5)).isEqualByComparingTo("3.5");
         assertThat(Values.toNumber(true)).isEqualByComparingTo("1");

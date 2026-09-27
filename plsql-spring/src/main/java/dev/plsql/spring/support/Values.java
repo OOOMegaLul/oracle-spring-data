@@ -40,6 +40,8 @@ import org.springframework.beans.PropertyAccessorFactory;
 import org.springframework.core.CollectionFactory;
 import org.springframework.core.ResolvableType;
 import org.springframework.core.convert.support.DefaultConversionService;
+import org.springframework.dao.EmptyResultDataAccessException;
+import org.springframework.util.ClassUtils;
 import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 import org.xml.sax.InputSource;
@@ -419,8 +421,10 @@ public final class Values {
      * <ul>
      *   <li>{@code Optional<X>} — значение приводится к {@code X} и заворачивается в
      *       {@code Optional};</li>
-     *   <li>{@code null} для примитивного типа становится значением по умолчанию
-     *       ({@code 0}, {@code false}), иначе остаётся {@code null};</li>
+     *   <li>{@code null} остаётся {@code null}, а для примитивного типа ({@code long},
+     *       {@code boolean}...) это ошибка, как в Spring Data: {@code NULL} не превращается молча
+     *       в {@code 0} или {@code false}, для него нужен {@code Long}, {@code Boolean} или
+     *       {@code Optional};</li>
      *   <li>{@link Clob} сначала читается в строку и освобождается;</li>
      *   <li>если нужен {@code Object} или значение уже нужного типа (кроме коллекций и карт,
      *       у которых надо привести элементы), оно возвращается как есть;</li>
@@ -449,6 +453,7 @@ public final class Values {
      *                               создать
      * @throws org.springframework.core.convert.ConversionException если Spring не умеет
      *                               преобразовать значение в нужный тип
+     * @throws EmptyResultDataAccessException если значение {@code null}, а тип примитивный
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     public static Object convert(Object v, ResolvableType target) {
@@ -457,7 +462,12 @@ public final class Values {
             return Optional.ofNullable(convert(v, target.getGeneric(0)));
         }
         if (v == null) {
-            return raw.isPrimitive() ? primitiveDefault(raw) : null;
+            if (raw.isPrimitive() && raw != void.class) {
+                // Как в Spring Data: NULL не превращается молча в 0 или false.
+                throw new EmptyResultDataAccessException("NULL cannot be returned as " + raw.getName() + "; declare "
+                        + ClassUtils.resolvePrimitiveIfNecessary(raw).getSimpleName() + " or Optional instead", 1);
+            }
+            return null;
         }
         if (v instanceof Clob c) {
             v = clobToString(c);
@@ -518,7 +528,7 @@ public final class Values {
      * <p>Для record каждому компоненту ищется ключ (с {@link Arg} — по имени из аннотации
      * без учёта регистра, иначе по правилам {@link NameMatcher}), значение приводится к
      * типу компонента через {@link #convert}, и вызывается канонический конструктор.
-     * Компонент без ключа получает {@code null} (или значение по умолчанию для примитива).
+     * Компонент без ключа получает {@code null}; примитивный компонент без значения — ошибка.
      *
      * <p>Бин создаётся конструктором без аргументов, после чего заполняются свойства с
      * setter'ом, для которых нашёлся ключ (с учётом {@link Arg} на поле, getter'е или
@@ -637,12 +647,14 @@ public final class Values {
          * @param byKey значения по номерам ключей
          * @return новый record или бин
          * @throws IllegalStateException если record не удалось создать
+         * @throws EmptyResultDataAccessException если примитивному компоненту (у record — и
+         *                                        компоненту без ключа) досталось {@code NULL}
          */
         Object build(Object[] byKey) {
             if (constructor != null) {
                 Object[] args = new Object[names.length];
                 for (int i = 0; i < args.length; i++) {
-                    args[i] = convert(keyIndex[i] < 0 ? null : byKey[keyIndex[i]], types[i]);
+                    args[i] = component(i, keyIndex[i] < 0 ? null : byKey[keyIndex[i]]);
                 }
                 try {
                     return constructor.newInstance(args);
@@ -654,10 +666,27 @@ public final class Values {
             BeanWrapper bw = PropertyAccessorFactory.forBeanPropertyAccess(bean);
             for (int i = 0; i < names.length; i++) {
                 if (keyIndex[i] >= 0) {
-                    bw.setPropertyValue(names[i], convert(byKey[keyIndex[i]], types[i]));
+                    bw.setPropertyValue(names[i], component(i, byKey[keyIndex[i]]));
                 }
             }
             return bean;
+        }
+
+        /**
+         * Приводит значение к типу компонента; ошибку «NULL в примитив» дополняет именем класса и
+         * компонента, чтобы было видно, какое поле пришло пустым.
+         *
+         * @param i номер компонента
+         * @param v значение из базы
+         * @return значение нужного типа
+         * @throws EmptyResultDataAccessException если значение {@code null}, а тип примитивный
+         */
+        private Object component(int i, Object v) {
+            try {
+                return convert(v, types[i]);
+            } catch (EmptyResultDataAccessException e) {
+                throw new EmptyResultDataAccessException(type.getSimpleName() + "." + names[i] + ": " + e.getMessage(), 1, e);
+            }
         }
 
         /**
@@ -813,26 +842,4 @@ public final class Values {
         return List.of(v);
     }
 
-    /**
-     * Возвращает значение по умолчанию для примитивного типа, когда из базы пришёл
-     * {@code NULL}: в примитив нельзя положить {@code null}.
-     *
-     * <p>{@code boolean} — {@code false}, {@code char} — {@code '\0'}, {@code void} —
-     * {@code null}, числовые типы — ноль нужного типа.
-     *
-     * @param c примитивный тип
-     * @return значение по умолчанию (упакованное) или {@code null} для {@code void}
-     */
-    private static Object primitiveDefault(Class<?> c) {
-        if (c == boolean.class) {
-            return false;
-        }
-        if (c == void.class) {
-            return null;
-        }
-        if (c == char.class) {
-            return '\0';
-        }
-        return CONVERSION.convert(0, c);
-    }
 }

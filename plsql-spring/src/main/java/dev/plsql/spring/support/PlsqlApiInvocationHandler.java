@@ -21,6 +21,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.ResolvableType;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.dao.IncorrectResultSizeDataAccessException;
 import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.jdbc.core.ArgumentPreparedStatementSetter;
@@ -286,6 +287,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             }
             CallPlan plan = plans.get(method);
             return unitOfWork(task, plan.sql(), rt.retryDiscardedState(), con -> rt.executor().execute(con, plan, args));
+        } catch (EmptyResultDataAccessException e) {
+            // NULL в примитивный результат: называем метод, иначе по сообщению не понять, где это.
+            throw new EmptyResultDataAccessException(describe(method) + ": " + e.getMessage(), e.getExpectedSize(), e);
         } finally {
             if (log.isDebugEnabled()) {
                 log.debug("{} {} ms", task, (System.nanoTime() - t0) / 1_000_000);
@@ -476,7 +480,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * возвращается число изменённых строк, приведённое к типу возврата ({@code int}, {@code long},
      * {@code boolean} — «изменилась ли хоть одна»), или {@code null} для {@code void}. Если вернул
      * строки: для коллекции — список, для {@code Optional} — {@code Optional}, иначе единственная
-     * строка или {@code null}, если строк нет.
+     * строка или {@code null}, если строк нет. Нет строк (или в строке {@code NULL}), а метод
+     * возвращает примитив ({@code int}, {@code long}...) — это ошибка, а не молчаливый 0.
      *
      * @param con  соединение текущей единицы работы
      * @param q    разобранный запрос
@@ -486,6 +491,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @throws IncorrectResultSizeDataAccessException если метод ждёт одну строку, а пришло несколько
      * @throws InvalidDataAccessApiUsageException если оператор вернул число изменённых строк, а
      *         метод ждёт коллекцию, {@code Optional} или объект
+     * @throws EmptyResultDataAccessException если метод возвращает примитив, а строк нет или в
+     *         строке {@code NULL}
      * @throws CharsetGuard.UnrepresentableCharacterException если строковый аргумент нельзя сохранить
      *         в кодировке базы
      */
@@ -541,6 +548,11 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 throw new IncorrectResultSizeDataAccessException(1, rows.size());
             }
             Object one = rows.isEmpty() ? null : rows.get(0);
+            if (rows.isEmpty() && q.element().resolve(Object.class).isPrimitive()) {
+                throw new EmptyResultDataAccessException("the query returned no rows; declare "
+                        + ClassUtils.resolvePrimitiveIfNecessary(q.element().resolve(Object.class)).getSimpleName()
+                        + " or Optional instead", 1);
+            }
             return q.optional() ? Optional.ofNullable(one) : Values.convert(one, q.element());
         });
     }

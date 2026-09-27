@@ -83,13 +83,15 @@ public record CallPlan(
          * выходных значений превращается в {@code returnType}: компоненты record или свойства
          * бина заполняются по именам OUT-аргументов. Иначе в {@code returnType} превращается
          * одно значение, лежащее под {@code returnKey}. Преобразование выполняет
-         * {@code Values.convert}: например, оборачивает значение в {@code Optional}, а
-         * {@code NULL} для примитивного типа заменяет значением по умолчанию (например,
-         * {@code 0} или {@code false}).
+         * {@code Values.convert}: например, оборачивает значение в {@code Optional}. {@code NULL}
+         * для примитивного типа — ошибка с именем выхода: {@code NULL} не превращается молча в
+         * {@code 0} или {@code false}.
          *
          * @param outs выходные значения по ключам {@link CallPlan.Bind#outKey()}; поля
          *             записей к этому моменту уже собраны в карты
          * @return значение, которое вернёт Java-метод
+         * @throws org.springframework.dao.EmptyResultDataAccessException если результат или его
+         *         примитивный компонент {@code NULL}
          */
         public Object assemble(Map<String, Object> outs) {
             Class<?> raw = returnType.resolve(Object.class);
@@ -99,7 +101,12 @@ public record CallPlan(
             if (outsToType) {
                 return dev.plsql.spring.support.Values.convert(outs, returnType);
             }
-            return dev.plsql.spring.support.Values.convert(outs.get(returnKey), returnType);
+            try {
+                return dev.plsql.spring.support.Values.convert(outs.get(returnKey), returnType);
+            } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+                String what = CallPlanner.RETURN_KEY.equals(returnKey) ? "the function" : "OUT argument " + returnKey;
+                throw new org.springframework.dao.EmptyResultDataAccessException(what + " returned NULL: " + e.getMessage(), 1, e);
+            }
         }
     }
 }

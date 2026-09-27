@@ -172,4 +172,26 @@ class RowMappersTest {
                 .isSameAs(RowMappers.forType(Immutable.class));
         assertThat(RowMappers.forType(Row.class)).isNotInstanceOf(DataClassRowMapper.class);
     }
+
+    /**
+     * Проверяет, что {@code NULL} в колонке, которая ложится на примитивный компонент
+     * ({@code long id}), — ошибка с именем record и компонента, а не молчаливый 0.
+     *
+     * @throws SQLException не бросается: драйвер подменён
+     */
+    @Test
+    void nullIntoAPrimitiveComponentIsAnError() throws SQLException {
+        ResultSet rs = mock(ResultSet.class);
+        ResultSetMetaData md = mock(ResultSetMetaData.class);
+        when(rs.getMetaData()).thenReturn(md);
+        when(md.getColumnCount()).thenReturn(2);
+        when(md.getColumnLabel(1)).thenReturn("ID");
+        when(md.getColumnLabel(2)).thenReturn("NAME");
+        when(rs.next()).thenReturn(true, false);
+        when(rs.wasNull()).thenReturn(true);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> RowMappers.mapAll(rs, ResolvableType.forClass(Joined.class)))
+                .isInstanceOf(org.springframework.dao.EmptyResultDataAccessException.class)
+                .hasMessageContaining("Joined.id: NULL cannot be returned as long");
+    }
 }
