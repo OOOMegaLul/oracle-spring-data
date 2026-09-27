@@ -68,7 +68,7 @@ class DictionaryIT {
 
     /**
      * Проверяет, что у аргумента объектного типа {@code LAB_OBJ} ({@code ECHO_OBJ}) есть атрибуты
-     * {@code ID}, {@code NAME}, {@code DT}, а у коллекции {@code LAB_OBJ_TAB} ({@code COUNT_OBJS})
+     * {@code ID}, {@code NAME}, {@code DT}, а у коллекции {@code LAB_OBJ_TAB} ({@code NAME_CHARS})
      * вид {@code SQL_COLLECTION} и элемент с теми же атрибутами.
      *
      * <p>{@code ALL_ARGUMENTS} описывает PL/SQL-записи поле за полем, но на объектных SQL-типах
@@ -80,7 +80,7 @@ class DictionaryIT {
         ArgumentInfo obj = only("ECHO_OBJ").arguments().get(0);
         assertThat(obj.kind()).isEqualTo(ArgKind.OBJECT);
         assertThat(obj.children()).extracting(ArgumentInfo::name).containsExactly("ID", "NAME", "DT");
-        ArgumentInfo coll = only("COUNT_OBJS").arguments().get(0);
+        ArgumentInfo coll = only("NAME_CHARS").arguments().get(0);
         assertThat(coll.kind()).isEqualTo(ArgKind.SQL_COLLECTION);
         assertThat(coll.children().get(0).children()).extracting(ArgumentInfo::name).containsExactly("ID", "NAME", "DT");
     }
