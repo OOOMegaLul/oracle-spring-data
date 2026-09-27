@@ -93,10 +93,13 @@ public class CallExecutor {
      *   <li>из пулового соединения достаётся «настоящее» соединение ojdbc
      *       ({@link OracleConnection}): только оно умеет создавать LOB, {@code Struct} и
      *       {@code Array};</li>
+     *   <li>входные значения вычисляются из аргументов метода, и текст (строки, {@code CLOB},
+     *       {@code XMLTYPE}, строки index-by таблиц) проверяется на кодировку базы — до того,
+     *       как что-либо уходит драйверу;</li>
      *   <li>текст блока готовится как {@link CallableStatement} — оператор JDBC, у которого
      *       есть не только входные, но и выходные позиции;</li>
      *   <li>для каждой позиции плана по порядку: если у неё есть источник входного
-     *       значения, значение вычисляется из аргументов метода и привязывается; если у неё
+     *       значения, вычисленное значение привязывается; если у неё
      *       есть ключ выхода, позиция регистрируется как OUT. У {@code IN OUT} делается и
      *       то и другое;</li>
      *   <li>блок выполняется, после чего все OUT-позиции читаются в карту «ключ выхода —
@@ -123,12 +126,21 @@ public class CallExecutor {
         List<Object> temporaries = new ArrayList<>();
         OracleConnection oc = con.unwrap(OracleConnection.class);
         Throwable failure = null;
+        List<CallPlan.Bind> binds = plan.binds();
+        // Значения вычисляются и текст проверяется до того, как что-либо уходит драйверу.
+        Object[] values = new Object[binds.size()];
+        for (int i = 0; i < binds.size(); i++) {
+            CallPlan.Bind b = binds.get(i);
+            if (b.in() != null) {
+                values[i] = b.in().apply(a);
+                precheck(b, values[i]);
+            }
+        }
         try (CallableStatement cs = con.prepareCall(plan.sql())) {
-            List<CallPlan.Bind> binds = plan.binds();
             for (int i = 0; i < binds.size(); i++) {
                 CallPlan.Bind b = binds.get(i);
                 if (b.in() != null) {
-                    bindIn(cs, oc, i + 1, b, b.in().apply(a), temporaries);
+                    bindIn(cs, oc, i + 1, b, values[i], temporaries);
                 }
                 if (b.outKey() != null) {
                     registerOut(cs, i + 1, b);
@@ -213,7 +225,8 @@ public class CallExecutor {
      *   <li>{@code INDEX_TABLE} — через {@code setPlsqlIndexTable}, расширение ojdbc для
      *       index-by таблиц. Элементы передаются массивом {@link BigDecimal} или строк;
      *       {@code null} превращается в пустую таблицу. Ёмкость — не меньше одного элемента,
-     *       длина строкового элемента — до 4000.</li>
+     *       длина строкового элемента — по самой длинной строке, до 32766 (больше драйвер
+     *       не принимает).</li>
      * </ul>
      *
      * @param cs          подготовленный вызов блока
@@ -311,7 +324,7 @@ public class CallExecutor {
                 OracleCallableStatement ocs = cs.unwrap(OracleCallableStatement.class);
                 ocs.setPlsqlIndexTable(idx, values, Math.max(values.length, 1), values.length,
                         el.kind() == ArgKind.NUMBER ? OracleTypes.NUMBER : OracleTypes.VARCHAR,
-                        el.kind() == ArgKind.NUMBER ? 0 : 4000);
+                        el.kind() == ArgKind.NUMBER ? 0 : longest(values, b.arg()));
             }
             default -> throw new IllegalStateException("cannot bind " + b.kind() + " as IN");
         }
@@ -330,9 +343,42 @@ public class CallExecutor {
      * @throws CharsetGuard.UnrepresentableCharacterException если текст нельзя сохранить
      */
     private void guard(ArgumentInfo arg, String s) {
-        String type = arg.dataType() == null ? "" : arg.dataType();
-        if (!type.startsWith("N")) { // NVARCHAR2 / NCHAR / NCLOB используют национальный набор символов
+        if (!isNational(arg)) {
             charsetGuard.check(arg.name() == null ? "value" : arg.name(), s);
+        }
+    }
+
+    /**
+     * Проверяет, хранится ли текст этого типа в национальном наборе символов базы
+     * ({@code NVARCHAR2}, {@code NCHAR}, {@code NCLOB}), а не в основном.
+     *
+     * @param arg описание аргумента, поля или элемента
+     * @return {@code true} для типов, чьё имя начинается с {@code N}
+     */
+    private static boolean isNational(ArgumentInfo arg) {
+        return arg.dataType() != null && arg.dataType().startsWith("N");
+    }
+
+    /**
+     * Проверяет текст входного значения на кодировку базы до того, как вызов уходит драйверу.
+     *
+     * <p>Проверяются строки, {@code CLOB} (по нему же идёт текст для {@code XMLTYPE}) и строки
+     * index-by таблиц. Текст внутри объектов и коллекций SQL проверяется при их сборке — тоже до
+     * выполнения блока, но уже после того, как драйвер прочитал описание их типов.
+     *
+     * @param b позиция плана
+     * @param v вычисленное значение
+     * @throws CharsetGuard.UnrepresentableCharacterException если текст нельзя сохранить
+     */
+    private void precheck(CallPlan.Bind b, Object v) {
+        if (v == null) {
+            return;
+        }
+        switch (b.kind()) {
+            case STRING, CLOB -> guard(b.arg(), Values.toText(v));
+            case INDEX_TABLE -> elements(v, b.arg().children().get(0), b.arg());
+            default -> {
+            }
         }
     }
 
@@ -341,9 +387,10 @@ public class CallExecutor {
      * {@code setPlsqlIndexTable}.
      *
      * <p>Для таблицы чисел получается {@code BigDecimal[]}, для остальных — {@code String[]}.
-     * Каждая непустая строка проверяется на кодировку базы; в сообщении об ошибке она
-     * называется как {@code ИМЯ_ТАБЛИЦЫ[n]}, где {@code n} считается с единицы.
-     * {@code null} в элементах сохраняется.
+     * Каждая непустая строка проверяется на кодировку базы (кроме таблиц {@code NVARCHAR2}, у
+     * которых свой, национальный набор символов); в сообщении об ошибке она называется как
+     * {@code ИМЯ_ТАБЛИЦЫ[n]}, где {@code n} считается с единицы. {@code null} в элементах
+     * сохраняется.
      *
      * @param v     коллекция, массив объектов или {@code null} (даёт пустой массив)
      * @param el    описание элемента таблицы
@@ -360,13 +407,86 @@ public class CallExecutor {
                 out[i++] = Values.toNumber(o);
             } else {
                 String s = o == null ? null : Values.toText(o);
-                if (s != null) {
+                if (s != null && !isNational(el)) {
                     charsetGuard.check(table.name() + "[" + (i + 1) + "]", s);
                 }
                 out[i++] = s;
             }
         }
         return out;
+    }
+
+    /**
+     * Самая длинная строка index-by таблицы — столько драйвер резервирует под каждый элемент.
+     *
+     * @param values строки таблицы, среди них может быть {@code null}
+     * @param table  описание таблицы, для сообщения об ошибке
+     * @return длина самой длинной строки, не меньше 1
+     * @throws IllegalArgumentException если строка длиннее 32766 символов: больше драйвер в
+     *                                  элемент index-by таблицы не передаёт
+     */
+    private static int longest(Object[] values, ArgumentInfo table) {
+        int max = 1;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] instanceof String s && s.length() > max) {
+                if (s.length() > MAX_PLSQL_VARCHAR) {
+                    throw new IllegalArgumentException(table.name() + "[" + (i + 1) + "] is " + s.length()
+                            + " characters; an index-by table element can hold at most " + MAX_PLSQL_VARCHAR);
+                }
+                max = s.length();
+            }
+        }
+        return max;
+    }
+
+    /**
+     * Самая длинная строка элемента index-by таблицы, которую принимает драйвер: 32766
+     * (измерено на ojdbc 19; на 32767 он отвечает ORA-17053 «недопустимый размер»).
+     */
+    private static final int MAX_PLSQL_VARCHAR = 32766;
+
+    /**
+     * Сколько символов разрешено резервировать под одну выходную index-by таблицу строк.
+     *
+     * <p>Драйвер выделяет память сразу на {@code indexTableMaxLength} элементов по
+     * объявленной длине каждый, сколько бы строк процедура ни вернула: на 11.2.0.4 это около
+     * 4,75 байта на символ резерва (10 000 × 4000 — 190 МБ и 58 мс на вызов, 10 000 × 100 —
+     * 4 МБ и 2 мс). Предел 50 млн символов — около 240 МБ; больше — ошибка при старте, а не
+     * нехватка памяти под нагрузкой.
+     */
+    static final long MAX_INDEX_TABLE_RESERVE = 50_000_000L;
+
+    /**
+     * Проверяет при старте, что вызов по плану можно выполнить с настройками этого исполнителя.
+     *
+     * <p>Сейчас проверяется одно: резерв под выходные index-by таблицы строк
+     * ({@code indexTableMaxLength} × объявленная длина элемента) не больше
+     * {@link #MAX_INDEX_TABLE_RESERVE}.
+     *
+     * @param plan план вызова
+     * @throws CallPlanner.PlanException если резерв слишком велик; сообщение называет аргумент,
+     *                                   примерный объём памяти и допустимое
+     *                                   {@code indexTableMaxLength}
+     */
+    public void verify(CallPlan plan) {
+        for (CallPlan.Bind b : plan.binds()) {
+            if (b.outKey() == null || b.kind() != ArgKind.INDEX_TABLE || b.arg().children().isEmpty()) {
+                continue;
+            }
+            ArgumentInfo el = b.arg().children().get(0);
+            if (el.kind() == ArgKind.NUMBER) {
+                continue;
+            }
+            int len = declaredLength(el);
+            long reserve = (long) indexTableMaxLength * len;
+            if (reserve > MAX_INDEX_TABLE_RESERVE) {
+                String who = b.arg().name() == null ? "return value" : b.arg().name();
+                throw new CallPlanner.PlanException("OUT index-by table " + who + " of " + el.dataType() + "(" + len
+                        + ") would reserve about " + reserve * 19 / 4 / 1_048_576 + " MB per call for "
+                        + indexTableMaxLength + " elements; lower plsql.index-table-max-length to "
+                        + MAX_INDEX_TABLE_RESERVE / len + " or less");
+            }
+        }
     }
 
     /**
@@ -497,7 +617,8 @@ public class CallExecutor {
      *   <li>{@code SQL_COLLECTION} и {@code OBJECT} — {@code ARRAY} и {@code STRUCT} с полным
      *       именем типа SQL;</li>
      *   <li>{@code INDEX_TABLE} — {@code registerIndexTableOutParameter}: драйвер резервирует
-     *       место под {@code indexTableMaxLength} элементов, строковый элемент — до 4000.</li>
+     *       место под {@code indexTableMaxLength} элементов, строковый элемент — по объявленной длине
+     *       (см. {@code declaredLength}).</li>
      * </ul>
      *
      * @param cs  подготовленный вызов блока
@@ -521,7 +642,7 @@ public class CallExecutor {
                 ArgumentInfo el = b.arg().children().get(0);
                 cs.unwrap(OracleCallableStatement.class).registerIndexTableOutParameter(idx, indexTableMaxLength,
                         el.kind() == ArgKind.NUMBER ? OracleTypes.NUMBER : OracleTypes.VARCHAR,
-                        el.kind() == ArgKind.NUMBER ? 0 : 4000);
+                        el.kind() == ArgKind.NUMBER ? 0 : declaredLength(el));
             }
             default -> throw new IllegalStateException("cannot read " + b.kind() + " as OUT");
         }
@@ -598,6 +719,21 @@ public class CallExecutor {
     }
 
     /**
+     * Длина строкового элемента выходной index-by таблицы: столько драйвер резервирует под
+     * каждый из {@code indexTableMaxLength} элементов.
+     *
+     * <p>Берётся объявленная длина ({@code VARCHAR2(100)} — 100) из словаря, но не больше 32766
+     * (больше драйвер не принимает); если словарь её не сообщил, — 4000.
+     *
+     * @param el описание элемента таблицы
+     * @return длина в символах, от 1 до 32766
+     */
+    private static int declaredLength(ArgumentInfo el) {
+        Integer n = el.charLength();
+        return n == null ? 4000 : Math.max(1, Math.min(n, MAX_PLSQL_VARCHAR));
+    }
+
+    /**
      * Читает все строки выходного курсора ({@code REF CURSOR}) и закрывает его.
      *
      * <p>{@code REF CURSOR} ({@code SYS_REFCURSOR}) — ссылка на запрос, который процедура
@@ -606,14 +742,14 @@ public class CallExecutor {
      * {@link RowMappers#mapAll}). После чтения курсор закрывается, иначе он оставался бы
      * открытым в сессии.
      *
-     * <p>Если процедура курсор не открыла (ORA-24338), возвращается {@code null}, а не
-     * ошибка.
+     * <p>Если процедура курсор не открыла (ORA-24338), строк нет: возвращается пустой список,
+     * а не ошибка и не {@code null}.
      *
      * @param cs     выполненный вызов блока
      * @param idx    номер позиции {@code ?}, с единицы
      * @param target тип Java, куда идёт значение (например, {@code List<Employee>}),
      *               или {@code null}
-     * @return список строк или {@code null}, если курсора нет
+     * @return список строк; пустой, если курсор не открыт
      * @throws SQLException если драйвер не смог отдать курсор или прочитать строку
      */
     private static List<Object> readCursor(CallableStatement cs, int idx, ResolvableType target) throws SQLException {
@@ -622,12 +758,12 @@ public class CallExecutor {
             rs = (ResultSet) cs.getObject(idx);
         } catch (SQLException e) {
             if (e.getErrorCode() == CURSOR_NOT_OPENED) {
-                return null;
+                return List.of();
             }
             throw e;
         }
         if (rs == null) {
-            return null;
+            return List.of();
         }
         try (rs) {
             return RowMappers.mapAll(rs, elementType(target));
@@ -663,8 +799,9 @@ public class CallExecutor {
      * Превращает {@link Struct}, прочитанный из базы, в карту «имя атрибута — значение».
      *
      * <p>Атрибуты сопоставляются с описанием типа по порядку объявления; ключ — имя
-     * атрибута PL/SQL. Вложенные объекты и коллекции разбираются рекурсивно. Лишние
-     * атрибуты без описания пропускаются. В record или бин карту превращает потом
+     * атрибута PL/SQL. Вложенные объекты и коллекции разбираются рекурсивно, атрибуты
+     * {@code CLOB} и {@code BLOB} читаются в строку и массив байтов, а сами LOB освобождаются.
+     * Лишние атрибуты без описания пропускаются. В record или бин карту превращает потом
      * {@link Values#convert}.
      *
      * @param s   объект из базы
@@ -682,6 +819,14 @@ public class CallExecutor {
                 v = fromStruct(inner, f);
             } else if (v instanceof Array arr) {
                 v = fromArray(arr, f);
+            } else if (v instanceof Clob c) {
+                v = Values.clobToString(c);
+            } else if (v instanceof Blob bl) {
+                try {
+                    v = bl.getBytes(1, (int) bl.length());
+                } finally {
+                    bl.free();
+                }
             }
             m.put(f.name(), v);
         }

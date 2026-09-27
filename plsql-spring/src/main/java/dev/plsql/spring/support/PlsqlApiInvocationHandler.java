@@ -9,6 +9,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,17 +22,18 @@ import org.slf4j.LoggerFactory;
 import org.springframework.core.ResolvableType;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.IncorrectResultSizeDataAccessException;
+import org.springframework.dao.InvalidDataAccessApiUsageException;
 import org.springframework.jdbc.core.ArgumentPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.PreparedStatementCallback;
 import org.springframework.jdbc.core.PreparedStatementCreator;
-import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterUtils;
 import org.springframework.jdbc.core.namedparam.ParsedSql;
 import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.jdbc.datasource.SingleConnectionDataSource;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.util.ClassUtils;
 
 import dev.plsql.spring.annotation.Arg;
 import dev.plsql.spring.annotation.PlsqlApi;
@@ -105,7 +107,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      *       процедуры и функции). Сигнатуры — списки аргументов с типами, по одному на каждую
      *       перегрузку — читаются из словаря данных Oracle (системного каталога с описанием
      *       объектов базы) через {@link PlsqlRuntime#signatures()};</li>
-     *   <li>{@link CallPlanner} подбирает для метода подходящую перегрузку и строит {@link CallPlan}.</li>
+     *   <li>{@link CallPlanner} подбирает для метода подходящую перегрузку и строит {@link CallPlan};
+     *       исполнитель проверяет, что план выполним с его настройками (например, что выходная
+     *       index-by таблица не потребует сотен мегабайт на вызов).</li>
      * </ul>
      *
      * <p>Сначала все сигнатуры интерфейса читаются за один заход; если это не удалось, каждая
@@ -141,10 +145,14 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             }
             SqlQuery q = m.getAnnotation(SqlQuery.class);
             if (q != null) {
+                if (m.isAnnotationPresent(Procedure.class)) {
+                    problems.add(describe(m) + ": has both @SqlQuery and @Procedure; keep one");
+                    continue;
+                }
                 try {
                     queries.put(m, QueryPlan.of(m, q.value()));
                 } catch (RuntimeException e) {
-                    problems.add(describe(m) + ": " + firstLine(e.getMessage()));
+                    problems.add(describe(m) + ": " + message(e));
                 }
                 continue;
             }
@@ -161,14 +169,16 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         }
         for (Method m : calls) {
             String name = subprogramName(m);
-            String target = (pkg != null ? pkg + "." : "") + name;
+            String target = (schema != null ? schema + "." : "") + (pkg != null ? pkg + "." : "") + name;
             try {
                 List<SubprogramInfo> overloads = signatures != null ? signatures.get(name) : rt.signatures().find(schema, pkg, name);
-                plans.put(m, rt.planner().plan(m, overloads == null ? List.of() : overloads));
+                CallPlan plan = rt.planner().plan(m, overloads == null ? List.of() : overloads);
+                rt.executor().verify(plan);
+                plans.put(m, plan);
             } catch (CallPlanner.PlanException e) {
                 problems.add(describe(m) + " -> " + target + ": " + e.getMessage());
             } catch (RuntimeException e) {
-                problems.add(describe(m) + " -> " + target + ": " + firstLine(e.getMessage()));
+                problems.add(describe(m) + " -> " + target + ": " + message(e));
             }
         }
         if (!problems.isEmpty()) {
@@ -206,20 +216,29 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     /**
      * Возвращает сгенерированный блок PL/SQL, который стоит за методом прокси, — для логов и тестов.
      *
-     * <p>Метод ищется только по имени. Если в интерфейсе несколько перегруженных методов с таким
-     * именем, возвращается блок одного из них (порядок методов в JDK не определён). Для объекта,
-     * который не является прокси этой библиотеки, падает с исключением JDK
-     * ({@code IllegalArgumentException} или {@code ClassCastException}).
+     * <p>Метод ищется по имени, а если переданы типы параметров — ещё и по ним. Если методов с
+     * таким именем несколько, а типы не переданы, это ошибка: какой из них имеется в виду, не
+     * угадывается. Для объекта, который не является прокси этой библиотеки, падает с исключением
+     * JDK ({@code IllegalArgumentException} или {@code ClassCastException}).
      *
-     * @param proxy      прокси, созданный {@link #create}
-     * @param methodName имя метода Java
+     * @param proxy          прокси, созданный {@link #create}
+     * @param methodName     имя метода Java
+     * @param parameterTypes типы параметров, чтобы выбрать из перегрузок; можно не передавать
      * @return текст анонимного блока; {@code null}, если такого метода нет или он помечен
      *         {@code @SqlQuery}
+     * @throws IllegalArgumentException если по имени подходят несколько методов, а типы не переданы
      */
-    public static String sqlOf(Object proxy, String methodName) {
+    public static String sqlOf(Object proxy, String methodName, Class<?>... parameterTypes) {
         PlsqlApiInvocationHandler h = (PlsqlApiInvocationHandler) Proxy.getInvocationHandler(proxy);
-        return h.plans.entrySet().stream().filter(e -> e.getKey().getName().equals(methodName))
-                .map(e -> e.getValue().sql()).findFirst().orElse(null);
+        List<CallPlan> found = h.plans.entrySet().stream()
+                .filter(e -> e.getKey().getName().equals(methodName))
+                .filter(e -> parameterTypes.length == 0 || Arrays.equals(e.getKey().getParameterTypes(), parameterTypes))
+                .map(Map.Entry::getValue).toList();
+        if (found.size() > 1) {
+            throw new IllegalArgumentException(found.size() + " methods are named " + methodName
+                    + "; pass the parameter types");
+        }
+        return found.isEmpty() ? null : found.get(0).sql();
     }
 
     /**
@@ -231,9 +250,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      *   <li>default-метод интерфейса выполняется как обычный код Java
      *       ({@link InvocationHandler#invokeDefault});</li>
      *   <li>метод с {@code @SqlQuery} выполняет свой SQL;</li>
-     *   <li>остальные методы вызывают процедуру по готовому плану; время вызова пишется в лог на
-     *       уровне DEBUG.</li>
+     *   <li>остальные методы вызывают процедуру по готовому плану.</li>
      * </ul>
+     * Время и запроса, и вызова пишется в лог на уровне DEBUG.
      * Запрос и вызов процедуры выполняются как единица работы ({@code unitOfWork}). Повтор после
      * ORA-04068 разрешён только для процедур и только если включён
      * {@link PlsqlRuntime#retryDiscardedState()}.
@@ -258,18 +277,18 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         if (method.isDefault()) {
             return InvocationHandler.invokeDefault(proxy, method, args);
         }
-        QueryPlan q = queries.get(method);
-        if (q != null) {
-            return unitOfWork(describe(method), q.sql(), false, con -> query(con, q, args));
-        }
-        CallPlan plan = plans.get(method);
         long t0 = System.nanoTime();
+        QueryPlan q = queries.get(method);
+        String task = q != null ? describe(method) : plans.get(method).target().qualifiedName();
         try {
-            return unitOfWork(plan.target().qualifiedName(), plan.sql(), rt.retryDiscardedState(),
-                    con -> rt.executor().execute(con, plan, args));
+            if (q != null) {
+                return unitOfWork(task, q.sql(), false, con -> query(con, q, args, task));
+            }
+            CallPlan plan = plans.get(method);
+            return unitOfWork(task, plan.sql(), rt.retryDiscardedState(), con -> rt.executor().execute(con, plan, args));
         } finally {
             if (log.isDebugEnabled()) {
-                log.debug("{} {} ms", plan.target().qualifiedName(), (System.nanoTime() - t0) / 1_000_000);
+                log.debug("{} {} ms", task, (System.nanoTime() - t0) / 1_000_000);
             }
         }
     }
@@ -309,9 +328,12 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * <p>ORA-04068 означает, что пакет перекомпилировали, пока сессия держала его состояние
      * (значения переменных пакета): Oracle сбрасывает это состояние и откатывает изменения данных
      * неудачного вызова.
-     * Если {@code retry} включён, такой вызов (и родственные ошибки, см.
-     * {@link PlsqlExceptionTranslator#isStateDiscarded}) повторяется один раз; соединение при этом
-     * запрашивается заново, внутри транзакции это то же самое соединение. Остальные
+     * Если {@code retry} включён и вызов идёт вне транзакции Spring, такой вызов (и родственные
+     * ошибки, см. {@link PlsqlExceptionTranslator#isStateDiscarded}) повторяется один раз на заново
+     * взятом соединении: пул и {@code SessionContextDataSource} готовят его сессию с нуля. Внутри
+     * транзакции Spring повтора нет: соединение то же, а всё, что предыдущие вызовы транзакции
+     * положили в переменные пакетов (контекст пользователя, организацию), уже стёрто, и повтор
+     * молча работал бы без этого контекста. Ошибка уходит наружу, и транзакция откатывается. Остальные
      * {@link SQLException} переводятся в исключения Spring через {@link PlsqlExceptionTranslator}.
      * Исключения времени выполнения и ошибки JVM пробрасываются как есть, после отката своей
      * единицы работы.
@@ -325,9 +347,10 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     private Object unitOfWork(String task, String sql, boolean retry, Work work) {
         for (int attempt = 0; ; attempt++) {
             Connection con = DataSourceUtils.getConnection(rt.dataSource());
+            boolean inTransaction = TransactionSynchronizationManager.isActualTransactionActive();
             boolean own = false;
             try {
-                own = !TransactionSynchronizationManager.isActualTransactionActive() && !con.getAutoCommit();
+                own = !inTransaction && !con.getAutoCommit();
                 Object result = work.run(con);
                 if (own) {
                     con.commit();
@@ -335,7 +358,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 return result;
             } catch (SQLException e) {
                 rollbackQuietly(con, own);
-                if (retry && attempt == 0 && PlsqlExceptionTranslator.isStateDiscarded(e)) {
+                if (retry && attempt == 0 && !inTransaction && PlsqlExceptionTranslator.isStateDiscarded(e)) {
                     log.warn("{}: package state discarded (ORA-{}), calling again", task, e.getErrorCode());
                     continue;
                 }
@@ -384,13 +407,12 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @param many       метод возвращает коллекцию: нужны все строки
      * @param optional   метод возвращает {@code Optional}: одна строка или пусто
      * @param element    тип одной строки результата: элемент коллекции, содержимое {@code Optional}
-     *                   или сам тип возврата
-     * @param mapper     как превратить строку {@code ResultSet} в {@code element}: запись или бин —
-     *                   по именам колонок, простой тип — из единственной колонки, {@code Map} или
-     *                   {@code Object} — в {@code Map}; {@code null} для {@code void}-методов
+     *                   или сам тип возврата; строки превращаются в него через
+     *                   {@link RowMappers#mapAll}
+     * @param noResult   метод объявлен как {@code void}: результат не нужен
      */
     private record QueryPlan(String sql, ParsedSql parsed, String[] names, ResolvableType returnType,
-                             boolean many, boolean optional, ResolvableType element, RowMapper<?> mapper) {
+                             boolean many, boolean optional, ResolvableType element, boolean noResult) {
 
         /**
          * Разбирает SQL метода и определяет, как отдавать результат.
@@ -402,8 +424,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
          * которого у метода нет, исключение возникает здесь, при старте, а не при первом вызове.
          *
          * <p>По типу возврата: коллекция — все строки; {@code Optional} — одна строка или пусто;
-         * иначе одна строка (или число изменённых строк для DML). Для {@code void} и {@code Void}
-         * преобразователь строк не создаётся.
+         * иначе одна строка (или число изменённых строк для DML).
          *
          * @param m   метод интерфейса с {@code @SqlQuery}
          * @param sql текст из аннотации
@@ -428,10 +449,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             boolean many = Collection.class.isAssignableFrom(raw);
             boolean optional = raw == Optional.class;
             ResolvableType element = many ? rt.asCollection().getGeneric(0) : optional ? rt.getGeneric(0) : rt;
-            Class<?> elementClass = element.resolve(Object.class);
-            RowMapper<?> mapper = elementClass == void.class || elementClass == Void.class
-                    ? null : RowMappers.forType(elementClass);
-            return new QueryPlan(sql, parsed, names, rt, many, optional, element, mapper);
+            boolean noResult = raw == void.class || raw == Void.class;
+            return new QueryPlan(sql, parsed, names, rt, many, optional, element, noResult);
         }
     }
 
@@ -454,19 +473,23 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * </ul>
      *
      * <p>Результат: если оператор не вернул строк (DML: {@code insert}, {@code update}...),
-     * возвращается число изменённых строк, приведённое к типу возврата, или {@code null} для
-     * {@code void}. Если вернул строки: для коллекции — список, для {@code Optional} —
-     * {@code Optional}, иначе единственная строка или {@code null}, если строк нет.
+     * возвращается число изменённых строк, приведённое к типу возврата ({@code int}, {@code long},
+     * {@code boolean} — «изменилась ли хоть одна»), или {@code null} для {@code void}. Если вернул
+     * строки: для коллекции — список, для {@code Optional} — {@code Optional}, иначе единственная
+     * строка или {@code null}, если строк нет.
      *
      * @param con  соединение текущей единицы работы
      * @param q    разобранный запрос
      * @param args аргументы вызова в порядке параметров метода
+     * @param task название метода для сообщений об ошибках
      * @return результат, приведённый к типу возврата метода
      * @throws IncorrectResultSizeDataAccessException если метод ждёт одну строку, а пришло несколько
+     * @throws InvalidDataAccessApiUsageException если оператор вернул число изменённых строк, а
+     *         метод ждёт коллекцию, {@code Optional} или объект
      * @throws CharsetGuard.UnrepresentableCharacterException если строковый аргумент нельзя сохранить
      *         в кодировке базы
      */
-    private Object query(Connection con, QueryPlan q, Object[] args) {
+    private Object query(Connection con, QueryPlan q, Object[] args, String task) {
         MapSqlParameterSource params = new MapSqlParameterSource();
         for (int i = 0; i < q.names().length; i++) {
             Object v = args[i];
@@ -480,8 +503,13 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         JdbcTemplate jdbc = new JdbcTemplate(new SingleConnectionDataSource(con, true));
         // Тот же перевод ошибок, что и у вызовов процедур: RAISE_APPLICATION_ERROR из триггера
         // здесь тоже бизнес-ошибка.
-        jdbc.setExceptionTranslator((task, s, ex) ->
-                rt.translator().translate(task, s, ex) instanceof DataAccessException d ? d : null);
+        jdbc.setExceptionTranslator((ignored, s, ex) -> {
+            RuntimeException r = rt.translator().translate(task, s, ex);
+            if (r instanceof DataAccessException d) {
+                return d;
+            }
+            throw r; // свой переводчик может вернуть и не DataAccessException
+        });
         PreparedStatementCreator creator = c -> {
             PreparedStatement ps = c.prepareStatement(sql);
             new ArgumentPreparedStatementSetter(values).setValues(ps);
@@ -489,18 +517,22 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         };
         return jdbc.execute(creator, (PreparedStatementCallback<Object>) ps -> {
             if (!ps.execute()) {
-                Class<?> raw = q.returnType().resolve(Object.class);
-                return raw == void.class || raw == Void.class ? null : Values.convert(ps.getUpdateCount(), q.returnType());
+                if (q.noResult()) {
+                    return null;
+                }
+                Class<?> raw = ClassUtils.resolvePrimitiveIfNecessary(q.returnType().resolve(Object.class));
+                if (!Number.class.isAssignableFrom(raw) && raw != Boolean.class && raw != Object.class) {
+                    throw new InvalidDataAccessApiUsageException(task + ": the statement returned an update count,"
+                            + " not rows; declare the method void, int, long or boolean");
+                }
+                return Values.convert(ps.getUpdateCount(), q.returnType());
             }
-            if (q.mapper() == null) {
+            if (q.noResult()) {
                 return null;
             }
-            List<Object> rows = new ArrayList<>();
+            List<Object> rows;
             try (ResultSet rs = ps.getResultSet()) {
-                int n = 0;
-                while (rs.next()) {
-                    rows.add(q.mapper().mapRow(rs, n++));
-                }
+                rows = RowMappers.mapAll(rs, q.element());
             }
             if (q.many()) {
                 return rows;
@@ -524,15 +556,18 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     }
 
     /**
-     * Возвращает первую строку текста. Сообщения об ошибках JDBC часто многострочные, а в списке
-     * проблем при старте нужна одна строка на метод.
+     * Возвращает первую строку сообщения исключения для списка проблем при старте: сообщения
+     * JDBC часто многострочные, а в списке нужна одна строка на метод.
      *
-     * @param s текст, может быть {@code null}
-     * @return текст до первого перевода строки; весь текст, если перевода строки нет;
-     *         {@code null}, если {@code s} равен {@code null}
+     * @param e исключение
+     * @return первая строка сообщения; имя класса исключения, если сообщения нет
      */
-    private static String firstLine(String s) {
-        int nl = s == null ? -1 : s.indexOf('\n');
+    private static String message(Throwable e) {
+        String s = e.getMessage();
+        if (s == null || s.isBlank()) {
+            return e.getClass().getSimpleName();
+        }
+        int nl = s.indexOf('\n');
         return nl < 0 ? s : s.substring(0, nl);
     }
 }

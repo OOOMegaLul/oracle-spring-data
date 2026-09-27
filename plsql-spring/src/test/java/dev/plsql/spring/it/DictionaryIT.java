@@ -1,8 +1,13 @@
 package dev.plsql.spring.it;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.List;
+import java.util.Map;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -13,6 +18,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import dev.plsql.spring.call.CallPlanner;
 import dev.plsql.spring.meta.ArgKind;
 import dev.plsql.spring.meta.ArgumentInfo;
+import dev.plsql.spring.meta.DictionaryReader;
 import dev.plsql.spring.meta.DictionarySignatureSource;
 import dev.plsql.spring.meta.SubprogramInfo;
 
@@ -179,18 +185,18 @@ class DictionaryIT {
      */
     @Test
     void codeThatDoesNotCompileIsReportedAsInvalidNotMissing() throws Exception {
-        try (java.sql.Connection c = ItDatabase.connect(); java.sql.Statement st = c.createStatement()) {
+        try (Connection c = ItDatabase.connect(); Statement st = c.createStatement()) {
             st.execute("create or replace procedure lab_broken(p_x number) is begin no_such_thing; end;");
             st.execute("create or replace package lab_broken_pkg as procedure p(p_x no_such_type); end;");
             try {
-                org.assertj.core.api.Assertions.assertThatThrownBy(() -> source.find(null, null, "LAB_BROKEN"))
-                        .isInstanceOf(dev.plsql.spring.meta.DictionaryReader.InvalidObjectException.class)
+                assertThatThrownBy(() -> source.find(null, null, "LAB_BROKEN"))
+                        .isInstanceOf(DictionaryReader.InvalidObjectException.class)
                         .hasMessageContaining("LAB_BROKEN is INVALID");
-                org.assertj.core.api.Assertions.assertThatThrownBy(() -> source.find(null, "LAB_BROKEN_PKG", "P"))
+                assertThatThrownBy(() -> source.find(null, "LAB_BROKEN_PKG", "P"))
+                        .isInstanceOf(DictionaryReader.InvalidObjectException.class)
                         .hasMessageContaining("LAB_BROKEN_PKG is INVALID");
             } finally {
-                st.execute("drop procedure lab_broken");
-                st.execute("drop package lab_broken_pkg");
+                dropAll(st, "drop procedure lab_broken", "drop package lab_broken_pkg");
             }
         }
     }
@@ -214,15 +220,15 @@ class DictionaryIT {
      */
     @Test
     void batchReadGivesEveryRequestedName() throws Exception {
-        java.util.Map<String, List<SubprogramInfo>> pkg = source.findAll(null, "LAB_PKG", List.of("ECHO_BOOL", "OVER", "NO_SUCH"));
+        Map<String, List<SubprogramInfo>> pkg = source.findAll(null, "LAB_PKG", List.of("ECHO_BOOL", "OVER", "NO_SUCH"));
         assertThat(pkg.get("ECHO_BOOL")).hasSize(1);
         assertThat(pkg.get("OVER")).hasSize(2);
         assertThat(pkg.get("NO_SUCH")).isEmpty();
-        try (java.sql.Connection c = ItDatabase.connect(); java.sql.Statement st = c.createStatement()) {
+        try (Connection c = ItDatabase.connect(); Statement st = c.createStatement()) {
             st.execute("create or replace function lab_standalone(p_x number) return number is begin return p_x + 1; end;");
             st.execute("create or replace procedure lab_noargs is begin null; end;");
             try {
-                java.util.Map<String, List<SubprogramInfo>> sa = source.findAll(null, null,
+                Map<String, List<SubprogramInfo>> sa = source.findAll(null, null,
                         List.of("LAB_STANDALONE", "LAB_NOARGS", "NO_SUCH_PROC"));
                 assertThat(sa.get("LAB_STANDALONE")).singleElement().satisfies(sp -> {
                     assertThat(sp.isFunction()).isTrue();
@@ -231,9 +237,34 @@ class DictionaryIT {
                 assertThat(sa.get("LAB_NOARGS")).singleElement().satisfies(sp -> assertThat(sp.arguments()).isEmpty());
                 assertThat(sa.get("NO_SUCH_PROC")).isEmpty();
             } finally {
-                st.execute("drop function lab_standalone");
-                st.execute("drop procedure lab_noargs");
+                dropAll(st, "drop function lab_standalone", "drop procedure lab_noargs");
             }
+        }
+    }
+    /**
+     * Удаляет временные объекты теста: каждый отдельно, чтобы неудачное удаление одного не
+     * оставило второй и не спрятало ошибку самого теста. Ошибки удаления прикладываются друг к
+     * другу и бросаются в конце.
+     *
+     * @param st    оператор на соединении теста
+     * @param drops команды {@code DROP}
+     * @throws SQLException первая ошибка удаления, с остальными как подавленными
+     */
+    private static void dropAll(Statement st, String... drops) throws SQLException {
+        SQLException first = null;
+        for (String d : drops) {
+            try {
+                st.execute(d);
+            } catch (SQLException e) {
+                if (first == null) {
+                    first = e;
+                } else {
+                    first.addSuppressed(e);
+                }
+            }
+        }
+        if (first != null) {
+            throw first;
         }
     }
 }

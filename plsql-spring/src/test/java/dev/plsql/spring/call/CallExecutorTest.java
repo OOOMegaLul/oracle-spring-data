@@ -1,7 +1,9 @@
 package dev.plsql.spring.call;
 
 import static dev.plsql.spring.test.Signatures.func;
+import static dev.plsql.spring.test.Signatures.field;
 import static dev.plsql.spring.test.Signatures.indexTable;
+import static dev.plsql.spring.test.Signatures.object;
 import static dev.plsql.spring.test.Signatures.proc;
 import static dev.plsql.spring.test.Signatures.xml;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -18,6 +20,7 @@ import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.sql.CallableStatement;
 import java.sql.Clob;
+import java.sql.Struct;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.Arrays;
@@ -28,6 +31,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
+import dev.plsql.spring.meta.ArgumentInfo;
 import dev.plsql.spring.support.CharsetGuard;
 import oracle.jdbc.OracleCallableStatement;
 import oracle.jdbc.OracleConnection;
@@ -91,6 +95,22 @@ class CallExecutorTest {
          * @return строки, среди которых может быть {@code null}
          */
         List<String> items(long n);
+
+        /**
+         * Сумма длин строк index-by таблицы.
+         *
+         * @param vals строки
+         * @return сумма длин
+         */
+        BigDecimal texts(List<String> vals);
+
+        /**
+         * Объект с атрибутом {@code CLOB} на выходе.
+         *
+         * @param id номер
+         * @return атрибуты объекта
+         */
+        Map<String, Object> doc(long id);
     }
 
     /**
@@ -188,8 +208,8 @@ class CallExecutorTest {
     /**
      * Проверяет, что при политике {@code FAIL} текст, который база в CL8MSWIN1251 сохранить не
      * может (казахская буква «Ә»), отвергается с именем аргумента {@code P_TEXT} ещё до создания
-     * временного {@code CLOB} и до выполнения вызова. Без этой проверки база молча заменила бы
-     * символ на {@code ?}.
+     * временного {@code CLOB} и вообще до того, как что-либо ушло драйверу ({@code prepareCall} не
+     * вызывался). Без этой проверки база молча заменила бы символ на {@code ?}.
      *
      * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
      */
@@ -201,6 +221,7 @@ class CallExecutorTest {
         assertThatThrownBy(() -> strict.execute(con, p, new Object[]{"Әлем"}))
                 .isInstanceOf(CharsetGuard.UnrepresentableCharacterException.class)
                 .hasMessageContaining("P_TEXT");
+        verify(con, never()).prepareCall(anyString());
         verify(con, never()).createClob();
         verify(cs, never()).execute();
     }
@@ -231,17 +252,18 @@ class CallExecutorTest {
 
     /**
      * Проверяет, что курсор {@code IN OUT}, который процедура так и не открыла (при чтении
-     * ORA-24338), даёт результат {@code null}, а не ошибку; OUT-параметр при этом
-     * зарегистрирован как {@code OracleTypes.CURSOR}.
+     * ORA-24338), даёт пустой список: строк нет. Не ошибку и не {@code null}, чтобы вызывающему
+     * не приходилось проверять на {@code null}. OUT-параметр при этом зарегистрирован как
+     * {@code OracleTypes.CURSOR}.
      *
      * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
      */
     @Test
-    void cursorLeftUnopenedReadsAsNull() throws SQLException {
+    void cursorLeftUnopenedReadsAsNoRows() throws SQLException {
         CallPlan p = planner.plan(m("cursor"), proc("PKG", "CUR").in("P_MIN_ID", "NUMBER").inOut("P_CUR", "REF CURSOR").build());
         when(cs.getObject(2)).thenThrow(new SQLException("ORA-24338", "HY000", 24338));
 
-        assertThat(new CallExecutor(100).execute(con, p, new Object[]{1L})).isNull();
+        assertThat(new CallExecutor(100).execute(con, p, new Object[]{1L})).isEqualTo(List.of());
         verify(cs).registerOutParameter(2, OracleTypes.CURSOR);
     }
 
@@ -332,5 +354,105 @@ class CallExecutorTest {
         org.mockito.Mockito.doThrow(new SQLException("ORA-22922", "99999", 22922)).when(clob).free();
         assertThatThrownBy(() -> new CallExecutor(100).execute(con, p, new Object[]{"text"}))
                 .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getErrorCode()).isEqualTo(22922));
+    }
+    /**
+     * Строит index-by таблицу строк с объявленной длиной элемента, как её читает словарь.
+     *
+     * @param name   имя аргумента
+     * @param inOut  направление
+     * @param type   тип элемента, {@code VARCHAR2} или {@code NVARCHAR2}
+     * @param length объявленная длина или {@code null}
+     * @return описание аргумента
+     */
+    static ArgumentInfo stringTable(String name, String inOut, String type, Integer length) {
+        return new ArgumentInfo(name, 1, 0, "PL/SQL TABLE", null, inOut, false, "APP", "PKG", "T_TAB",
+                List.of(new ArgumentInfo(null, 1, 1, type, null, inOut, false, null, null, null, null, length)), null);
+    }
+
+    /**
+     * Проверяет длину строковых элементов index-by таблиц: у выходной таблицы драйвер резервирует
+     * объявленную в словаре длину (раньше всегда 4000), у входной — по самой длинной строке. Строка
+     * в 32766 символов проходит, а длиннее — ошибка до вызова: больше драйвер не принимает.
+     *
+     * @throws SQLException не бросается: драйвер подменён
+     */
+    @Test
+    void indexTableElementsTakeTheirRealLength() throws SQLException {
+        OracleCallableStatement ocs = mock(OracleCallableStatement.class);
+        when(cs.unwrap(OracleCallableStatement.class)).thenReturn(ocs);
+
+        CallPlan out = planner.plan(m("items"), proc("PKG", "ITEMS").in("P_N", "NUMBER")
+                .add(stringTable("P_VALS", "OUT", "VARCHAR2", 5000)).build());
+        when(ocs.getPlsqlIndexTable(2)).thenReturn(new String[0]);
+        new CallExecutor(100).execute(con, out, new Object[]{1L});
+        verify(ocs).registerIndexTableOutParameter(2, 100, OracleTypes.VARCHAR, 5000);
+
+        CallPlan in = planner.plan(m("texts"), func("PKG", "TEXTS", "NUMBER")
+                .add(stringTable("P_VALS", "IN", "VARCHAR2", 32767)).build());
+        String longOne = "x".repeat(6000);
+        new CallExecutor(100).execute(con, in, new Object[]{List.of("a", longOne)});
+        verify(ocs).setPlsqlIndexTable(2, new String[]{"a", longOne}, 2, 2, OracleTypes.VARCHAR, 6000);
+
+        String limit = "z".repeat(32_766);
+        new CallExecutor(100).execute(con, in, new Object[]{List.of(limit)});
+        verify(ocs).setPlsqlIndexTable(2, new String[]{limit}, 1, 1, OracleTypes.VARCHAR, 32_766);
+        assertThatThrownBy(() -> new CallExecutor(100).execute(con, in, new Object[]{List.of("y".repeat(32_767))}))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("P_VALS[1] is 32767 characters");
+    }
+
+    /**
+     * Проверяет, что строки index-by таблицы {@code NVARCHAR2} не проверяются по основной
+     * кодировке базы: у национальных типов свой набор символов (раньше проверка их отвергала).
+     *
+     * @throws SQLException не бросается: драйвер подменён
+     */
+    @Test
+    void nationalIndexTablesAreNotCheckedAgainstTheDatabaseCharset() throws SQLException {
+        OracleCallableStatement ocs = mock(OracleCallableStatement.class);
+        when(cs.unwrap(OracleCallableStatement.class)).thenReturn(ocs);
+        CallExecutor strict = new CallExecutor(100, CharsetGuard.forDatabase("CL8MSWIN1251", CharsetGuard.Policy.FAIL));
+        CallPlan in = planner.plan(m("texts"), func("PKG", "TEXTS", "NUMBER")
+                .add(stringTable("P_VALS", "IN", "NVARCHAR2", 100)).build());
+
+        strict.execute(con, in, new Object[]{List.of("Әлем")});
+
+        verify(ocs).setPlsqlIndexTable(2, new String[]{"Әлем"}, 1, 1, OracleTypes.VARCHAR, 4);
+    }
+
+    /**
+     * Проверяет, что атрибут {@code CLOB} объекта, пришедшего из базы, читается в строку, а сам
+     * LOB освобождается (раньше он так и оставался объектом {@code Clob} в карте).
+     *
+     * @throws SQLException не бросается: драйвер подменён
+     */
+    @Test
+    void lobAttributesOfObjectsAreReadAndFreed() throws SQLException {
+        CallPlan p = planner.plan(m("doc"), func("PKG", "DOC", object(null, "OUT", "DOC_T",
+                field("ID", "NUMBER"), field("BODY", "CLOB"))).in("P_ID", "NUMBER").build());
+        Struct struct = mock(Struct.class);
+        Clob clob = mock(Clob.class);
+        when(cs.getObject(1)).thenReturn(struct);
+        when(struct.getAttributes()).thenReturn(new Object[]{BigDecimal.ONE, clob});
+        when(clob.length()).thenReturn(3L);
+        when(clob.getSubString(1, 3)).thenReturn("abc");
+
+        assertThat(new CallExecutor(100).execute(con, p, new Object[]{1L}))
+                .isEqualTo(Map.of("ID", BigDecimal.ONE, "BODY", "abc"));
+        verify(clob).free();
+    }
+    /**
+     * Проверяет, что выходная index-by таблица строк, под которую драйвер зарезервировал бы
+     * сотни мегабайт на вызов, отвергается при старте с советом, до скольки снизить
+     * {@code indexTableMaxLength}; при меньшем {@code indexTableMaxLength} та же таблица проходит.
+     */
+    @Test
+    void hugeOutIndexTableReserveFailsAtStartup() {
+        CallPlan out = planner.plan(m("items"), proc("PKG", "ITEMS").in("P_N", "NUMBER")
+                .add(stringTable("P_VALS", "OUT", "VARCHAR2", 32767)).build());
+        assertThatThrownBy(() -> new CallExecutor(10_000).verify(out))
+                .isInstanceOf(CallPlanner.PlanException.class)
+                .hasMessageContaining("P_VALS of VARCHAR2(32766)")
+                .hasMessageContaining("lower plsql.index-table-max-length to 1525");
+        new CallExecutor(1_000).verify(out);
     }
 }

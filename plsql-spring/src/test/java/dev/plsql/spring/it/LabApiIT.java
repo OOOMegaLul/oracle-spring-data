@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -174,7 +175,7 @@ class LabApiIT {
         assertThat(out).extracting(LabApi.Emp::id).containsExactly(2L, 3L);
         assertThat(api.empsF(2)).isEqualTo(out);
         assertThat(api.empsInout(1, 2)).isEqualTo(out);
-        assertThat(api.empsInout(0, 2)).as("cursor left unopened").isNull();
+        assertThat(api.empsInout(0, 2)).as("cursor left unopened").isEmpty();
     }
 
     /**
@@ -283,8 +284,9 @@ class LabApiIT {
      * ({@code UnrepresentableCharacterException} с именем аргумента {@code P_S}, кодом символа и
      * позицией 1), и в {@code @SqlQuery}; с политикой {@code IGNORE} текст уходит, и база, как при
      * обычном JDBC, молча заменяет символ на {@code ?}. В базе с Unicode (например {@code AL32UTF8})
-     * тот же текст проходит без изменений. Строка из кириллицы и типографских знаков
-     * ({@code Ёжик € № — «»}), которые есть в Windows-1251, в любой базе возвращается как есть.
+     * тот же текст проходит без изменений. Какие символы база хранит, тест берёт у той же
+     * проверки кодировки, поэтому он верен и для других однобайтовых баз (WE8MSWIN1252 и т.п.):
+     * строка из хранимых символов ({@code Ёжик € № — «» é} без лишних) возвращается как есть.
      *
      * <p>Без этой проверки данные теряются без всякой ошибки, и это видно только позже, по
      * вопросительным знакам в базе.
@@ -292,18 +294,38 @@ class LabApiIT {
     @Test
     void textOutsideTheDatabaseCharsetIsRejected() {
         String kazakh = "Әлем";
-        if (ItDatabase.singleByteCyrillic()) {
+        CharsetGuard guard = CharsetGuard.forDatabase(ItDatabase.charset(), CharsetGuard.Policy.FAIL);
+        if (!representable(guard, kazakh)) {
             assertThatThrownBy(() -> api.echoStr(kazakh))
                     .isInstanceOf(CharsetGuard.UnrepresentableCharacterException.class)
                     .hasMessageContaining("P_S").hasMessageContaining("U+04D8").hasMessageContaining("position 1");
             assertThatThrownBy(() -> api.findByName(kazakh))
                     .isInstanceOf(CharsetGuard.UnrepresentableCharacterException.class);
             LabApi lenient = PlsqlApiFactory.builder(ds).charsetPolicy(CharsetGuard.Policy.IGNORE).build().create(LabApi.class);
-            assertThat(lenient.echoStr(kazakh)).isEqualTo("?лем");
+            assertThat(lenient.echoStr(kazakh)).startsWith("?");
         } else {
             assertThat(api.echoStr(kazakh)).isEqualTo(kazakh);
         }
-        assertThat(api.echoStr("Ёжик € № — «»")).isEqualTo("Ёжик € № — «»");
+        // Строка из тех символов, которые кодировка базы хранит, проходит туда и обратно без потерь.
+        StringBuilder kept = new StringBuilder();
+        "Ёжик € № — «» é".codePoints().mapToObj(Character::toString).filter(ch -> representable(guard, ch)).forEach(kept::append);
+        assertThat(api.echoStr(kept.toString())).isEqualTo(kept.toString());
+    }
+
+    /**
+     * Проверяет, сохранит ли база с этой проверкой кодировки такой текст.
+     *
+     * @param guard проверка кодировки тестовой базы
+     * @param text  текст
+     * @return {@code true}, если проверка текст пропускает
+     */
+    private static boolean representable(CharsetGuard guard, String text) {
+        try {
+            guard.check("text", text);
+            return true;
+        } catch (CharsetGuard.UnrepresentableCharacterException e) {
+            return false;
+        }
     }
 
     /**
@@ -335,6 +357,15 @@ class LabApiIT {
          * @return никогда не возвращает: реализация интерфейса не создаётся
          */
         String echoStr(String s, int extra);
+
+        /**
+         * Функция {@code LAB_PKG.XOBJ_ID} принимает объект {@code LAB_XOBJ} с атрибутом
+         * {@code XMLTYPE}: внутри {@code Struct} его через JDBC не передать.
+         *
+         * @param obj объект
+         * @return номер объекта
+         */
+        long xobjId(Map<String, Object> obj);
     }
 
     /**
@@ -354,6 +385,55 @@ class LabApiIT {
                 .hasMessageContaining("index-by table")
                 .hasMessageContaining("Unsupported.noSuchProcedure")
                 .hasMessageContaining("not found")
-                .hasMessageContaining("'extra' has no matching argument");
+                .hasMessageContaining("'extra' has no matching argument")
+                .hasMessageContaining("Unsupported.xobjId")
+                .hasMessageContaining("LAB_XOBJ.BODY is OPAQUE/XMLTYPE, which cannot be passed inside a SQL object");
+    }
+    /**
+     * Проверяет index-by таблицы длинных строк ({@code VARCHAR2(32767)}): на входе строка в
+     * 10 000 символов, на выходе строки по 5 000 (раньше длина элемента была зашита в 4000).
+     * Выходная таблица с резервом по умолчанию — 10 000 элементов по 32766 символов, около
+     * 1,5 ГБ на вызов — отвергается при создании с советом, до скольки снизить
+     * {@code indexTableMaxLength}; с {@code indexTableMaxLength(100)} она работает.
+     */
+    @Test
+    void longStringsInIndexByTables() {
+        assertThat(api.longLen(List.of("a", "b".repeat(10_000)))).isEqualByComparingTo("10001");
+
+        LongTables small = PlsqlApiFactory.builder(ds).indexTableMaxLength(100).build().create(LongTables.class);
+        List<String> out = small.longOut(3, 5_000);
+        assertThat(out).hasSize(3).allSatisfy(v -> assertThat(v).hasSize(5_000).startsWith("vxx"));
+
+        assertThatThrownBy(() -> factory.create(LongTables.class))
+                .hasMessageContaining("OUT index-by table P_VALS of VARCHAR2(32766)")
+                .hasMessageContaining("lower plsql.index-table-max-length to 1525");
+    }
+
+    /**
+     * Выходная index-by таблица {@code VARCHAR2(32767)}: драйвер резервирует под каждый из
+     * {@code indexTableMaxLength} элементов объявленную длину, поэтому такой интерфейс создаётся
+     * только фабрикой с небольшим {@code indexTableMaxLength}.
+     */
+    @PlsqlApi(packageName = "LAB_PKG")
+    interface LongTables {
+        /**
+         * Вызывает процедуру {@code LAB_PKG.LONG_OUT(P_N, P_LEN, P_VALS OUT LONG_IBT)}: {@code n}
+         * строк длиной {@code len}.
+         *
+         * @param n   сколько строк
+         * @param len длина каждой
+         * @return строки
+         */
+        List<String> longOut(int n, int len);
+    }
+
+    /**
+     * Проверяет, что колонки курсора с типовыми префиксами ({@code NRN}, {@code SNAME},
+     * {@code DHIRED}) ложатся на компоненты record без префиксов, как и аргументы процедур.
+     */
+    @Test
+    void cursorColumnsFollowTheArgumentNamingRules() {
+        assertThat(api.empsPrefixed()).first()
+                .isEqualTo(new LabApi.Brief2(1, "Иванов", LocalDate.of(2020, 1, 15)));
     }
 }

@@ -114,7 +114,8 @@ public class SessionContextDataSource extends DelegatingDataSource {
      *
      * <p>Ключ читается за то же обращение к базе, что и сброс, поэтому блок из
      * {@link #setScopedInitSql} ничего не стоит, когда он не нужен. Параметр регистрируется как
-     * {@code VARCHAR}, и строка сравнивается со строковым видом ({@code toString()}) нужного ключа.
+     * {@code VARCHAR}, и строка сравнивается со строковым видом ({@code toString()}) нужного ключа
+     * (ключ-число — как число, см. {@code sameKey}).
      * Ключ стоит хранить в таблице, а не в переменной пакета: переменную пакета сбросит этот же блок.
      * Пример:
      * <pre>{@code
@@ -160,8 +161,8 @@ public class SessionContextDataSource extends DelegatingDataSource {
      * выдаче. Явный {@code commit} выполняется только при {@code autoCommit=false}; при
      * {@code autoCommit=true} запись фиксирует сам драйвер.
      *
-     * @param key   поставщик нужного ключа; сравнение идёт по {@code toString()}, {@code null}
-     *              означает «ключа нет»
+     * @param key   поставщик нужного ключа; сравнение идёт по {@code toString()}, а у числа — как
+     *              чисел (см. {@code sameKey}); {@code null} означает «ключа нет»
      * @param sql   блок, который записывает ключ в сессию
      * @param binds поставщики значений для {@code ?} в {@code sql}, по порядку
      */
@@ -195,6 +196,33 @@ public class SessionContextDataSource extends DelegatingDataSource {
     @Override
     public Connection getConnection(String username, String password) throws SQLException {
         return prepare(super.getConnection(username, password));
+    }
+
+    /**
+     * Сравнивает ключ, записанный в сессии, с нужным.
+     *
+     * <p>Если нужный ключ в Java — число ({@link Number}), строка из сессии сравнивается с ним как
+     * число: база может вернуть {@code 1001.0} или {@code 1001 } для ключа {@code 1001L}, и тогда
+     * запись в сессию и её {@code commit} шли бы на каждой выдаче соединения. Строковый ключ
+     * сравнивается строго как строка: {@code "007"} и {@code "7"} — разные коды, и принять одно
+     * за другое значило бы оставить пользователю чужую сессию.
+     *
+     * @param inSession что сообщила проба сброса
+     * @param wanted    нужный ключ или {@code null}, если ключа нет
+     * @return {@code true}, если ключ в сессии уже нужный
+     */
+    static boolean sameKey(String inSession, Object wanted) {
+        if (wanted == null || inSession == null) {
+            return wanted == null && inSession == null;
+        }
+        if (wanted instanceof Number n) {
+            try {
+                return new java.math.BigDecimal(inSession.trim()).compareTo(new java.math.BigDecimal(n.toString())) == 0;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        return inSession.equals(wanted.toString());
     }
 
     /**
@@ -252,8 +280,7 @@ public class SessionContextDataSource extends DelegatingDataSource {
             oc.setClientInfo("OCSID.CLIENTID", user == null ? "" : user);
             if (scopedSql != null) {
                 Object key = scopeKey.get();
-                String wanted = key == null ? null : key.toString();
-                if (!resetReportsKey || !Objects.equals(current, wanted)) {
+                if (!resetReportsKey || !sameKey(current, key)) {
                     try (CallableStatement cs = con.prepareCall(scopedSql)) {
                         bind(cs, scopedBinds);
                         cs.execute();

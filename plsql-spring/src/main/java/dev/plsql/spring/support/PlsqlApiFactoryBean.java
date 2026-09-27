@@ -1,5 +1,6 @@
 package dev.plsql.spring.support;
 
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -9,10 +10,12 @@ import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.BeanFactoryAware;
 import org.springframework.beans.factory.FactoryBean;
 import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.config.ConfigurableBeanFactory;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
 
 import dev.plsql.spring.PlsqlApiFactory;
+import dev.plsql.spring.boot.PlsqlProperties;
 import dev.plsql.spring.call.ArgumentDefaults;
 import dev.plsql.spring.meta.SignatureSource;
 
@@ -35,15 +38,18 @@ import dev.plsql.spring.meta.SignatureSource;
  * <p>Какой {@link PlsqlApiFactory} используется:
  * <ul>
  *   <li>бин с именем из {@code factoryRef}, если оно задано;</li>
- *   <li>иначе единственный бин {@link PlsqlApiFactory} в контексте (или основной из
- *       нескольких) — если {@code dataSourceRef} оставлен по умолчанию или эта фабрика работает
- *       именно с бином {@code dataSourceRef} (напрямую или через обёртки вроде
- *       {@code SessionContextDataSource});</li>
- *   <li>иначе общая фабрика, построенная на бине {@code DataSource} с именем
- *       {@code dataSourceRef} вместе с бинами {@link ArgumentDefaults} и {@link SignatureSource},
- *       если они есть в контексте.</li>
+ *   <li>иначе бин {@link PlsqlApiFactory}, который работает с бином {@code DataSource} по имени
+ *       {@code dataSourceRef} (если имя не задано — {@code dataSource}), напрямую или через
+ *       обёртки вроде {@code SessionContextDataSource};</li>
+ *   <li>если такого нет, а {@code dataSourceRef} не задан, — единственный бин
+ *       {@code PlsqlApiFactory} в контексте (или основной из нескольких), как бы он ни был собран;</li>
+ *   <li>если и такого нет — общая фабрика, построенная на этом бине {@code DataSource} вместе с
+ *       бинами {@link ArgumentDefaults} и {@link SignatureSource}, если они есть в контексте, и с
+ *       настройками {@code plsql.*} Spring Boot.</li>
  * </ul>
- * Так явно указанный {@code dataSourceRef} никогда не уходит молча в чужую базу.
+ * Так явно указанный {@code dataSourceRef} никогда не уходит молча в чужую базу, а несколько
+ * равноправных фабрик — ошибка при старте с советом указать {@code factoryRef}, а не молчаливая
+ * сборка ещё одной.
  *
  * @param <T> тип интерфейса {@code @PlsqlApi}, реализацию которого создаёт этот бин
  */
@@ -60,7 +66,7 @@ public class PlsqlApiFactoryBean<T> implements FactoryBean<T>, BeanFactoryAware,
     static final String SHARED_FACTORIES = "plsqlApiFactory#shared";
 
     private final Class<T> apiInterface;
-    private String dataSourceRef = DEFAULT_DATA_SOURCE;
+    private String dataSourceRef = "";
     private String factoryRef = "";
     private BeanFactory beanFactory;
     private T instance;
@@ -83,7 +89,8 @@ public class PlsqlApiFactoryBean<T> implements FactoryBean<T>, BeanFactoryAware,
      * <p>Используется, только если {@code factoryRef} пуст и в контексте нет единственного
      * (или основного) бина {@code PlsqlApiFactory}.
      *
-     * @param dataSourceRef имя бина {@code DataSource}; по умолчанию {@code dataSource}
+     * @param dataSourceRef имя бина {@code DataSource}; пустая строка — не задано (тогда бин
+     *                      {@code dataSource})
      */
     public void setDataSourceRef(String dataSourceRef) {
         this.dataSourceRef = dataSourceRef;
@@ -134,23 +141,49 @@ public class PlsqlApiFactoryBean<T> implements FactoryBean<T>, BeanFactoryAware,
     /**
      * Выбирает {@link PlsqlApiFactory}, которым будет создана реализация.
      *
-     * <p>Если задан {@code factoryRef}, берётся бин с этим именем. Иначе берётся единственный
-     * бин {@code PlsqlApiFactory} (или основной из нескольких), но только если он подходит к
-     * {@code dataSourceRef} (см. описание класса). В остальных случаях — общая фабрика из
-     * {@link #sharedFactory()}.
+     * <p>Правила — в описании класса.
      *
      * @return фабрика реализаций
+     * @throws IllegalStateException если подходят несколько фабрик и ни одна не основная
      */
     PlsqlApiFactory factory() {
         if (!factoryRef.isEmpty()) {
             return beanFactory.getBean(factoryRef, PlsqlApiFactory.class);
         }
-        PlsqlApiFactory declared = beanFactory.getBeanProvider(PlsqlApiFactory.class).getIfUnique();
-        if (declared != null && (DEFAULT_DATA_SOURCE.equals(dataSourceRef)
-                || uses(declared, beanFactory.getBean(dataSourceRef, DataSource.class)))) {
-            return declared;
+        ObjectProvider<PlsqlApiFactory> provider = beanFactory.getBeanProvider(PlsqlApiFactory.class);
+        PlsqlApiFactory primary = provider.getIfUnique();
+        List<PlsqlApiFactory> all = provider.orderedStream().toList();
+        String ref = dataSourceName();
+        List<PlsqlApiFactory> candidates = List.of();
+        if (beanFactory.containsBean(ref)) {
+            DataSource wanted = beanFactory.getBean(ref, DataSource.class);
+            candidates = all.stream().filter(f -> uses(f, wanted)).toList();
         }
-        return sharedFactory();
+        if (candidates.isEmpty() && dataSourceRef.isEmpty()) {
+            candidates = all; // имя не задано: подходит любая объявленная фабрика, как и раньше
+        }
+        if (candidates.isEmpty()) {
+            return sharedFactory();
+        }
+        if (candidates.size() == 1) {
+            return candidates.get(0);
+        }
+        if (primary != null && candidates.contains(primary)) {
+            return primary;
+        }
+        throw new IllegalStateException(apiInterface.getName() + ": " + candidates.size()
+                + " PlsqlApiFactory beans fit dataSourceRef '" + ref + "' and none is @Primary;"
+                + " name one with factoryRef on @EnablePlsqlApis");
+    }
+
+    /**
+     * Возвращает имя бина {@code DataSource}: {@code dataSourceRef}, а если он не задан —
+     * {@value #DEFAULT_DATA_SOURCE}.
+     *
+     * @return имя бина
+     */
+    private String dataSourceName() {
+        return dataSourceRef.isEmpty() ? DEFAULT_DATA_SOURCE : dataSourceRef;
     }
 
     /**
@@ -202,24 +235,38 @@ public class PlsqlApiFactoryBean<T> implements FactoryBean<T>, BeanFactoryAware,
             }
             shared = (Map<String, PlsqlApiFactory>) cbf.getSingleton(SHARED_FACTORIES);
         }
-        return shared.computeIfAbsent(dataSourceRef, ref -> build());
+        return shared.computeIfAbsent(dataSourceName(), ref -> build());
     }
 
     /**
      * Строит новую фабрику на бине {@code DataSource} с именем {@code dataSourceRef}.
      *
-     * <p>Бины {@link ArgumentDefaults} и {@link SignatureSource} подключаются, только если такой
-     * бин один (или один из нескольких помечен как основной). Остальные параметры фабрики
-     * остаются по умолчанию: настройки {@code plsql.*} из Spring Boot сюда не попадают.
+     * <p>Бины {@link ArgumentDefaults} и {@link SignatureSource} подключаются, если такой бин
+     * один (или один из нескольких помечен как основной); несколько равноправных — ошибка. Если
+     * в контексте есть настройки {@code plsql.*} Spring Boot ({@link PlsqlProperties}), они тоже
+     * переносятся в фабрику.
      *
      * @return новая фабрика
+     * @throws org.springframework.beans.factory.NoUniqueBeanDefinitionException если бинов
+     *         {@code ArgumentDefaults} или {@code SignatureSource} несколько и ни один не основной
      */
     private PlsqlApiFactory build() {
-        PlsqlApiFactory.Builder b = PlsqlApiFactory.builder(beanFactory.getBean(dataSourceRef, DataSource.class));
-        beanFactory.getBeanProvider(ArgumentDefaults.class).ifUnique(b::argumentDefaults);
-        beanFactory.getBeanProvider(SignatureSource.class).ifUnique(b::signatureSource);
+        PlsqlApiFactory.Builder b = PlsqlApiFactory.builder(beanFactory.getBean(dataSourceName(), DataSource.class));
+        if (PROPERTIES_PRESENT) {
+            beanFactory.getBeanProvider(PlsqlProperties.class).ifAvailable(p -> p.applyTo(b));
+        }
+        beanFactory.getBeanProvider(ArgumentDefaults.class).ifAvailable(b::argumentDefaults);
+        beanFactory.getBeanProvider(SignatureSource.class).ifAvailable(b::signatureSource);
         return b.build();
     }
+
+    /**
+     * Есть ли на classpath Spring Boot: без него бина {@link PlsqlProperties} не бывает, и его
+     * не ищут.
+     */
+    private static final boolean PROPERTIES_PRESENT = org.springframework.util.ClassUtils.isPresent(
+            "org.springframework.boot.context.properties.ConfigurationProperties",
+            PlsqlApiFactoryBean.class.getClassLoader());
 
     /**
      * Возвращает готовую реализацию интерфейса — именно этот объект Spring внедряет вместо

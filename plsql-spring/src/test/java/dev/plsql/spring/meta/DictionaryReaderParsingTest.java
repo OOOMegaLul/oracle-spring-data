@@ -49,7 +49,7 @@ class DictionaryReaderParsingTest {
         assertThat(first).startsWith("PROCEDURE EMP_ROW(P_ID NUMBER").doesNotContain("WRONG");
         assertThat(DictionaryReader.rowtypeOf(first, "P_ROW")).isEqualTo("EMP");
 
-        String second = DictionaryReader.findDeclaration(SPEC, "emp_row", "2");
+        String second = DictionaryReader.findDeclaration(SPEC, "EMP_ROW", "2");
         assertThat(DictionaryReader.rowtypeOf(second, "P_ROW")).isEqualTo("HR.EMP_HIST");
     }
 
@@ -98,7 +98,7 @@ class DictionaryReaderParsingTest {
     void packageCursorIsRecognised() {
         String decl = DictionaryReader.findDeclaration(SPEC, "CUR_ROW", null);
         assertThat(DictionaryReader.rowtypeOf(decl, "P_ROW")).isEqualTo("C_EMP");
-        assertThat(DictionaryReader.declaresCursor(SPEC, "c_emp")).isTrue();
+        assertThat(DictionaryReader.declaresCursor(SPEC, "C_EMP")).isTrue();
         assertThat(DictionaryReader.declaresCursor(SPEC, "C_EM")).isFalse();
         assertThat(DictionaryReader.declaresCursor(SPEC, "C_OLD")).isFalse();
         assertThat(DictionaryReader.declaresCursor(SPEC, "EMP")).isFalse();
@@ -106,13 +106,55 @@ class DictionaryReaderParsingTest {
 
     /**
      * Проверяет удаление комментариев: строчный ({@code --} до конца строки) и блочный
-     * комментарий заменяются пробелом, а строковые литералы, в том числе с {@code --} внутри и
-     * с удвоенной кавычкой ({@code 'it''s'}), остаются нетронутыми.
+     * комментарий заменяются пробелами той же длины, так что позиции в тексте не сдвигаются, а
+     * строковые литералы, в том числе с {@code --} внутри, с удвоенной кавычкой
+     * ({@code 'it''s'}) и с другой кавычкой ({@code q'[-- ']'}), и имена в кавычках остаются
+     * нетронутыми.
      */
     @Test
     void stripCommentsKeepsLiterals() {
-        assertThat(DictionaryReader.stripComments("a -- x\nb /* y */ c 'd -- e' 'it''s'"))
-                .isEqualTo("a  \nb   c 'd -- e' 'it''s'");
+        String src = "a -- x\nb /* y */ c 'd -- e' 'it''s' q'[-- ']' \"--\"";
+        String out = DictionaryReader.stripComments(src);
+        assertThat(out).hasSameSizeAs(src).isEqualTo("a     \nb         c 'd -- e' 'it''s' q'[-- ']' \"--\"");
+    }
+
+    /**
+     * Проверяет, что строковые литералы не сбивают разбор заголовка: скобка в значении по
+     * умолчанию ({@code DEFAULT ')'}) не закрывает список аргументов, а слово {@code PROCEDURE}
+     * внутри литерала — в том числе в {@code q'[...]'} — не считается ещё одной перегрузкой.
+     * {@code IS} сразу после скобки, без пробела, заголовок обрывает.
+     */
+    @Test
+    void literalsDoNotConfuseTheHeader() {
+        String spec = """
+                create or replace package p as
+                  c_note constant varchar2(60) := q'[procedure emp_row(p_x out wrong%rowtype);]';
+                  procedure emp_row(p_sep varchar2 default ')', p_row out emp%rowtype);
+                  procedure emp_row(p_note varchar2 default 'procedure emp_row', p_row out dept%rowtype);
+                end;
+                """;
+        String first = DictionaryReader.findDeclaration(spec, "EMP_ROW", "1");
+        assertThat(DictionaryReader.rowtypeOf(first, "P_ROW")).isEqualTo("EMP");
+        String second = DictionaryReader.findDeclaration(spec, "EMP_ROW", "2");
+        assertThat(DictionaryReader.rowtypeOf(second, "P_ROW")).isEqualTo("DEPT");
+
+        String body = "procedure p(p_row out emp%rowtype)is begin null; end;";
+        assertThat(DictionaryReader.findDeclaration(body, "P", null)).endsWith("EMP%ROWTYPE)");
+    }
+
+    /**
+     * Проверяет имена в двойных кавычках: регистр в них сохраняется, имя подпрограммы в
+     * кавычках находится, таблица {@code "Emp"} разбирается на части без кавычек, а в текст блока
+     * такие части снова идут в кавычках.
+     */
+    @Test
+    void quotedNamesKeepTheirCase() {
+        String spec = "create package \"Hr\" as procedure \"Load\"(p_row out \"Hr\".\"Emp\"%rowtype); end;";
+        String decl = DictionaryReader.findDeclaration(spec, "Load", null);
+        String written = DictionaryReader.rowtypeOf(decl, "P_ROW");
+        assertThat(written).isEqualTo("\"Hr\".\"Emp\"");
+        assertThat(DictionaryReader.nameParts(written)).containsExactly("Hr", "Emp");
+        assertThat(DictionaryReader.sqlName("APP", "Emp", "EMP_2")).isEqualTo("APP.\"Emp\".EMP_2");
     }
 
     /**
@@ -132,5 +174,25 @@ class DictionaryReaderParsingTest {
         assertThat(Signatures.arg("A", "OPAQUE/ANYDATA", "IN").kind()).isEqualTo(ArgKind.UNSUPPORTED);
         assertThat(ArgKind.CLOB.isScalar()).isTrue();
         assertThat(ArgKind.XMLTYPE.isScalar()).isFalse();
+    }
+    /**
+     * Проверяет, что имя подпрограммы ищется целым словом: {@code EMP_ROWS}, объявленная раньше, не
+     * принимается за {@code EMP_ROW} и не сдвигает счёт перегрузок.
+     */
+    @Test
+    void nameIsMatchedAsAWholeWord() {
+        String spec = "procedure emp_rows(p_row out wrong%rowtype); procedure emp_row(p_row out right_t%rowtype);";
+        String decl = DictionaryReader.findDeclaration(spec, "EMP_ROW", "1");
+        assertThat(DictionaryReader.rowtypeOf(decl, "P_ROW")).isEqualTo("RIGHT_T");
+    }
+    /**
+     * Проверяет, что имя в другом регистре (объявленное в кавычках, {@code "Load"}) ищется только в
+     * кавычках: процедура {@code load} без кавычек, объявленная раньше, — другая процедура.
+     */
+    @Test
+    void mixedCaseNamesMatchOnlyQuoted() {
+        String spec = "procedure load(p_row out dept%rowtype); procedure \"Load\"(p_row out emp%rowtype);";
+        assertThat(DictionaryReader.rowtypeOf(DictionaryReader.findDeclaration(spec, "Load", null), "P_ROW")).isEqualTo("EMP");
+        assertThat(DictionaryReader.rowtypeOf(DictionaryReader.findDeclaration(spec, "LOAD", null), "P_ROW")).isEqualTo("DEPT");
     }
 }

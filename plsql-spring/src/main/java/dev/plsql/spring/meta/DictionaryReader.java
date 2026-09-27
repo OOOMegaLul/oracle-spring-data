@@ -40,11 +40,14 @@ public class DictionaryReader {
      * {@code SEQUENCE} — порядок строк, {@code DATA_LEVEL} — уровень вложенности (поля записи
      * и элементы коллекций лежат отдельными строками уровнем ниже), {@code IN_OUT} —
      * направление, {@code DEFAULTED} — есть ли значение по умолчанию,
-     * {@code TYPE_OWNER}/{@code TYPE_NAME}/{@code TYPE_SUBNAME} — имя пользовательского типа.
+     * {@code TYPE_OWNER}/{@code TYPE_NAME}/{@code TYPE_SUBNAME} — имя пользовательского типа,
+     * {@code CHAR_LENGTH} — объявленная длина строки в символах (нужна элементам index-by
+     * таблиц: под выходную таблицу драйвер заранее выделяет место).
      */
     private static final String COLUMNS = """
             select object_name, overload, position, sequence, data_level, argument_name, data_type,
-                   pls_type, in_out, defaulted, type_owner, type_name, type_subname
+                   pls_type, in_out, defaulted, type_owner, type_name, type_subname,
+                   nullif(nvl(char_length, 0), 0) as char_len
               from all_arguments
             """;
 
@@ -85,6 +88,26 @@ public class DictionaryReader {
      *                    {@link DictionaryReader#resolvePackage}, где разрешается только пакет
      */
     public record Resolved(String owner, String packageName, String name) {
+    }
+
+    /**
+     * Сообщает, что имя — синоним объекта в другой базе (через database link, dblink).
+     *
+     * <p>Словарь описывает только объекты своей базы, а вызов через dblink не может передать
+     * {@code BOOLEAN}, записи и прочее, ради чего пишется блок, поэтому такие имена не
+     * поддерживаются, и это говорится прямо, а не «объект не найден».
+     */
+    public static class RemoteObjectException extends IllegalStateException {
+        /**
+         * Создаёт исключение с текстом, который называет имя и ссылку на другую базу.
+         *
+         * @param name   имя, как его разрешали
+         * @param dblink ссылка на другую базу, которую вернул {@code NAME_RESOLVE}
+         */
+        public RemoteObjectException(String name, String dblink) {
+            super(name + " is a synonym for an object in another database (@" + dblink
+                    + "); calls over a database link are not supported, call it on that database directly");
+        }
     }
 
     /**
@@ -131,7 +154,8 @@ public class DictionaryReader {
      * <p>Склеивает непустые части в имя вида {@code SCHEMA.PKG.NAME} и вызывает
      * {@code DBMS_UTILITY.NAME_RESOLVE} с контекстом 1 (код PL/SQL). Процедура возвращает схему,
      * две части имени ({@code part1}, {@code part2}), ссылку на другую базу (dblink), тип первой
-     * части и номер объекта; dblink и номер объекта здесь не используются. Тип 9 означает пакет:
+     * части и номер объекта. Если имя ведёт в другую базу, бросается
+     * {@link RemoteObjectException}; номер объекта не используется. Тип 9 означает пакет:
      * тогда {@code part1} — пакет, а {@code part2} — подпрограмма в нём. Иначе (7 — автономная
      * процедура, 8 — автономная функция) {@code part1} — сама подпрограмма. Если {@code part2}
      * пуст, именем считается {@code part1}; поэтому при разрешении одного имени пакета в
@@ -144,6 +168,7 @@ public class DictionaryReader {
      * @param name        имя подпрограммы (или пакета, если {@code packageName} равен {@code null})
      * @return где на самом деле лежит код
      * @throws SQLException при ошибке вызова; если имени нет, код ошибки ORA-06564
+     * @throws RemoteObjectException если имя — синоним объекта в другой базе
      */
     public Resolved resolve(Connection con, String schema, String packageName, String name) throws SQLException {
         String full = join(schema, packageName, name);
@@ -160,6 +185,10 @@ public class DictionaryReader {
             String owner = cs.getString(2);
             String part1 = cs.getString(3);
             String part2 = cs.getString(4);
+            String dblink = cs.getString(5);
+            if (dblink != null) {
+                throw new RemoteObjectException(full, dblink);
+            }
             int part1Type = cs.getInt(6);
             boolean isPackage = part1Type == 9;
             return new Resolved(owner, isPackage ? part1 : null, part2 != null ? part2 : part1);
@@ -329,9 +358,10 @@ public class DictionaryReader {
      * Выполняет запрос к {@code ALL_ARGUMENTS} и группирует строки: имя подпрограммы → номер
      * перегрузки → строки, в порядке выдачи запроса.
      *
-     * <p>Номер перегрузки превращается в строку через {@code String.valueOf}, так что у
-     * неперегруженной подпрограммы ключ — строка {@code "null"}. {@code DEFAULTED = 'Y'}
-     * превращается в {@code true}.
+     * <p>У неперегруженной подпрограммы номера перегрузки нет, её ключ — пустая строка.
+     * {@code DEFAULTED = 'Y'} превращается в {@code true}. Длина строки берётся из
+     * {@code CHAR_LENGTH}; 0 или пусто — длина не известна. {@code DATA_LENGTH} не берётся: это
+     * байты, и у не-символьных типов ({@code ROWID}) он меньше длины их строкового вида.
      *
      * @param ps подготовленный запрос с подставленными параметрами, выбирающий столбцы
      *           {@code COLUMNS}
@@ -353,12 +383,25 @@ public class DictionaryReader {
                         "Y".equals(rs.getString("defaulted")),
                         rs.getString("type_owner"),
                         rs.getString("type_name"),
-                        rs.getString("type_subname"));
+                        rs.getString("type_subname"),
+                        length(rs));
                 out.computeIfAbsent(rs.getString("object_name"), k -> new LinkedHashMap<>())
-                        .computeIfAbsent(String.valueOf(row.overload), k -> new ArrayList<>()).add(row);
+                        .computeIfAbsent(row.overload == null ? "" : row.overload, k -> new ArrayList<>()).add(row);
             }
         }
         return out;
+    }
+
+    /**
+     * Читает объявленную длину строки в символах ({@code CHAR_LENGTH}) из текущей строки запроса.
+     *
+     * @param rs результат запроса {@code COLUMNS}, стоящий на строке
+     * @return длина в символах или {@code null}, если словарь её не сообщает
+     * @throws SQLException при ошибке чтения
+     */
+    private static Integer length(ResultSet rs) throws SQLException {
+        int n = rs.getInt("char_len");
+        return rs.wasNull() || n <= 0 ? null : n;
     }
 
     /**
@@ -414,8 +457,10 @@ public class DictionaryReader {
      * <p>У {@code OBJECT} с известным именем типа вложенные элементы заменяются атрибутами из
      * {@code ALL_TYPE_ATTRS}. У коллекции SQL, для которой словарь не дал строки элемента,
      * элемент читается из {@code ALL_COLL_TYPES}. Остальные вложенные строки остаются как есть.
-     * Затем то же делается для каждого вложенного элемента. При {@code depth} больше 5 аргумент
-     * возвращается без изменений: так обход не может уйти в бесконечную рекурсию.
+     * Затем то же делается для каждого вложенного элемента. Глубже {@link #MAX_TYPE_DEPTH}
+     * уровней обход не идёт (так он не может уйти в бесконечную рекурсию): такой элемент
+     * помечается типом {@code NESTED TOO DEEP}, и планировщик называет его при старте, а не
+     * отправляет объект без атрибутов.
      *
      * @param con   соединение, на котором читается словарь
      * @param a     аргумент или вложенный элемент
@@ -424,8 +469,9 @@ public class DictionaryReader {
      * @throws SQLException при ошибке обращения к словарю
      */
     private ArgumentInfo completeSqlType(Connection con, ArgumentInfo a, int depth) throws SQLException {
-        if (depth > 5) {
-            return a;
+        if (depth > MAX_TYPE_DEPTH) {
+            return new ArgumentInfo(a.name(), a.position(), a.dataLevel(), "NESTED TOO DEEP", a.plsType(), a.inOut(),
+                    a.defaulted(), a.typeOwner(), a.typeName(), a.typeSubname(), null, a.charLength());
         }
         ArgKind k = a.kind();
         List<ArgumentInfo> children = new ArrayList<>();
@@ -444,15 +490,24 @@ public class DictionaryReader {
             completed.add(completeSqlType(con, c, depth + 1));
         }
         return new ArgumentInfo(a.name(), a.position(), a.dataLevel(), a.dataType(), a.plsType(), a.inOut(),
-                a.defaulted(), a.typeOwner(), a.typeName(), a.typeSubname(), completed);
+                a.defaulted(), a.typeOwner(), a.typeName(), a.typeSubname(), completed, a.charLength());
     }
+
+    /**
+     * Сколько уровней вложенности объектных типов и коллекций SQL дочитывается.
+     */
+    private static final int MAX_TYPE_DEPTH = 8;
 
     /**
      * Читает атрибуты (поля) объектного типа SQL из {@code ALL_TYPE_ATTRS} в порядке объявления.
      *
      * <p>Для каждого атрибута из {@code ALL_TYPES} берётся код типа ({@code TYPECODE}), чтобы
      * отличить объект и коллекцию от встроенного типа, а из {@code ALL_COLL_TYPES} — вид
-     * коллекции, если атрибут сам коллекция.
+     * коллекции, если атрибут сам коллекция. У встроенных типов ({@code NUMBER},
+     * {@code VARCHAR2}) владельца нет, и соединение с этими представлениями для них явно
+     * пропускается. Тип, объявленный через публичный синоним, словарь записывает с владельцем
+     * {@code PUBLIC} (так выглядит, например, {@code XMLTYPE}: {@code PUBLIC.XMLTYPE}); синоним
+     * раскрывается до настоящего типа ({@code SYS.XMLTYPE}).
      *
      * @param con   соединение, на котором читается словарь
      * @param owner схема типа
@@ -463,10 +518,15 @@ public class DictionaryReader {
      */
     private List<ArgumentInfo> typeAttributes(Connection con, String owner, String type, String inOut) throws SQLException {
         String sql = """
-                select a.attr_name, a.attr_type_owner, a.attr_type_name, t.typecode, c.coll_type
+                select a.attr_name, nvl(s.table_owner, a.attr_type_owner), nvl(s.table_name, a.attr_type_name),
+                       t.typecode, c.coll_type
                   from all_type_attrs a
-                  left join all_types t on t.owner = a.attr_type_owner and t.type_name = a.attr_type_name
-                  left join all_coll_types c on c.owner = a.attr_type_owner and c.type_name = a.attr_type_name
+                  left join all_synonyms s on a.attr_type_owner = 'PUBLIC'
+                        and s.owner = 'PUBLIC' and s.synonym_name = a.attr_type_name
+                  left join all_types t on a.attr_type_owner is not null
+                        and t.owner = nvl(s.table_owner, a.attr_type_owner) and t.type_name = nvl(s.table_name, a.attr_type_name)
+                  left join all_coll_types c on a.attr_type_owner is not null
+                        and c.owner = nvl(s.table_owner, a.attr_type_owner) and c.type_name = nvl(s.table_name, a.attr_type_name)
                  where a.owner = ? and a.type_name = ?
                  order by a.attr_no""";
         List<ArgumentInfo> out = new ArrayList<>();
@@ -485,7 +545,7 @@ public class DictionaryReader {
 
     /**
      * Читает тип элемента коллекции SQL ({@code TABLE OF} или {@code VARRAY}) из
-     * {@code ALL_COLL_TYPES}.
+     * {@code ALL_COLL_TYPES}; публичный синоним типа элемента раскрывается, как у атрибутов.
      *
      * @param con   соединение, на котором читается словарь
      * @param owner схема типа коллекции
@@ -496,10 +556,14 @@ public class DictionaryReader {
      */
     private ArgumentInfo collectionElement(Connection con, String owner, String type, String inOut) throws SQLException {
         String sql = """
-                select c.elem_type_owner, c.elem_type_name, t.typecode, cc.coll_type
+                select nvl(s.table_owner, c.elem_type_owner), nvl(s.table_name, c.elem_type_name), t.typecode, cc.coll_type
                   from all_coll_types c
-                  left join all_types t on t.owner = c.elem_type_owner and t.type_name = c.elem_type_name
-                  left join all_coll_types cc on cc.owner = c.elem_type_owner and cc.type_name = c.elem_type_name
+                  left join all_synonyms s on c.elem_type_owner = 'PUBLIC'
+                        and s.owner = 'PUBLIC' and s.synonym_name = c.elem_type_name
+                  left join all_types t on c.elem_type_owner is not null
+                        and t.owner = nvl(s.table_owner, c.elem_type_owner) and t.type_name = nvl(s.table_name, c.elem_type_name)
+                  left join all_coll_types cc on c.elem_type_owner is not null
+                        and cc.owner = nvl(s.table_owner, c.elem_type_owner) and cc.type_name = nvl(s.table_name, c.elem_type_name)
                  where c.owner = ? and c.type_name = ?""";
         try (PreparedStatement ps = con.prepareStatement(sql)) {
             ps.setString(1, owner);
@@ -522,6 +586,12 @@ public class DictionaryReader {
      * скобках ({@code TIMESTAMP(6)} превращается в {@code TIMESTAMP}); владелец и имя типа у
      * встроенного типа обнуляются. Позиция не заполняется (0), уровень вложенности всегда 1.
      *
+     * <p>Системные типы {@code SYS.XMLTYPE}, {@code SYS.ANYDATA} и подобные в
+     * {@code ALL_TYPES} имеют собственный код ({@code XMLTYPE}, {@code ANYDATA}), а не
+     * {@code OBJECT}; они записываются как {@code OPAQUE/<имя>}, как их называет
+     * {@code ALL_ARGUMENTS}, чтобы планировщик узнал их и остановил старт с понятной причиной:
+     * внутри объектного типа SQL такие атрибуты через JDBC не передать.
+     *
      * @param name      имя атрибута или {@code null} у элемента коллекции
      * @param typeOwner схема типа
      * @param typeName  имя типа
@@ -537,6 +607,11 @@ public class DictionaryReader {
             dataType = "OBJECT";
         } else if ("COLLECTION".equals(typecode)) {
             dataType = "VARYING ARRAY".equals(collType) ? "VARRAY" : "TABLE";
+        } else if (typecode != null) {
+            // Системный непрозрачный тип: SYS.XMLTYPE, SYS.ANYDATA, ...
+            dataType = "OPAQUE/" + typeName;
+        } else if (typeName == null) {
+            dataType = "UNKNOWN";
         } else {
             // Встроенный тип: NUMBER, VARCHAR2, DATE, TIMESTAMP(6), ...
             dataType = typeName.replaceAll("\\(.*\\)", "");
@@ -612,7 +687,7 @@ public class DictionaryReader {
      * @param con     соединение, на котором читается словарь
      * @param sp      подпрограмма, которой принадлежит объявление
      * @param source  исходный текст спецификации пакета или самой подпрограммы
-     * @param written имя из объявления в верхнем регистре или {@code null}
+     * @param written имя из объявления ({@link #rowtypeOf}) или {@code null}
      * @return полное имя таблицы или курсора; {@code null}, если имя не задано или не
      *         разрешилось (такой таблицы этот пользователь не видит, синоним ведёт по dblink)
      * @throws SQLException при ошибке обращения к словарю
@@ -622,21 +697,21 @@ public class DictionaryReader {
         if (written == null) {
             return null;
         }
-        String[] parts = written.replace("\"", "").split("\\.");
-        if (parts.length == 1) {
-            if (sp.packageName() != null && declaresCursor(source, parts[0])) {
-                return sp.owner() + "." + sp.packageName() + "." + parts[0];
+        List<String> parts = nameParts(written);
+        if (parts.size() == 1) {
+            if (sp.packageName() != null && declaresCursor(source, parts.get(0))) {
+                return sqlName(sp.owner(), sp.packageName(), parts.get(0));
             }
-            return resolveTable(con, sp.owner(), parts[0], true);
+            return resolveTable(con, sp.owner(), parts.get(0), true);
         }
-        if (parts.length == 2) {
-            String table = resolveTable(con, parts[0], parts[1], false);
-            if (table != null || !isPackage(con, sp.owner(), parts[0])) {
+        if (parts.size() == 2) {
+            String table = resolveTable(con, parts.get(0), parts.get(1), false);
+            if (table != null || !isPackage(con, sp.owner(), parts.get(0))) {
                 return table;
             }
-            return sp.owner() + "." + parts[0] + "." + parts[1];
+            return sqlName(sp.owner(), parts.get(0), parts.get(1));
         }
-        return String.join(".", parts);
+        return sqlName(parts.toArray(String[]::new));
     }
 
     /**
@@ -651,7 +726,8 @@ public class DictionaryReader {
      * @param schema         схема, в которой разрешается имя
      * @param name           имя без схемы
      * @param publicSynonyms искать ли публичные синонимы (только для имени, написанного без схемы)
-     * @return {@code OWNER.TABLE} или {@code null}, если ничего не нашлось, синоним ведёт в
+     * @return {@code OWNER.TABLE} (имена в кавычках, если без них нельзя) или {@code null}, если
+     *         ничего не нашлось, синоним ведёт в
      *         другую базу (dblink) или цепочка синонимов длиннее {@link #MAX_SYNONYM_HOPS}
      * @throws SQLException при ошибке обращения к словарю
      */
@@ -680,7 +756,7 @@ public class DictionaryReader {
                         return null;
                     }
                     if (rs.getInt(1) == 1) {
-                        return schema + "." + name;
+                        return sqlName(schema, name);
                     }
                     schema = rs.getString(2);
                     name = rs.getString(3);
@@ -714,15 +790,15 @@ public class DictionaryReader {
     /**
      * Проверяет, объявлен ли в исходнике курсор с таким именем: {@code CURSOR C_EMP IS ...}.
      *
-     * <p>Комментарии не учитываются, имя ищется целым словом без учёта регистра.
+     * <p>Комментарии и строковые литералы не учитываются; имя без кавычек ищется целым словом
+     * без учёта регистра, имя в кавычках — точно.
      *
      * @param source исходный текст спецификации пакета
-     * @param name   имя курсора
+     * @param name   имя курсора так, как его хранит словарь
      * @return {@code true}, если курсор объявлен
      */
     static boolean declaresCursor(String source, String name) {
-        return Pattern.compile("\\bCURSOR\\s+\"?" + Pattern.quote(name.toUpperCase(Locale.ROOT)) + "\"?(?![A-Z0-9_$#])")
-                .matcher(stripComments(source).toUpperCase(Locale.ROOT)).find();
+        return Pattern.compile("\\bCURSOR\\s+" + namePattern(name) + NAME_END).matcher(scan(source, true)[1]).find();
     }
 
     /**
@@ -750,7 +826,7 @@ public class DictionaryReader {
         }
         // typeSubname остаётся null: CallPlanner объявляет переменную как <typeName>%ROWTYPE.
         return new ArgumentInfo(a.name(), a.position(), a.dataLevel(), a.dataType(), a.plsType(), a.inOut(),
-                a.defaulted(), null, rowtypeOf, null, a.children());
+                a.defaulted(), null, rowtypeOf, null, a.children(), a.charLength());
     }
 
     /**
@@ -785,28 +861,57 @@ public class DictionaryReader {
      * {@code PROCEDURE} или {@code FUNCTION} до {@code ;} или {@code IS}/{@code AS}, которые
      * завершают её заголовок.
      *
-     * <p>Комментарии предварительно удаляются, текст приводится к верхнему регистру. Имя ищется
-     * целым словом, в том числе в двойных кавычках. Перегрузки нумеруются в порядке объявления,
-     * как их нумерует {@code ALL_ARGUMENTS.OVERLOAD}: берётся вхождение с номером
-     * {@code overload}, а если он {@code null} — первое.
+     * <p>Текст сначала размечается ({@link #scan}): комментарии не учитываются, а внутри
+     * строковых литералов ничего не ищется, поэтому ни {@code 'PROCEDURE X'} в значении по
+     * умолчанию, ни {@code DEFAULT ')'} не сбивают ни счёт перегрузок, ни поиск конца заголовка.
+     * Имя ищется целым словом без учёта регистра, а имя, объявленное в двойных кавычках, — точно.
+     * Перегрузки нумеруются в порядке объявления, как их нумерует {@code ALL_ARGUMENTS.OVERLOAD}:
+     * берётся вхождение с номером {@code overload}, а если он {@code null} — первое.
      *
      * @param source   исходный текст пакета или подпрограммы
-     * @param name     имя подпрограммы, регистр не важен
+     * @param name     имя подпрограммы так, как его хранит словарь (без кавычек — в верхнем регистре)
      * @param overload номер перегрузки строкой или {@code null}
-     * @return объявление в верхнем регистре или пустая строка, если оно не найдено
+     * @return объявление без комментариев, в верхнем регистре везде, кроме имён в двойных
+     *         кавычках; пустая строка, если объявление не найдено
      */
     static String findDeclaration(String source, String name, String overload) {
-        String text = stripComments(source).toUpperCase(Locale.ROOT);
-        Matcher m = Pattern.compile("\\b(PROCEDURE|FUNCTION)\\s+\"?" + Pattern.quote(name.toUpperCase(Locale.ROOT))
-                + "\"?(?![A-Z0-9_$#])").matcher(text);
-        int wanted = overload == null ? 1 : Integer.parseInt(overload);
+        String[] t = scan(source, true);
+        Matcher m = Pattern.compile("\\b(?:PROCEDURE|FUNCTION)\\s+" + namePattern(name) + NAME_END).matcher(t[1]);
+        int wanted = overload == null || overload.isEmpty() ? 1 : Integer.parseInt(overload);
         int seen = 0;
         while (m.find()) {
             if (++seen == wanted) {
-                return text.substring(m.start(), headerEnd(text, m.end()));
+                return t[0].substring(m.start(), headerEnd(t[1], m.end()));
             }
         }
         return "";
+    }
+
+    /**
+     * Проверка «имя закончилось»: дальше не идёт символ, который мог бы продолжить
+     * идентификатор, и не закрывающая кавычка.
+     */
+    private static final String NAME_END = "(?![\\p{L}\\p{N}_$#\"])";
+
+    /**
+     * Часть имени в тексте после {@link #scan}: имя в кавычках или имя без кавычек (оно уже в
+     * верхнем регистре).
+     */
+    private static final String NAME_PART = "(?:\"[^\"]+\"|[\\p{L}\\p{N}_$#]+)";
+
+    /**
+     * Шаблон, который находит одно имя в тексте после {@link #scan}.
+     *
+     * <p>Имя в верхнем регистре (так словарь хранит имена, объявленные без кавычек) находится и
+     * без кавычек, и в кавычках. Имя в другом регистре могло быть объявлено только в кавычках и
+     * ищется только в них, точно: {@code "Load"} не спутается с {@code load}.
+     *
+     * @param name имя так, как его хранит словарь
+     * @return фрагмент регулярного выражения
+     */
+    private static String namePattern(String name) {
+        String quoted = "\"" + Pattern.quote(name) + "\"";
+        return name.equals(name.toUpperCase(Locale.ROOT)) ? "(?:" + quoted + "|" + Pattern.quote(name) + ")" : quoted;
     }
 
     /**
@@ -814,32 +919,33 @@ public class DictionaryReader {
      * {@code IS}/{@code AS} вне круглых скобок.
      *
      * <p>Скобки считаются, чтобы не остановиться на таких символах внутри списка аргументов.
+     * Поиск идёт по тексту, в котором содержимое строковых литералов уже заменено пробелами.
      *
-     * @param text текст в верхнем регистре без комментариев
-     * @param from позиция сразу после имени подпрограммы
+     * @param masked текст после {@link #scan} (второй элемент)
+     * @param from   позиция сразу после имени подпрограммы
      * @return позиция конца заголовка или длина текста, если конец не найден
      */
-    private static int headerEnd(String text, int from) {
+    private static int headerEnd(String masked, int from) {
         int depth = 0;
-        for (int i = from; i < text.length(); i++) {
-            char c = text.charAt(i);
+        for (int i = from; i < masked.length(); i++) {
+            char c = masked.charAt(i);
             if (c == '(') {
                 depth++;
             } else if (c == ')') {
                 depth--;
-            } else if (depth == 0 && (c == ';' || isKeywordAt(text, i, "IS") || isKeywordAt(text, i, "AS"))) {
+            } else if (depth == 0 && (c == ';' || isKeywordAt(masked, i, "IS") || isKeywordAt(masked, i, "AS"))) {
                 return i;
             }
         }
-        return text.length();
+        return masked.length();
     }
 
     /**
      * Проверяет, начинается ли в позиции {@code i} отдельное ключевое слово {@code kw}.
      *
-     * <p>Перед словом должен стоять пробельный символ, после — конец текста или символ, который
-     * не может входить в идентификатор. Так {@code IS} в {@code P_ISSUE_DATE} словом не
-     * считается.
+     * <p>До и после слова не должно быть символа, который мог бы входить в идентификатор, и
+     * кавычки. Так {@code IS} в {@code P_ISSUE_DATE} и {@code AS} в {@code ASSET_T} словами не
+     * считаются, а {@code )IS} без пробела — считается.
      *
      * @param text текст в верхнем регистре
      * @param i    позиция проверки
@@ -847,11 +953,14 @@ public class DictionaryReader {
      * @return {@code true}, если в позиции {@code i} стоит слово {@code kw}
      */
     private static boolean isKeywordAt(String text, int i, String kw) {
-        if (!text.startsWith(kw, i) || i == 0 || !Character.isWhitespace(text.charAt(i - 1))) {
+        if (!text.startsWith(kw, i)) {
+            return false;
+        }
+        if (i > 0 && (isIdentifierChar(text.charAt(i - 1)) || text.charAt(i - 1) == '"')) {
             return false;
         }
         int after = i + kw.length();
-        return after >= text.length() || !isIdentifierChar(text.charAt(after));
+        return after >= text.length() || (!isIdentifierChar(text.charAt(after)) && text.charAt(after) != '"');
     }
 
     /**
@@ -870,16 +979,17 @@ public class DictionaryReader {
      *
      * <p>Понимает режимы {@code IN}, {@code OUT}, {@code IN OUT} и подсказку {@code NOCOPY}
      * (просьбу передавать параметр по ссылке, без копирования). Имя возвращается как написано
-     * ({@code EMP}, {@code HR.EMP_HIST}, {@code C_EMP}); что оно означает — таблицу, синоним или
-     * курсор, — решает {@link #resolveRowtype}.
+     * ({@code EMP}, {@code HR.EMP_HIST}, {@code C_EMP}, {@code "Emp"}); что оно означает —
+     * таблицу, синоним или курсор, — решает {@link #resolveRowtype}.
      *
-     * @param decl    объявление в верхнем регистре (результат {@link #findDeclaration})
-     * @param argName имя аргумента в верхнем регистре
+     * @param decl    объявление (результат {@link #findDeclaration})
+     * @param argName имя аргумента так, как его хранит словарь
      * @return имя перед {@code %ROWTYPE} или {@code null}, если аргумент объявлен иначе
      */
     static String rowtypeOf(String decl, String argName) {
-        Matcher m = Pattern.compile("(?<![A-Z0-9_$#])" + Pattern.quote(argName)
-                + "\\s+(?:IN\\s+OUT\\s+|IN\\s+|OUT\\s+)?(?:NOCOPY\\s+)?([A-Z0-9_$#.\"]+)%ROWTYPE").matcher(decl);
+        Matcher m = Pattern.compile("(?<![\\p{L}\\p{N}_$#\"])" + namePattern(argName)
+                + "\\s+(?:IN\\s+OUT\\s+|IN\\s+|OUT\\s+)?(?:NOCOPY\\s+)?(" + NAME_PART + "(?:\\." + NAME_PART + "){0,2})%ROWTYPE")
+                .matcher(decl);
         return m.find() ? m.group(1) : null;
     }
 
@@ -887,53 +997,197 @@ public class DictionaryReader {
      * Находит в объявлении функции имя из {@code RETURN ...%ROWTYPE}:
      * {@code RETURN EMP%ROWTYPE} даёт {@code EMP}.
      *
-     * @param decl объявление в верхнем регистре (результат {@link #findDeclaration})
+     * @param decl объявление (результат {@link #findDeclaration})
      * @return имя перед {@code %ROWTYPE} или {@code null}, если функция возвращает не {@code %ROWTYPE}
      */
     static String returnRowtypeOf(String decl) {
-        Matcher m = Pattern.compile("\\bRETURN\\s+([A-Z0-9_$#.\"]+)%ROWTYPE").matcher(decl);
+        Matcher m = Pattern.compile("\\bRETURN\\s+(" + NAME_PART + "(?:\\." + NAME_PART + "){0,2})%ROWTYPE").matcher(decl);
         return m.find() ? m.group(1) : null;
+    }
+
+    /**
+     * Разбивает имя из объявления на части: {@code HR."Emp"} даёт {@code [HR, Emp]}.
+     *
+     * @param written имя как в объявлении: части без кавычек уже в верхнем регистре
+     * @return части имени без кавычек
+     */
+    static List<String> nameParts(String written) {
+        List<String> parts = new ArrayList<>();
+        Matcher m = Pattern.compile("\"([^\"]+)\"|([^.\"]+)").matcher(written);
+        while (m.find()) {
+            parts.add(m.group(1) != null ? m.group(1) : m.group(2));
+        }
+        return parts;
+    }
+
+    /**
+     * Склеивает части имени через точку так, чтобы результат можно было написать в блоке:
+     * часть, которую нельзя написать без кавычек (строчные буквы, пробелы), берётся в кавычки.
+     *
+     * @param parts части имени, как их хранит словарь
+     * @return имя для текста PL/SQL, например {@code APP."Emp"}
+     */
+    static String sqlName(String... parts) {
+        StringBuilder sb = new StringBuilder();
+        for (String part : parts) {
+            if (!sb.isEmpty()) {
+                sb.append('.');
+            }
+            sb.append(part.matches("[A-Z][A-Z0-9_$#]*") ? part : "\"" + part.replace("\"", "\"\"") + "\"");
+        }
+        return sb.toString();
     }
 
     /**
      * Удаляет из текста PL/SQL комментарии: однострочные ({@code --} до конца строки) и
      * многострочные (<code>/* ... *&#47;</code>).
      *
-     * <p>Строковые литералы в одинарных кавычках копируются как есть (удвоенная кавычка
-     * {@code ''} внутри литерала означает саму кавычку), поэтому {@code --} внутри кавычек
-     * комментарием не считается. Каждый комментарий заменяется одним пробелом, чтобы соседние
-     * слова не склеились; перевод строки после {@code --} сохраняется.
+     * <p>Комментарий заменяется пробелами той же длины (переводы строк сохраняются), так что
+     * позиции в тексте не сдвигаются. Строковые литералы ({@code '...'}, {@code q'[...]'}) и имена
+     * в двойных кавычках копируются как есть: {@code --} внутри них комментарием не считается.
      *
      * @param s исходный текст
-     * @return текст без комментариев
+     * @return текст без комментариев той же длины
      */
     static String stripComments(String s) {
-        StringBuilder out = new StringBuilder(s.length());
+        return scan(s, false)[0];
+    }
+
+    /**
+     * Размечает исходный текст PL/SQL для поиска: возвращает две строки той же длины, что и
+     * исходник, так что позиции в них совпадают символ в символ.
+     *
+     * <ul>
+     *   <li>первая — комментарии ({@code --} до конца строки и <code>/* ... *&#47;</code>)
+     *       заменены пробелами (переводы строк сохранены);</li>
+     *   <li>вторая — то же, но и содержимое строковых литералов заменено пробелами (сами кавычки
+     *       остаются). По ней ищутся ключевые слова и скобки.</li>
+     * </ul>
+     * Понимаются литералы {@code '...'} с удвоенной кавычкой внутри, литералы с другой кавычкой
+     * {@code q'[...]'}, {@code q'{...}'}, {@code q'!...!'} (и национальные {@code nq'...'}) и имена в
+     * двойных кавычках: внутри имени в кавычках ничего не распознаётся и регистр не меняется.
+     *
+     * @param s     исходный текст
+     * @param upper перевести ли в верхний регистр всё, кроме имён в двойных кавычках (посимвольно,
+     *              так что длина не меняется)
+     * @return две строки той же длины, см. выше
+     */
+    static String[] scan(String s, boolean upper) {
+        int n = s.length();
+        char[] text = new char[n];
+        char[] masked = new char[n];
         int i = 0;
-        while (i < s.length()) {
+        while (i < n) {
             char c = s.charAt(i);
-            if (c == '\'') {
-                int end = s.indexOf('\'', i + 1);
-                while (end >= 0 && end + 1 < s.length() && s.charAt(end + 1) == '\'') {
-                    end = s.indexOf('\'', end + 2);
+            int end;
+            if (c == '-' && i + 1 < n && s.charAt(i + 1) == '-') {
+                end = s.indexOf('\n', i);
+                end = end < 0 ? n : end;
+                blank(s, i, end, text, masked);
+            } else if (c == '/' && i + 1 < n && s.charAt(i + 1) == '*') {
+                end = s.indexOf("*/", i + 2);
+                end = end < 0 ? n : end + 2;
+                blank(s, i, end, text, masked);
+            } else if (c == '"') {
+                end = s.indexOf('"', i + 1);
+                end = end < 0 ? n : end + 1;
+                s.getChars(i, end, text, i);
+                s.getChars(i, end, masked, i);
+            } else if (isQQuoteAt(s, i)) {
+                char open = s.charAt(i + 2);
+                char close = switch (open) {
+                    case '[' -> ']';
+                    case '(' -> ')';
+                    case '{' -> '}';
+                    case '<' -> '>';
+                    default -> open;
+                };
+                int closeAt = s.indexOf(close + "'", i + 3);
+                end = closeAt < 0 ? n : closeAt + 2;
+                literal(s, i, i + 3, closeAt < 0 ? n : closeAt, end, upper, text, masked);
+            } else if (c == '\'') {
+                int k = i + 1;
+                int closeAt = -1;
+                while (k < n) {
+                    if (s.charAt(k) == '\'') {
+                        if (k + 1 < n && s.charAt(k + 1) == '\'') {
+                            k += 2;
+                            continue;
+                        }
+                        closeAt = k;
+                        break;
+                    }
+                    k++;
                 }
-                end = end < 0 ? s.length() : end + 1;
-                out.append(s, i, end);
-                i = end;
-            } else if (s.startsWith("--", i)) {
-                int nl = s.indexOf('\n', i);
-                i = nl < 0 ? s.length() : nl;
-                out.append(' ');
-            } else if (s.startsWith("/*", i)) {
-                int close = s.indexOf("*/", i + 2);
-                i = close < 0 ? s.length() : close + 2;
-                out.append(' ');
+                end = closeAt < 0 ? n : closeAt + 1;
+                literal(s, i, i + 1, closeAt < 0 ? n : closeAt, end, upper, text, masked);
             } else {
-                out.append(c);
-                i++;
+                end = i + 1;
+                text[i] = upper ? Character.toUpperCase(c) : c;
+                masked[i] = text[i];
             }
+            i = end;
         }
-        return out.toString();
+        return new String[]{new String(text), new String(masked)};
+    }
+
+    /**
+     * Проверяет, начинается ли в позиции {@code i} литерал с другой кавычкой: {@code q'X...X'}
+     * (в том числе национальный {@code nq'X...X'}, у которого {@code n} уже пройдена).
+     *
+     * @param s исходный текст
+     * @param i позиция буквы {@code q}
+     * @return {@code true}, если здесь начинается такой литерал
+     */
+    private static boolean isQQuoteAt(String s, int i) {
+        char c = s.charAt(i);
+        if ((c != 'q' && c != 'Q') || i + 2 >= s.length() || s.charAt(i + 1) != '\'') {
+            return false;
+        }
+        if (i == 0 || !isIdentifierChar(s.charAt(i - 1))) {
+            return true;
+        }
+        char prev = s.charAt(i - 1);
+        return (prev == 'n' || prev == 'N') && (i == 1 || !isIdentifierChar(s.charAt(i - 2)));
+    }
+
+    /**
+     * Заменяет комментарий пробелами в обеих размеченных строках, сохраняя переводы строк.
+     *
+     * @param s      исходный текст
+     * @param from   начало комментария
+     * @param to     позиция сразу после комментария
+     * @param text   первая размеченная строка
+     * @param masked вторая размеченная строка
+     */
+    private static void blank(String s, int from, int to, char[] text, char[] masked) {
+        for (int k = from; k < to; k++) {
+            char ch = s.charAt(k);
+            text[k] = masked[k] = ch == '\n' || ch == '\r' ? ch : ' ';
+        }
+    }
+
+    /**
+     * Копирует строковый литерал в первую размеченную строку, а во вторую — только его кавычки,
+     * заменяя содержимое пробелами.
+     *
+     * @param s            исходный текст
+     * @param from         начало литерала (первая кавычка или буква {@code q})
+     * @param contentStart первый символ содержимого
+     * @param contentEnd   позиция сразу после содержимого
+     * @param to           позиция сразу после литерала
+     * @param upper        переводить ли в верхний регистр
+     * @param text         первая размеченная строка
+     * @param masked       вторая размеченная строка
+     */
+    private static void literal(String s, int from, int contentStart, int contentEnd, int to, boolean upper,
+                                char[] text, char[] masked) {
+        for (int k = from; k < to; k++) {
+            char ch = s.charAt(k);
+            text[k] = upper ? Character.toUpperCase(ch) : ch;
+            boolean content = k >= contentStart && k < contentEnd;
+            masked[k] = content ? (ch == '\n' || ch == '\r' ? ch : ' ') : text[k];
+        }
     }
 
     /**
@@ -960,7 +1214,8 @@ public class DictionaryReader {
                 continue; // у процедуры без аргументов одна пустая строка
             }
             ArgumentInfo a = new ArgumentInfo(row.name, row.position, row.level, row.dataType,
-                    row.plsType, row.inOut, row.defaulted, row.typeOwner, row.typeName, row.typeSubname, null);
+                    row.plsType, row.inOut, row.defaulted, row.typeOwner, row.typeName, row.typeSubname, null,
+                    row.charLength);
             while (stack.size() > row.level) {
                 stack.pop();
             }
@@ -985,7 +1240,9 @@ public class DictionaryReader {
      *
      * <p>В {@code ALL_PROCEDURES} у автономной подпрограммы её имя лежит в
      * {@code OBJECT_NAME}, а {@code PROCEDURE_NAME} пуст; у подпрограммы пакета в
-     * {@code OBJECT_NAME} — имя пакета, а в {@code PROCEDURE_NAME} — имя подпрограммы.
+     * {@code OBJECT_NAME} — имя пакета, а в {@code PROCEDURE_NAME} — имя подпрограммы. Строки с
+     * пустым {@code PROCEDURE_NAME} есть и у самих пакетов, типов и триггеров, поэтому для
+     * автономной подпрограммы дополнительно проверяется {@code OBJECT_TYPE}.
      *
      * @param con соединение, на котором читается словарь
      * @param r   где лежит подпрограмма
@@ -995,6 +1252,7 @@ public class DictionaryReader {
     private boolean existsWithoutArguments(Connection con, Resolved r) throws SQLException {
         String sql = r.packageName() == null
                 ? "select count(*) from all_procedures where owner = ? and object_name = ? and procedure_name is null"
+                        + " and object_type in ('PROCEDURE', 'FUNCTION')"
                 : "select count(*) from all_procedures where owner = ? and object_name = ? and procedure_name = ?";
         try (PreparedStatement ps = con.prepareStatement(sql)) {
             ps.setString(1, r.owner());
@@ -1043,8 +1301,10 @@ public class DictionaryReader {
      * @param typeOwner   {@code TYPE_OWNER}: схема пользовательского типа
      * @param typeName    {@code TYPE_NAME}: имя типа или пакета, где он объявлен
      * @param typeSubname {@code TYPE_SUBNAME}: имя типа внутри пакета
+     * @param charLength  объявленная длина строки в символах или {@code null}
      */
     private record Row(String overload, int position, int level, String name, String dataType, String plsType,
-                       String inOut, boolean defaulted, String typeOwner, String typeName, String typeSubname) {
+                       String inOut, boolean defaulted, String typeOwner, String typeName, String typeSubname,
+                       Integer charLength) {
     }
 }

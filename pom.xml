@@ -8,7 +8,7 @@
        зафиксирован на ветке 19.x: клиенты 21+ сервер 11.2 официально не поддерживают. -->
   <groupId>dev.plsql</groupId>
   <artifactId>plsql-spring-parent</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <packaging>pom</packaging>
   <name>Oracle Spring Data (parent)</name>
   <url>https://github.com/OOOMegaLul/oracle-spring-data</url>

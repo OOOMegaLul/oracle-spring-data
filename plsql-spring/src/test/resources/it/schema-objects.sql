@@ -24,12 +24,15 @@ create or replace type lab_obj_tab as table of lab_obj
 /
 create or replace type lab_num_tab as table of number
 /
+create or replace type lab_xobj as object (id number, body xmltype)
+/
 create or replace package lab_pkg as
   type rec_t is record (id number, name varchar2(100), flag boolean, dt date);
   type xrec_t is record (id number, body xmltype);
   type num_ibt is table of number index by pls_integer;
   type str_ibt is table of varchar2(100) index by pls_integer;
   type rec_ibt is table of rec_t index by pls_integer;
+  type long_ibt is table of varchar2(32767) index by pls_integer;
 
   g_state varchar2(100);
   cursor c_emp is select id, name from lab_emp;
@@ -66,6 +69,10 @@ create or replace package lab_pkg as
   procedure xml_out(p_n number, p_x out xmltype);
   procedure xrec_inout(p_r in out xrec_t);
   function xml_is_null(p_x xmltype) return number;
+  function long_len(p_vals long_ibt) return number;
+  procedure long_out(p_n number, p_len number, p_vals out long_ibt);
+  procedure emps_prefixed(p_cur out sys_refcursor);
+  function xobj_id(p_obj lab_xobj) return number;
 end lab_pkg;
 /
 create or replace package body lab_pkg as
@@ -197,5 +204,21 @@ create or replace package body lab_pkg as
   begin
     return case when p_x is null then 1 else 0 end;
   end;
+  function long_len(p_vals long_ibt) return number is
+    s number := 0;
+    i pls_integer := p_vals.first;
+  begin
+    while i is not null loop s := s + nvl(length(p_vals(i)), 0); i := p_vals.next(i); end loop;
+    return s;
+  end;
+  procedure long_out(p_n number, p_len number, p_vals out long_ibt) is
+  begin
+    for i in 1..p_n loop p_vals(i) := rpad('v', p_len, 'x'); end loop;
+  end;
+  procedure emps_prefixed(p_cur out sys_refcursor) is
+  begin
+    open p_cur for select id nrn, name sname, hired dhired from lab_emp order by id;
+  end;
+  function xobj_id(p_obj lab_xobj) return number is begin return p_obj.id; end;
 end lab_pkg;
 /

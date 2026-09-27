@@ -234,4 +234,21 @@ class SessionContextDataSourceTest {
         verify(init).execute();
         verify(con, never()).prepareCall(SessionContextDataSource.REINITIALIZE_PACKAGES);
     }
+    /**
+     * Проверяет сравнение ключа сессии: ключ-число сравнивается как число ({@code 1001.0} из базы
+     * и {@code 1001L} из Java — один ключ, и запись с {@code commit} не повторяется на каждой
+     * выдаче), а строковый — строго как строка: коды {@code "007"} и {@code "7"} разные, иначе
+     * пользователь получил бы сессию, подготовленную под чужой код.
+     */
+    @Test
+    void keysCompareByTheirJavaType() {
+        assertThat(SessionContextDataSource.sameKey("1001.0", 1001L)).isTrue();
+        assertThat(SessionContextDataSource.sameKey(" 1001", 1001)).isTrue();
+        assertThat(SessionContextDataSource.sameKey("007", "7")).isFalse();
+        assertThat(SessionContextDataSource.sameKey("1.0", "1")).isFalse();
+        assertThat(SessionContextDataSource.sameKey("A", "a")).isFalse();
+        assertThat(SessionContextDataSource.sameKey(null, "1")).isFalse();
+        assertThat(SessionContextDataSource.sameKey("1", null)).isFalse();
+        assertThat(SessionContextDataSource.sameKey(null, null)).isTrue();
+    }
 }

@@ -466,9 +466,7 @@ public class CallPlanner {
      *
      * @param a аргумент или возвращаемое значение функции
      * @return {@code BOOLEAN}, {@code XMLTYPE}, {@code SYS_REFCURSOR} или имя типа записи
-     * @throws PlanException если для этого вида переменная не предусмотрена; текст сообщения
-     *                       говорит о возвращаемом значении, потому что аргументы таких видов
-     *                       отсекаются раньше
+     * @throws PlanException если для этого вида переменная не предусмотрена
      */
     private static String localType(ArgumentInfo a) {
         return switch (a.kind()) {
@@ -476,7 +474,8 @@ public class CallPlanner {
             case XMLTYPE -> "XMLTYPE";
             case REF_CURSOR -> "SYS_REFCURSOR";
             case RECORD -> recordType(a);
-            default -> throw new PlanException("return type " + a.dataType() + " is not supported");
+            default -> throw new PlanException((a.name() == null ? "return value" : a.name()) + " of type "
+                    + a.dataType() + " is not supported");
         };
     }
 
@@ -562,7 +561,10 @@ public class CallPlanner {
      *   <li>запись с неизвестным именем типа или с полями неподдерживаемых типов;</li>
      *   <li>index-by таблица с элементами не {@code NUMBER} и не {@code VARCHAR2};</li>
      *   <li>тип, который библиотека не знает вовсе (например, {@code OPAQUE/ANYDATA});</li>
-     *   <li>REF CURSOR только на вход: открытый курсор нельзя передать из Java.</li>
+     *   <li>REF CURSOR только на вход: открытый курсор нельзя передать из Java;</li>
+     *   <li>атрибут объектного типа SQL или элемент коллекции SQL, который через JDBC внутри
+     *       {@code Struct}/{@code Array} не передать ({@code XMLTYPE}, {@code ANYDATA} и
+     *       подобные), и вложенность типов глубже, чем читает словарь.</li>
      * </ul>
      * {@link #plan(Method, SubprogramInfo)} вызывает эту проверку первой: такие причины
      * важнее любых несовпадений со стороной Java.
@@ -602,11 +604,36 @@ public class CallPlanner {
                         issues.add(who + ": IN REF CURSOR");
                     }
                 }
+                case OBJECT, SQL_COLLECTION -> sqlTypeIssues(who, a, issues);
                 default -> {
                 }
             }
         }
         return issues;
+    }
+
+    /**
+     * Проверяет атрибуты объектного типа и элементы коллекции SQL, рекурсивно.
+     *
+     * <p>Внутри {@code Struct} и {@code Array} драйвер передаёт только SQL-типы: числа, строки,
+     * даты, LOB, {@code RAW}, вложенные объекты и коллекции. {@code XMLTYPE} там требует
+     * библиотек XDB, которых у ojdbc нет, остальные непрозрачные типы не передаются вовсе.
+     *
+     * @param who    имя аргумента для сообщения
+     * @param a      объект или коллекция SQL
+     * @param issues список, куда добавляются проблемы
+     */
+    private static void sqlTypeIssues(String who, ArgumentInfo a, List<String> issues) {
+        for (ArgumentInfo c : a.children()) {
+            String what = a.sqlTypeName() + (c.name() == null ? " element" : "." + c.name());
+            switch (c.kind()) {
+                case OBJECT, SQL_COLLECTION -> sqlTypeIssues(who, c, issues);
+                case NUMBER, STRING, DATE, TIMESTAMP, CLOB, BLOB, RAW -> {
+                }
+                default -> issues.add(who + ": " + what + " is " + c.dataType()
+                        + ", which cannot be passed inside a SQL object or collection");
+            }
+        }
     }
 
     // ------------------------------------------------------------------ сторона Java
@@ -634,9 +661,13 @@ public class CallPlanner {
      *         массива аргументов вызова; в порядке параметров метода
      * @throws PlanException если параметр или свойство не нашли аргумента или нашли его
      *                       неоднозначно, если параметр попал в чисто выходной аргумент или
-     *                       два параметра попали в один аргумент
+     *                       два параметра попали в один аргумент, если тип Java заведомо не
+     *                       передаётся в тип аргумента или если у record/бина нет свойства для
+     *                       поля записи или атрибута объекта (см. {@link #checkJavaType})
      */
     private Map<ArgumentInfo, Function<Object[], Object>> matchParameters(Method method, SubprogramInfo sp) {
+        Procedure procAnn = method.getAnnotation(Procedure.class);
+        boolean nullForMissing = procAnn != null && procAnn.nullForMissing();
         Parameter[] params = method.getParameters();
         Map<ArgumentInfo, Function<Object[], Object>> supplied = new LinkedHashMap<>();
         for (int i = 0; i < params.length; i++) {
@@ -653,8 +684,9 @@ public class CallPlanner {
                                 + " has no matching argument; arguments are " + names(sp.arguments()));
                     }
                     String argName = pa.name();
-                    put(supplied, pa, args -> Values.property(args[k], argName),
-                            "property '" + prop.name() + "' of " + p.getType().getSimpleName());
+                    String label = "property '" + prop.name() + "' of " + p.getType().getSimpleName();
+                    checkJavaType(pa, prop.type(), label, nullForMissing);
+                    put(supplied, pa, args -> Values.property(args[k], argName), label);
                 }
                 continue;
             }
@@ -663,9 +695,140 @@ public class CallPlanner {
                         + "' has no matching argument; arguments are " + names(sp.arguments())
                         + (p.getName().matches("arg\\d+") ? " (compile with -parameters)" : ""));
             }
-            put(supplied, a, args -> args[k], "parameter '" + p.getName() + "'");
+            String label = "parameter '" + p.getName() + "'";
+            checkJavaType(a, ResolvableType.forMethodParameter(method, i), label, nullForMissing);
+            put(supplied, a, args -> args[k], label);
         }
         return supplied;
+    }
+
+    /**
+     * Проверяет при старте, что значение этого типа Java можно передать в аргумент.
+     *
+     * <ul>
+     *   <li>Тип должен быть совместим с видом аргумента ({@link #compatible}): {@code LocalTime}
+     *       в {@code DATE}, строка в {@code BLOB} или число в запись упали бы только при вызове.</li>
+     *   <li>У record или бина, который идёт в {@code RECORD} или объектный тип SQL, должно быть
+     *       свойство на каждое поле или атрибут; у коллекции объектов — у типа элемента. Иначе
+     *       поле молча ушло бы {@code NULL}. С {@code @Procedure(nullForMissing = true)} это
+     *       разрешено явно. {@code Map} и {@code Object} не проверяются: их ключи известны только
+     *       при вызове.</li>
+     * </ul>
+     *
+     * @param a              аргумент PL/SQL
+     * @param javaType       тип параметра или свойства, с параметрами типа
+     * @param label          что сопоставлено, для сообщения, например {@code parameter 'rec'}
+     * @param nullForMissing разрешено ли оставлять поля без пары {@code NULL}
+     * @throws PlanException если тип несовместим или поля нет
+     */
+    private static void checkJavaType(ArgumentInfo a, ResolvableType javaType, String label, boolean nullForMissing) {
+        Class<?> raw = javaType.resolve(Object.class);
+        if (!compatible(a.kind(), raw)) {
+            throw new PlanException(label + " is " + raw.getSimpleName() + ", which cannot be passed as "
+                    + a.dataType() + " " + a.name());
+        }
+        if (!nullForMissing) {
+            List<String> missing = missingProperties(a, javaType);
+            if (!missing.isEmpty()) {
+                throw new PlanException(label + " (" + raw.getSimpleName() + ") has no property for "
+                        + missing + " of " + a.name() + "; add them, or allow NULL with"
+                        + " @Procedure(nullForMissing = true)");
+            }
+        }
+    }
+
+    /**
+     * Перечисляет поля записи или атрибуты объекта, для которых у типа Java нет свойства.
+     *
+     * <p>Для коллекции объектов SQL проверяется тип её элемента ({@code List<Obj>} — {@code Obj}).
+     * {@code Object}, {@code Map} и коллекции без типа элемента ({@code List<?>}, {@code Object[]})
+     * не проверяются: что в них лежит, видно только при вызове. Вложенные объекты тоже не
+     * проверяются: тип их свойства здесь не известен.
+     *
+     * @param a        аргумент PL/SQL
+     * @param javaType тип Java, из которого возьмутся значения
+     * @return имена полей без пары; пустой список, если проверять нечего или всё есть
+     */
+    private static List<String> missingProperties(ArgumentInfo a, ResolvableType javaType) {
+        Class<?> raw = javaType.resolve(Object.class);
+        if (raw == Object.class) {
+            return List.of(); // что лежит в Object, видно только при вызове
+        }
+        if (a.kind() == ArgKind.SQL_COLLECTION && !a.children().isEmpty()
+                && a.children().get(0).kind() == ArgKind.OBJECT) {
+            ResolvableType el = raw.isArray() ? javaType.getComponentType()
+                    : Collection.class.isAssignableFrom(raw) ? javaType.asCollection().getGeneric(0) : ResolvableType.NONE;
+            return el == ResolvableType.NONE ? List.of() : missingProperties(a.children().get(0), el);
+        }
+        if ((a.kind() != ArgKind.RECORD && a.kind() != ArgKind.OBJECT) || !isParameterObject(raw)) {
+            return List.of();
+        }
+        List<String> missing = new ArrayList<>();
+        for (ArgumentInfo f : a.children()) {
+            if (f.name() != null && !Values.hasProperty(raw, f.name())) {
+                missing.add(f.name());
+            }
+        }
+        return missing;
+    }
+
+    /**
+     * Проверяет, может ли значение этого типа Java вообще передаваться как аргумент данного
+     * вида — мягче, чем {@link #accepts}: отвергается только то, что при вызове заведомо
+     * упадёт или уйдёт не тем.
+     *
+     * <p>{@code Object} и другие общие предки подходящих типов ({@code Serializable},
+     * {@code Comparable}, {@code Temporal}...) проходят: что в них лежит, видно только при
+     * вызове. Правила:
+     * <ul>
+     *   <li>{@code NUMBER} — числа, {@code Boolean} и строки (строка разбирается как число);</li>
+     *   <li>{@code BOOLEAN} — {@code Boolean}, числа и строки ({@code Y}/{@code N} и т.п.);</li>
+     *   <li>строки, {@code CLOB}, {@code XMLTYPE} — всё, кроме коллекций, массивов, {@code Map}
+     *       и record;</li>
+     *   <li>{@code DATE}, {@code TIMESTAMP}, {@code BLOB}, {@code RAW}, коллекции, записи и
+     *       объекты — как в {@link #accepts};</li>
+     *   <li>остальные виды — любой тип.</li>
+     * </ul>
+     *
+     * @param kind вид аргумента PL/SQL
+     * @param t    тип параметра или свойства Java
+     * @return {@code false}, если значение такого типа передать нельзя
+     */
+    static boolean compatible(ArgKind kind, Class<?> t) {
+        Class<?> c = ClassUtils.resolvePrimitiveIfNecessary(t);
+        if (accepts(kind, c)) {
+            return true;
+        }
+        return switch (kind) {
+            case NUMBER, BOOLEAN -> CharSequence.class.isAssignableFrom(c) || c == Boolean.class
+                    || Number.class.isAssignableFrom(c) || isSupertypeOf(c, Long.class, Boolean.class, String.class);
+            case STRING, CLOB, XMLTYPE -> !Collection.class.isAssignableFrom(c) && !Map.class.isAssignableFrom(c)
+                    && !c.isArray() && !c.isRecord();
+            case DATE, TIMESTAMP -> isSupertypeOf(c, java.time.LocalDate.class, java.time.LocalDateTime.class,
+                    java.time.Instant.class, java.time.OffsetDateTime.class, java.time.ZonedDateTime.class,
+                    java.sql.Timestamp.class);
+            case BLOB, RAW -> isSupertypeOf(c, byte[].class);
+            case SQL_COLLECTION, INDEX_TABLE -> isSupertypeOf(c, java.util.ArrayList.class, Object[].class);
+            case RECORD, OBJECT -> isSupertypeOf(c, java.util.LinkedHashMap.class);
+            default -> true;
+        };
+    }
+
+    /**
+     * Проверяет, является ли {@code c} общим предком хотя бы одного из подходящих типов, то есть
+     * может ли в переменной такого типа лежать подходящее значение.
+     *
+     * @param c         тип параметра
+     * @param fitting   подходящие типы
+     * @return {@code true}, если {@code c} — предок (или сам) одного из них
+     */
+    private static boolean isSupertypeOf(Class<?> c, Class<?>... fitting) {
+        for (Class<?> f : fitting) {
+            if (c.isAssignableFrom(f)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -893,18 +1056,19 @@ public class CallPlanner {
      * Описывает свойство объекта-параметра и явное имя аргумента для него, если оно задано.
      *
      * @param name     имя свойства Java (компонента record или свойства бина)
-     * @param explicit имя аргумента PL/SQL из {@code @Arg} на компоненте record, иначе
-     *                 {@code null}
+     * @param explicit имя аргумента PL/SQL из {@code @Arg} (на компоненте record, на поле,
+     *                 getter'е или setter'е бина), иначе {@code null}
+     * @param type     тип свойства с параметрами типа
      */
-    private record PropertyName(String name, String explicit) {
+    private record PropertyName(String name, String explicit, ResolvableType type) {
     }
 
     /**
      * Возвращает свойства объекта-параметра, которые нужно сопоставить с аргументами.
      *
      * <p>Для record это все компоненты с учётом {@code @Arg} на компоненте. Для бина — все
-     * свойства, у которых есть геттер, кроме {@code class}; {@code @Arg} здесь не
-     * поддерживается (аннотация ставится только на параметры и компоненты record).
+     * свойства, у которых есть геттер, кроме {@code class}, с учётом {@code @Arg} на поле,
+     * геттере или сеттере.
      *
      * @param t тип объекта-параметра
      * @return свойства в порядке объявления компонентов record или в порядке, который отдаёт
@@ -914,35 +1078,47 @@ public class CallPlanner {
         if (t.isRecord()) {
             return Arrays.stream(t.getRecordComponents()).map(rc -> {
                 Arg a = rc.getAnnotation(Arg.class);
-                return new PropertyName(rc.getName(), a == null ? null : a.value());
+                return new PropertyName(rc.getName(), a == null ? null : a.value(),
+                        ResolvableType.forType(rc.getGenericType()));
             }).toList();
         }
         return Arrays.stream(BeanUtils.getPropertyDescriptors(t))
                 .filter(pd -> pd.getReadMethod() != null && !pd.getName().equals("class"))
-                .map(PropertyDescriptor::getName).map(n -> new PropertyName(n, null)).toList();
+                .map(pd -> {
+                    Arg a = Values.argOf(t, pd);
+                    return new PropertyName(pd.getName(), a == null ? null : a.value(),
+                            ResolvableType.forMethodReturnType(pd.getReadMethod()));
+                }).toList();
     }
 
     /**
      * Проверяет, служит ли тип результата «контейнером» для OUT-аргумента, а не самим его
      * значением.
      *
-     * <p>Смотрится только первый компонент record и только по имени через {@code NameMatcher};
-     * {@code @Arg} на компоненте здесь не учитывается.
+     * <p>Смотрятся все компоненты record: с {@code @Arg} — по точному имени, без неё — через
+     * {@code NameMatcher}.
      *
      * @param type тип результата Java-метода
      * @param outs OUT-аргументы процедуры (метод вызывается, только когда он ровно один)
-     * @return {@code true}, если тип — Java record, чей первый компонент совпадает по имени с
+     * @return {@code true}, если тип — Java record, чей компонент совпадает по имени с
      *         OUT-аргументом, а сам OUT-аргумент не RECORD
+     * @throws PlanException если имя компонента одинаково подходит к нескольким OUT-аргументам
      */
     private static boolean isMultiValueHolder(Class<?> type, List<ArgumentInfo> outs) {
         // Единственный OUT типа RECORD ложится прямо на тип результата; Java record, чей
         // компонент совпадает по имени с OUT-аргументом, вместо этого считается контейнером.
-        if (!type.isRecord()) {
+        if (!type.isRecord() || outs.get(0).kind() == ArgKind.RECORD) {
             return false;
         }
-        RecordComponent[] rc = type.getRecordComponents();
-        return rc.length > 0 && match(rc[0].getName(), outs, ArgumentInfo::name) != null
-                && outs.get(0).kind() != ArgKind.RECORD;
+        for (RecordComponent rc : type.getRecordComponents()) {
+            Arg a = rc.getAnnotation(Arg.class);
+            boolean hit = a != null ? a.value().equalsIgnoreCase(outs.get(0).name())
+                    : match(rc.getName(), outs, ArgumentInfo::name) != null;
+            if (hit) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1040,6 +1216,8 @@ public class CallPlanner {
 
         /** Итоговые привязки в порядке {@code ?} в тексте; заполняются в {@code render}. */
         private final List<CallPlan.Bind> ordered = new ArrayList<>();
+        /** Собран ли уже текст блока: {@link #render} вызывается один раз. */
+        private boolean rendered;
 
         /** Счётчик для имён переменных {@code v1}, {@code v2}, ... */
         private int vars;
@@ -1120,13 +1298,18 @@ public class CallPlanner {
         /**
          * Собирает итоговый текст блока и заполняет список привязок в порядке {@code ?}.
          *
-         * <p>Секция {@code DECLARE} выводится, только если объявлены переменные. Метод
-         * рассчитан на один вызов: повторный вызов добавил бы привязки в список ещё раз.
+         * <p>Секция {@code DECLARE} выводится, только если объявлены переменные. Блок собирается
+         * один раз: повторный вызов добавил бы привязки в список ещё раз, поэтому он запрещён.
          *
          * @param callStmt оператор вызова, например {@code ? := APP.PKG.F(P_X => ?);}
          * @return текст анонимного блока
+         * @throws IllegalStateException при повторном вызове
          */
         String render(String callStmt) {
+            if (rendered) {
+                throw new IllegalStateException("the block is already rendered");
+            }
+            rendered = true;
             StringBuilder sb = new StringBuilder();
             if (!declarations.isEmpty()) {
                 sb.append("DECLARE\n");

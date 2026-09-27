@@ -65,9 +65,9 @@ public class PlsqlAutoConfiguration {
      * фабрику на бине {@code DataSource} с именем {@code dataSource}.
      *
      * <p>В фабрику переносятся настройки {@code plsql.*}. Бины {@link ArgumentDefaults} и
-     * {@link SignatureSource} необязательны и подключаются через {@code ObjectProvider.ifUnique}:
-     * только если такой бин один (или один из нескольких помечен как основной); при нескольких
-     * равноправных кандидатах не используется ни один.
+     * {@link SignatureSource} необязательны: если такой бин один (или один из нескольких помечен
+     * как основной), он подключается; если их несколько равноправных, это ошибка при старте, а
+     * не молчаливый отказ от всех.
      *
      * <p>Если политика кодировки {@code FAIL} и {@code plsql.database-charset} не задан, фабрика
      * при создании обращается к базе, чтобы прочитать NLS_CHARACTERSET (кодировку базы).
@@ -79,6 +79,8 @@ public class PlsqlAutoConfiguration {
      * @param signatures необязательный источник сигнатур подпрограмм вместо словаря Oracle
      * @return готовая фабрика
      * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1
+     * @throws org.springframework.beans.factory.NoUniqueBeanDefinitionException если бинов
+     *         {@code ArgumentDefaults} или {@code SignatureSource} несколько и ни один не основной
      */
     @Bean
     @ConditionalOnMissingBean
@@ -86,13 +88,9 @@ public class PlsqlAutoConfiguration {
     PlsqlApiFactory plsqlApiFactory(DataSource dataSource, PlsqlProperties props,
                                     ObjectProvider<ArgumentDefaults> defaults,
                                     ObjectProvider<SignatureSource> signatures) {
-        PlsqlApiFactory.Builder b = PlsqlApiFactory.builder(dataSource)
-                .charsetPolicy(props.getCharsetPolicy())
-                .databaseCharset(props.getDatabaseCharset())
-                .indexTableMaxLength(props.getIndexTableMaxLength())
-                .retryDiscardedState(props.isRetryDiscardedState());
-        defaults.ifUnique(b::argumentDefaults);
-        signatures.ifUnique(b::signatureSource);
+        PlsqlApiFactory.Builder b = props.applyTo(PlsqlApiFactory.builder(dataSource));
+        defaults.ifAvailable(b::argumentDefaults);
+        signatures.ifAvailable(b::signatureSource);
         return b.build();
     }
 
@@ -173,7 +171,7 @@ public class PlsqlAutoConfiguration {
                 return; // это уже сделала @EnablePlsqlApis
             }
             List<String> packages = AutoConfigurationPackages.get(beanFactory);
-            PlsqlApiRegistrar.register(registry, packages, "dataSource", "", resourceLoader, environment);
+            PlsqlApiRegistrar.register(registry, packages, "", "", resourceLoader, environment);
         }
     }
 }

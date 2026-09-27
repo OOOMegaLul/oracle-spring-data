@@ -2,6 +2,7 @@ package dev.plsql.spring.boot;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import dev.plsql.spring.PlsqlApiFactory;
 import dev.plsql.spring.support.CharsetGuard;
 
 /**
@@ -118,5 +119,21 @@ public class PlsqlProperties {
      */
     public void setRetryDiscardedState(boolean retryDiscardedState) {
         this.retryDiscardedState = retryDiscardedState;
+    }
+
+    /**
+     * Переносит настройки в построитель фабрики. Так настройки попадают и в фабрику
+     * автоконфигурации, и в фабрику, которую {@code PlsqlApiFactoryBean} строит сам для
+     * {@code dataSourceRef}.
+     *
+     * @param b построитель фабрики
+     * @return тот же построитель
+     * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1
+     */
+    public PlsqlApiFactory.Builder applyTo(PlsqlApiFactory.Builder b) {
+        return b.charsetPolicy(charsetPolicy)
+                .databaseCharset(databaseCharset)
+                .indexTableMaxLength(indexTableMaxLength)
+                .retryDiscardedState(retryDiscardedState);
     }
 }

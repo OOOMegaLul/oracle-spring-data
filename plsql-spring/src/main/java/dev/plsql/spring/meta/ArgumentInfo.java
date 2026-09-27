@@ -40,6 +40,9 @@ import java.util.List;
  *                    объявленных в спецификации пакета
  * @param children    вложенные строки: поля записи или объектного типа, элемент коллекции;
  *                    пустой изменяемый список, если их нет
+ * @param charLength  объявленная длина строкового типа в символах ({@code CHAR_LENGTH}),
+ *                    например 100 у {@code VARCHAR2(100)}; {@code null}, если словарь её не
+ *                    сообщает (тогда под элемент выходной index-by таблицы берётся 4000)
  */
 public record ArgumentInfo(
         String name,
@@ -52,7 +55,8 @@ public record ArgumentInfo(
         String typeOwner,
         String typeName,
         String typeSubname,
-        List<ArgumentInfo> children) {
+        List<ArgumentInfo> children,
+        Integer charLength) {
 
     /**
      * Создаёт описание аргумента и заменяет {@code children}, равный {@code null}, на новый
@@ -72,9 +76,33 @@ public record ArgumentInfo(
      * @param typeName    имя типа (или пакета, где он объявлен) либо {@code null}
      * @param typeSubname имя типа внутри пакета или {@code null}
      * @param children    вложенные строки; {@code null} означает «нет вложенных»
+     * @param charLength  объявленная длина в символах или {@code null}
      */
     public ArgumentInfo {
         children = children == null ? new ArrayList<>() : children;
+    }
+
+    /**
+     * Создаёт описание аргумента без объявленной длины: для строк, у которых словарь её не
+     * сообщает, и для описаний, собранных вручную (в тестах).
+     *
+     * @param name        имя аргумента; {@code null} у возвращаемого значения и элемента коллекции
+     * @param position    позиция в списке аргументов, 0 у возвращаемого значения
+     * @param dataLevel   уровень вложенности, 0 у самого аргумента
+     * @param dataType    тип из {@code ALL_ARGUMENTS.DATA_TYPE}
+     * @param plsType     тип из {@code ALL_ARGUMENTS.PLS_TYPE}, может быть {@code null}
+     * @param inOut       {@code IN}, {@code OUT} или {@code IN/OUT}
+     * @param defaulted   есть ли у аргумента значение по умолчанию
+     * @param typeOwner   схема типа или {@code null}
+     * @param typeName    имя типа (или пакета, где он объявлен) либо {@code null}
+     * @param typeSubname имя типа внутри пакета или {@code null}
+     * @param children    вложенные строки; {@code null} означает «нет вложенных»
+     */
+    public ArgumentInfo(String name, int position, int dataLevel, String dataType, String plsType, String inOut,
+                        boolean defaulted, String typeOwner, String typeName, String typeSubname,
+                        List<ArgumentInfo> children) {
+        this(name, position, dataLevel, dataType, plsType, inOut, defaulted, typeOwner, typeName, typeSubname,
+                children, null);
     }
 
     /**

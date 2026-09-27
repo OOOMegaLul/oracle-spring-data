@@ -17,6 +17,7 @@ import dev.plsql.spring.call.CallExecutor;
 import dev.plsql.spring.call.CallPlanner;
 import dev.plsql.spring.meta.DictionarySignatureSource;
 import dev.plsql.spring.meta.SignatureSource;
+import dev.plsql.spring.session.SessionContextDataSource;
 import dev.plsql.spring.support.CharsetGuard;
 import dev.plsql.spring.support.PlsqlApiInvocationHandler;
 import dev.plsql.spring.support.PlsqlExceptionTranslator;
@@ -120,6 +121,8 @@ public final class PlsqlApiFactory {
         private String databaseCharset;
         private int indexTableMaxLength = 10_000;
         private boolean retryDiscardedState = true;
+        /** Источник соединений для чтения словаря и кодировки или {@code null} — выбрать самому. */
+        private DataSource metadataDataSource;
 
         /**
          * Создаёт построитель; снаружи вызывается через {@link PlsqlApiFactory#builder}.
@@ -251,22 +254,46 @@ public final class PlsqlApiFactory {
         }
 
         /**
+         * Задаёт источник соединений, через который читаются словарь и кодировка базы при сборке.
+         *
+         * <p>По умолчанию это {@code dataSource}, а если он — {@link SessionContextDataSource}, то
+         * пул под ним (подготовка сессии под пользователя для чтения словаря не нужна). Задавать
+         * стоит, когда словарь нужно читать в особых условиях — например, в другой текущей схеме.
+         *
+         * @param metadata источник соединений для чтения словаря
+         * @return этот же построитель
+         */
+        public Builder metadataDataSource(DataSource metadata) {
+            this.metadataDataSource = Objects.requireNonNull(metadata);
+            return this;
+        }
+
+        /**
          * Создаёт фабрику с заданными настройками.
          *
-         * <p>Если источник сигнатур не задан, используется {@link DictionarySignatureSource} на том же
-         * {@code dataSource}. При политике {@code IGNORE} проверка кодировки выключена. Иначе
-         * кодировка берётся из {@link #databaseCharset(String)}, а если она не задана — читается из базы,
-         * то есть сборка уже обращается к базе. Для Unicode-кодировок и кодировок, которых
-         * {@link CharsetGuard} не знает, проверка тоже выключается.
+         * <p>Если источник сигнатур не задан, используется {@link DictionarySignatureSource}. При
+         * политике {@code IGNORE} проверка кодировки выключена. Иначе кодировка берётся из
+         * {@link #databaseCharset(String)}, а если она не задана — читается из базы, то есть сборка
+         * уже обращается к базе. Для Unicode-кодировок и кодировок, которых {@link CharsetGuard} не
+         * знает, проверка тоже выключается.
+         *
+         * <p>Словарь и кодировку не нужно готовить под пользователя, поэтому, если
+         * {@code dataSource} — {@link SessionContextDataSource}, они читаются через пул под ним: при
+         * старте нет запроса и пользователя, и поставщики сессии звать не нужно (и нельзя). Всё,
+         * что нужно каждому соединению независимо от пользователя ({@code CURRENT_SCHEMA}, роли),
+         * поэтому задаётся в самом пуле (у HikariCP — {@code connectionInitSql}), а не в
+         * {@code initSql} обёртки. Другой источник для словаря можно задать через
+         * {@link #metadataDataSource(DataSource)}.
          *
          * @return готовая фабрика
          * @throws UncategorizedSQLException если запрос кодировки базы завершился ошибкой
          */
         public PlsqlApiFactory build() {
-            SignatureSource signatures = signatureSource != null ? signatureSource : new DictionarySignatureSource(dataSource);
+            DataSource meta = metadataDataSource != null ? metadataDataSource : metadataSource(dataSource);
+            SignatureSource signatures = signatureSource != null ? signatureSource : new DictionarySignatureSource(meta);
             CharsetGuard guard = charsetPolicy == CharsetGuard.Policy.IGNORE
                     ? CharsetGuard.none()
-                    : CharsetGuard.forDatabase(databaseCharset != null ? databaseCharset : readCharset(), charsetPolicy);
+                    : CharsetGuard.forDatabase(databaseCharset != null ? databaseCharset : readCharset(meta), charsetPolicy);
             return new PlsqlApiFactory(new PlsqlRuntime(dataSource, signatures, new CallPlanner(argumentDefaults),
                     new CallExecutor(indexTableMaxLength, guard), exceptionTranslator, guard, retryDiscardedState));
         }
@@ -278,10 +305,11 @@ public final class PlsqlApiFactory {
          * Spring, используется её соединение, иначе соединение берётся из пула и сразу
          * возвращается.
          *
+         * @param dataSource источник соединений для чтения
          * @return имя кодировки в терминах Oracle или {@code null}, если параметр не найден
          * @throws UncategorizedSQLException если запрос завершился ошибкой
          */
-        private String readCharset() {
+        private static String readCharset(DataSource dataSource) {
             Connection con = DataSourceUtils.getConnection(dataSource);
             try (PreparedStatement ps = con.prepareStatement(
                     "select value from nls_database_parameters where parameter = 'NLS_CHARACTERSET'");
@@ -292,6 +320,22 @@ public final class PlsqlApiFactory {
             } finally {
                 DataSourceUtils.releaseConnection(con, dataSource);
             }
+        }
+
+        /**
+         * Возвращает источник соединений для чтения словаря и кодировки: пул под
+         * {@link SessionContextDataSource} (сколько бы их ни было вложено) или сам
+         * {@code dataSource}.
+         *
+         * @param dataSource источник соединений фабрики
+         * @return источник без подготовки сессии под пользователя
+         */
+        private static DataSource metadataSource(DataSource dataSource) {
+            DataSource ds = dataSource;
+            while (ds instanceof SessionContextDataSource s && s.getTargetDataSource() != null) {
+                ds = s.getTargetDataSource();
+            }
+            return ds;
         }
     }
 }

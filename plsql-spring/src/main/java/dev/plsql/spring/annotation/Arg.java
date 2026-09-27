@@ -26,12 +26,15 @@ import java.lang.annotation.Target;
  *   <li>на компоненте record (record — неизменяемый класс-«запись» Java 16+) — имя аргумента
  *       или поля PL/SQL-записи, которое этот компонент передаёт или принимает: когда record
  *       служит объектом-параметром, собирает несколько OUT-аргументов или заполняется из
- *       записи {@code RECORD} либо объектного типа.</li>
+ *       записи {@code RECORD} либо объектного типа; у строк курсора и {@code @SqlQuery} — имя
+ *       колонки;</li>
+ *   <li>на поле, getter'е или setter'е бина (обычного класса со свойствами) — то же, что на
+ *       компоненте record.</li>
  * </ul>
  */
 @Documented
 @Retention(RetentionPolicy.RUNTIME)
-@Target({ElementType.PARAMETER, ElementType.RECORD_COMPONENT})
+@Target({ElementType.PARAMETER, ElementType.RECORD_COMPONENT, ElementType.FIELD, ElementType.METHOD})
 public @interface Arg {
 
     /**

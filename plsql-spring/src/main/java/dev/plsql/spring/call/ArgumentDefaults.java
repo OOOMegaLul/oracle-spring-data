@@ -76,15 +76,20 @@ public interface ArgumentDefaults {
      *
      * @param values поставщики значений по именам аргументов PL/SQL
      * @return реализация, которая выбирает поставщика по имени аргумента
-     * @throws IllegalArgumentException если одно имя задано дважды в разном регистре
+     * @throws IllegalArgumentException если одно имя задано дважды в разном регистре или у имени
+     *                                  нет поставщика ({@code null})
      *                                  (например, {@code NTENANT} и {@code ntenant})
      */
     static ArgumentDefaults byName(Map<String, Supplier<Object>> values) {
         Map<String, Supplier<Object>> upper = new java.util.HashMap<>();
         values.forEach((k, v) -> {
-            if (upper.put(k.toUpperCase(Locale.ROOT), v) != null) {
+            if (v == null) {
+                throw new IllegalArgumentException("argument " + k + " has no supplier");
+            }
+            if (upper.containsKey(k.toUpperCase(Locale.ROOT))) {
                 throw new IllegalArgumentException("argument " + k + " is given twice");
             }
+            upper.put(k.toUpperCase(Locale.ROOT), v);
         });
         return (s, a) -> a.name() == null ? null : upper.get(a.name().toUpperCase(Locale.ROOT));
     }

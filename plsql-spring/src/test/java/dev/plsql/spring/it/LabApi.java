@@ -290,12 +290,12 @@ public interface LabApi {
      * она открывает курсор тем же запросом, что в {@link #emps}, только если {@code P_OPEN = 1}.
      *
      * <p>Форма: IN OUT {@code REF CURSOR}. Курсор из Java передать нельзя, поэтому на вход идёт
-     * неоткрытая переменная блока. Если процедура курсор не открыла, метод возвращает {@code null}:
-     * ошибку ORA-24338 при чтении неоткрытого курсора библиотека перехватывает.
+     * неоткрытая переменная блока. Если процедура курсор не открыла, строк нет и метод возвращает
+     * пустой список: ошибку ORA-24338 при чтении неоткрытого курсора библиотека перехватывает.
      *
      * @param open  1 — открыть курсор, другое значение — оставить неоткрытым
      * @param minId нижняя граница {@code id} включительно
-     * @return строки курсора или {@code null}, если курсор не был открыт
+     * @return строки курсора; пустой список, если курсор не был открыт
      */
     List<Emp> empsInout(int open, long minId);
 
@@ -569,4 +569,37 @@ public interface LabApi {
     default String describe(long id) {
         return findEmp(id).map(Emp::name).orElse("none");
     }
+    /**
+     * Вызывает функцию {@code LAB_PKG.LONG_LEN(P_VALS LONG_IBT) RETURN NUMBER}: сумму длин строк
+     * index-by таблицы {@code VARCHAR2(32767)}.
+     *
+     * <p>Форма: IN index-by таблица длинных строк. Раньше длина элемента была зашита в 4000, и
+     * строка длиннее не проходила.
+     *
+     * @param vals строки
+     * @return сумма длин
+     */
+    BigDecimal longLen(List<String> vals);
+
+    /**
+     * Строка курсора {@code EMPS_PREFIXED}: колонки названы с типовыми префиксами
+     * ({@code NRN}, {@code SNAME}, {@code DHIRED}).
+     *
+     * @param rn    номер, из {@code NRN}
+     * @param name  имя, из {@code SNAME}
+     * @param hired дата приёма, из {@code DHIRED}
+     */
+    record Brief2(long rn, String name, LocalDate hired) {
+    }
+
+    /**
+     * Вызывает процедуру {@code LAB_PKG.EMPS_PREFIXED(P_CUR OUT SYS_REFCURSOR)}.
+     *
+     * <p>Форма: колонки курсора сопоставляются с компонентами record по тем же правилам, что и
+     * аргументы: типовые префиксы отбрасываются. Раньше курсор понимал только
+     * {@code BEGIN_DATE} → {@code beginDate}.
+     *
+     * @return строки курсора
+     */
+    List<Brief2> empsPrefixed();
 }

@@ -4,6 +4,7 @@ import static dev.plsql.spring.test.Signatures.arg;
 import static dev.plsql.spring.test.Signatures.field;
 import static dev.plsql.spring.test.Signatures.func;
 import static dev.plsql.spring.test.Signatures.indexTable;
+import static dev.plsql.spring.test.Signatures.object;
 import static dev.plsql.spring.test.Signatures.proc;
 import static dev.plsql.spring.test.Signatures.record;
 import static dev.plsql.spring.test.Signatures.rowtype;
@@ -14,6 +15,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -24,6 +26,7 @@ import org.junit.jupiter.api.Test;
 import dev.plsql.spring.annotation.Arg;
 import dev.plsql.spring.annotation.Procedure;
 import dev.plsql.spring.meta.ArgKind;
+import dev.plsql.spring.meta.ArgumentInfo;
 import dev.plsql.spring.meta.SubprogramInfo;
 
 /**
@@ -289,6 +292,108 @@ class CallPlannerTest {
          * @return строки курсора
          */
         List<Map<String, Object>> cursorWithValue(long minId, List<Object> cur);
+
+        /**
+         * Время без даты: в {@code DATE} его не превратить.
+         *
+         * @param at время
+         * @return результат
+         */
+        String at(java.time.LocalTime at);
+
+        /**
+         * Строка там, где процедура ждёт {@code BLOB}.
+         *
+         * @param data текст
+         */
+        void blob(String data);
+
+        /**
+         * {@code Object}: что в нём лежит, видно только при вызове.
+         *
+         * @param data значение
+         */
+        void anything(Object data);
+
+        /**
+         * Record без поля {@code BODY}, которое есть у записи.
+         *
+         * @param id   номер
+         * @param flag признак
+         */
+        record Partial(Long id, Boolean flag) {
+        }
+
+        /**
+         * Запись, у которой в Java нет поля {@code BODY}.
+         *
+         * @param rec запись
+         */
+        void partial(Partial rec);
+
+        /**
+         * То же, но недостающее поле явно разрешено оставить {@code NULL}.
+         *
+         * @param rec запись
+         */
+        @Procedure(nullForMissing = true)
+        void partialAllowed(Partial rec);
+
+        /**
+         * Запись из {@code Map}: ключи известны только при вызове.
+         *
+         * @param rec запись
+         */
+        void recMap(Map<String, Object> rec);
+
+        /**
+         * Объект без атрибута {@code DT}.
+         *
+         * @param id   номер
+         * @param name имя
+         */
+        record Obj(Long id, String name) {
+        }
+
+        /**
+         * Коллекция объектов.
+         *
+         * @param objs объекты
+         * @return результат
+         */
+        BigDecimal objs(List<Obj> objs);
+
+        /**
+         * Результат, чей компонент совпадает с OUT-аргументом только через {@code @Arg}: по имени
+         * {@code label} к {@code P_TEXT} не подходит.
+         *
+         * @param label {@code P_TEXT}
+         */
+        record Label(@Arg("P_TEXT") String label) {
+        }
+
+        /**
+         * Процедура с одним OUT-аргументом, результат — record-контейнер.
+         *
+         * @param in входное значение
+         * @return контейнер
+         */
+        Label labelled(long in);
+
+        /**
+         * Запись из {@code Object}: что в нём лежит, видно только при вызове.
+         *
+         * @param rec запись
+         */
+        void saveAny(Object rec);
+
+        /**
+         * Коллекция объектов без типа элемента.
+         *
+         * @param objs объекты
+         * @return результат
+         */
+        BigDecimal objsAny(List<?> objs);
     }
 
     /**
@@ -681,5 +786,99 @@ class CallPlannerTest {
         assertThat(d.lookup(sp, sp.arguments().get(0))).isSameAs(tenant);
         assertThatThrownBy(() -> ArgumentDefaults.byName(Map.of("NTENANT", tenant, "ntenant", tenant)))
                 .hasMessageContaining("given twice");
+    }
+    /**
+     * Проверяет, что тип Java, который заведомо нельзя передать, — ошибка при старте, а не при
+     * вызове: {@code LocalTime} в {@code DATE}, строка в {@code BLOB}. {@code Object} проходит.
+     */
+    @Test
+    void javaTypesThatCannotBeBoundFailAtStartup() {
+        assertThatThrownBy(() -> PLANNER.plan(m("at"), func(null, "F", "VARCHAR2").in("P_AT", "DATE").build()))
+                .hasMessageContaining("parameter 'at' is LocalTime, which cannot be passed as DATE P_AT");
+        assertThatThrownBy(() -> PLANNER.plan(m("blob"), proc(null, "P").in("P_DATA", "BLOB").build()))
+                .hasMessageContaining("parameter 'data' is String, which cannot be passed as BLOB P_DATA");
+        assertThat(PLANNER.plan(m("anything"), proc(null, "P").in("P_DATA", "BLOB").build())).isNotNull();
+    }
+
+    /**
+     * Проверяет мягкую проверку совместимости: строка проходит в {@code NUMBER} (она разбирается
+     * как число), но не в запись; record не проходит в {@code VARCHAR2}; общие предки подходящих
+     * типов проходят.
+     */
+    @Test
+    void compatibilityRejectsOnlyWhatSurelyFails() {
+        assertThat(CallPlanner.compatible(ArgKind.NUMBER, String.class)).isTrue();
+        assertThat(CallPlanner.compatible(ArgKind.NUMBER, java.io.Serializable.class)).isTrue();
+        assertThat(CallPlanner.compatible(ArgKind.DATE, java.time.temporal.Temporal.class)).isTrue();
+        assertThat(CallPlanner.compatible(ArgKind.DATE, java.time.LocalTime.class)).isFalse();
+        assertThat(CallPlanner.compatible(ArgKind.RECORD, String.class)).isFalse();
+        assertThat(CallPlanner.compatible(ArgKind.RECORD, Map.class)).isTrue();
+        assertThat(CallPlanner.compatible(ArgKind.STRING, Api.Rec.class)).isFalse();
+        assertThat(CallPlanner.compatible(ArgKind.SQL_COLLECTION, long[].class)).isTrue();
+    }
+
+    /**
+     * Проверяет, что поле записи, для которого у record нет свойства, — ошибка при старте (раньше
+     * оно молча уходило {@code NULL}); с {@code @Procedure(nullForMissing = true)} это разрешено, а
+     * {@code Map} и {@code Object} не проверяются: их содержимое известно только при вызове.
+     */
+    @Test
+    void recordFieldsNeedJavaProperties() {
+        SubprogramInfo sp = proc("PKG", "REC").add(record("P_REC", "IN", "PKG", "REC_T",
+                field("ID", "NUMBER"), field("FLAG", "PL/SQL BOOLEAN"), field("BODY", "OPAQUE/XMLTYPE"))).build();
+        assertThatThrownBy(() -> PLANNER.plan(m("partial"), sp))
+                .hasMessageContaining("parameter 'rec' (Partial) has no property for [BODY] of P_REC")
+                .hasMessageContaining("nullForMissing");
+        assertThat(PLANNER.plan(m("partialAllowed"), sp)).isNotNull();
+        assertThat(PLANNER.plan(m("recMap"), sp)).isNotNull();
+        assertThat(PLANNER.plan(m("saveAny"), sp)).isNotNull();
+    }
+
+    /**
+     * Проверяет то же для коллекции объектов SQL: у типа элемента {@code List<Obj>} нет свойства
+     * для атрибута {@code DT}. Коллекция без типа элемента ({@code List<?>}) не проверяется.
+     */
+    @Test
+    void objectCollectionElementsNeedJavaProperties() {
+        ArgumentInfo objs = new ArgumentInfo("P_OBJS", 1, 0, "TABLE", null, "IN", false, "APP", "OBJ_TAB", null,
+                List.of(object(null, "IN", "OBJ_T", field("ID", "NUMBER"), field("NAME", "VARCHAR2"), field("DT", "DATE"))));
+        assertThatThrownBy(() -> PLANNER.plan(m("objs"), func("PKG", "OBJS", "NUMBER").add(objs).build()))
+                .hasMessageContaining("parameter 'objs' (List) has no property for [DT] of P_OBJS");
+        assertThat(PLANNER.plan(m("objsAny"), func("PKG", "OBJS", "NUMBER").add(objs).build())).isNotNull();
+    }
+
+    /**
+     * Проверяет, что record-контейнер для единственного OUT-аргумента узнаётся и по {@code @Arg}
+     * на компоненте. Раньше компонент сравнивался только по имени, {@code Label} считался самим
+     * значением, и строка {@code P_TEXT} не превращалась в него уже при вызове.
+     */
+    @Test
+    void holderIsRecognisedByAnyComponentAndArg() {
+        CallPlan p = PLANNER.plan(m("labelled"), proc("PKG", "ONE").in("P_IN", "NUMBER").out("P_TEXT", "VARCHAR2").build());
+        assertThat(p.result().outsToType()).isTrue();
+        assertThat(p.result().assemble(Map.of("P_TEXT", "x"))).isEqualTo(new Api.Label("x"));
+    }
+
+    /**
+     * Проверяет, что атрибуты объектных типов SQL, которые внутри {@code Struct} не передать
+     * ({@code XMLTYPE}), и слишком глубокая вложенность типов называются при старте.
+     */
+    @Test
+    void sqlTypeAttributesThatCannotTravelAreReported() {
+        SubprogramInfo xml = func("PKG", "X", "NUMBER")
+                .add(object("P_OBJ", "IN", "DOC_T", field("ID", "NUMBER"), field("BODY", "OPAQUE/XMLTYPE"))).build();
+        assertThat(CallPlanner.supportIssues(xml)).singleElement().asString()
+                .contains("APP.DOC_T.BODY is OPAQUE/XMLTYPE, which cannot be passed inside a SQL object");
+        SubprogramInfo deep = func("PKG", "D", "NUMBER")
+                .add(object("P_OBJ", "IN", "DEEP_T", field("INNER", "NESTED TOO DEEP"))).build();
+        assertThat(CallPlanner.supportIssues(deep)).singleElement().asString().contains("NESTED TOO DEEP");
+    }
+
+    /** Проверяет, что {@code ArgumentDefaults.byName} не принимает пустого поставщика. */
+    @Test
+    void defaultsNeedASupplier() {
+        Map<String, Supplier<Object>> m = new HashMap<>();
+        m.put("NTENANT", null);
+        assertThatThrownBy(() -> ArgumentDefaults.byName(m)).hasMessageContaining("NTENANT has no supplier");
     }
 }

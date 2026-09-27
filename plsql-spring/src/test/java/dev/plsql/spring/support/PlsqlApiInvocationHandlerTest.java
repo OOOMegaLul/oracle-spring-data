@@ -88,6 +88,51 @@ class PlsqlApiInvocationHandlerTest {
         java.util.Optional<String> name(long id);
     }
 
+    /** Два метода с одним именем: какой из них показать, {@code sqlOf} не угадывает. */
+    @PlsqlApi(packageName = "PKG")
+    interface Overloaded {
+        /**
+         * {@code PKG.NEXT} с числом.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         * @return результат функции
+         */
+        long next(long tenant);
+
+        /**
+         * {@code PKG.NEXT} со строкой, которая разбирается как число.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         * @return результат функции
+         */
+        long next(String tenant);
+    }
+
+    /** Методы, которые при старте должны быть отвергнуты или при вызове сообщить понятную ошибку. */
+    @PlsqlApi(packageName = "PKG")
+    interface Misused {
+        /**
+         * {@code UPDATE}, но метод ждёт список строк.
+         *
+         * @return строки; число изменённых строк в них не превратить
+         */
+        @dev.plsql.spring.annotation.SqlQuery("update t set x = 1")
+        java.util.List<java.util.Map<String, Object>> update();
+    }
+
+    /** Метод и с {@code @SqlQuery}, и с {@code @Procedure}. */
+    @PlsqlApi(packageName = "PKG")
+    interface Both {
+        /**
+         * Непонятно, что вызывать: запрос или процедуру.
+         *
+         * @return результат
+         */
+        @dev.plsql.spring.annotation.SqlQuery("select 1 from dual")
+        @dev.plsql.spring.annotation.Procedure("NEXT")
+        long both();
+    }
+
     /** Запрос ссылается на параметр {@code :missing}, которого у метода нет. */
     @PlsqlApi(packageName = "PKG")
     interface BadQuery {
@@ -295,14 +340,15 @@ class PlsqlApiInvocationHandlerTest {
     /**
      * Проверяет служебные методы: {@code sqlOf} показывает сгенерированный блок метода и
      * возвращает {@code null} для default-метода, у которого блока нет; {@code subprogramName}
-     * даёт имя подпрограммы в верхнем регистре с подчёркиваниями.
+     * даёт имя подпрограммы в верхнем регистре.
+     *
+     * @throws NoSuchMethodException не бросается: метод {@code touch} есть
      */
     @Test
-    void sqlOfShowsTheBlock() {
+    void sqlOfShowsTheBlock() throws NoSuchMethodException {
         assertThat(PlsqlApiInvocationHandler.sqlOf(api, "touch")).isEqualTo("BEGIN\n  APP.PKG.TOUCH(NTENANT => ?);\nEND;");
         assertThat(PlsqlApiInvocationHandler.sqlOf(api, "twice")).isNull();
-        assertThat(PlsqlApiInvocationHandler.subprogramName(
-                Api.class.getMethods()[0])).matches("[A-Z_]+");
+        assertThat(PlsqlApiInvocationHandler.subprogramName(Api.class.getMethod("touch", long.class))).isEqualTo("TOUCH");
     }
 
     /**
@@ -395,5 +441,76 @@ class PlsqlApiInvocationHandlerTest {
         when(md.getColumnCount()).thenReturn(1);
         when(rs.getString(1)).thenReturn("Иванов");
         assertThat(q.name(1)).contains("Иванов");
+    }
+    /**
+     * Проверяет, что {@code sqlOf} для перегруженных методов требует типы параметров, а не
+     * отдаёт блок случайного из них.
+     */
+    @Test
+    void sqlOfNeedsTypesForOverloads() {
+        Overloaded o = factory().create(Overloaded.class);
+        assertThatThrownBy(() -> PlsqlApiInvocationHandler.sqlOf(o, "next"))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("2 methods are named next");
+        assertThat(PlsqlApiInvocationHandler.sqlOf(o, "next", long.class)).contains("APP.PKG.NEXT");
+    }
+
+    /**
+     * Проверяет, что внутри транзакции Spring после ORA-04068 вызов не повторяется: соединение то
+     * же, а контекст, который предыдущие вызовы положили в переменные пакетов, уже стёрт, и повтор
+     * молча работал бы без него. Ошибка уходит наружу, транзакция откатывается.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void discardedStateInsideATransactionIsNotRetried() throws SQLException {
+        when(con.getAutoCommit()).thenReturn(false);
+        when(cs.execute()).thenThrow(new SQLException("ORA-04068", "72000", 4068));
+        TransactionTemplate tx = new TransactionTemplate(new DataSourceTransactionManager(ds));
+
+        assertThatThrownBy(() -> tx.executeWithoutResult(s -> api.touch(1))).hasMessageContaining("ORA-04068");
+
+        verify(cs, times(1)).execute();
+        verify(con).rollback();
+    }
+
+    /**
+     * Проверяет, что {@code UPDATE} в методе, который ждёт список строк, — понятная ошибка с именем
+     * метода, а не странное приведение числа к списку.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void updateCountCannotBecomeRows() throws SQLException {
+        java.sql.PreparedStatement ps = mock(java.sql.PreparedStatement.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.execute()).thenReturn(false);
+        when(ps.getUpdateCount()).thenReturn(3);
+        Misused m = factory().create(Misused.class);
+
+        assertThatThrownBy(m::update).isInstanceOf(org.springframework.dao.InvalidDataAccessApiUsageException.class)
+                .hasMessageContaining("Misused.update").hasMessageContaining("update count");
+    }
+
+    /**
+     * Проверяет, что ошибка SQL в {@code @SqlQuery} называет метод, а не внутреннюю метку
+     * {@code JdbcTemplate}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void queryErrorsNameTheMethod() throws SQLException {
+        java.sql.PreparedStatement ps = mock(java.sql.PreparedStatement.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.execute()).thenThrow(new SQLException("ORA-00942: table or view does not exist", "42000", 942));
+        Queries q = factory().create(Queries.class);
+
+        assertThatThrownBy(() -> q.touch(1)).hasMessageContaining("Queries.touch");
+    }
+
+    /** Проверяет, что метод с {@code @SqlQuery} и {@code @Procedure} сразу отвергается при создании. */
+    @Test
+    void queryAndProcedureOnOneMethodIsRejected() {
+        assertThatThrownBy(() -> factory().create(Both.class))
+                .hasMessageContaining("Both.both: has both @SqlQuery and @Procedure");
     }
 }

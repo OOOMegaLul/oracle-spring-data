@@ -83,7 +83,7 @@ public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, Resourc
     public void registerBeanDefinitions(AnnotationMetadata metadata, BeanDefinitionRegistry registry) {
         Map<String, Object> attrs = metadata.getAnnotationAttributes(EnablePlsqlApis.class.getName());
         List<String> packages = new ArrayList<>();
-        String dataSourceRef = "dataSource";
+        String dataSourceRef = "";
         String factoryRef = "";
         if (attrs != null) {
             packages.addAll(Arrays.asList((String[]) attrs.get("basePackages")));
@@ -104,7 +104,8 @@ public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, Resourc
      * буквы ({@code TenantContext} даёт {@code tenantContext}). Если бин с таким именем уже
      * есть и описывает тот же интерфейс (интерфейс попал сюда через два сканируемых пакета),
      * повторная регистрация пропускается. Если это другой бин (два интерфейса с одинаковым
-     * простым именем), используется полное имя интерфейса с пакетом.
+     * простым именем), используется полное имя интерфейса с пакетом — с той же проверкой на
+     * повторную находку того же интерфейса.
      *
      * <p>Каждому описанию бина передаются класс интерфейса (аргумент конструктора),
      * {@code dataSourceRef} и {@code factoryRef} (свойства) и атрибут
@@ -112,11 +113,12 @@ public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, Resourc
      *
      * @param registry       реестр описаний бинов, куда добавляются новые бины
      * @param packages       пакеты для сканирования
-     * @param dataSourceRef  имя бина {@code DataSource} для фабрики, если она строится сама
+     * @param dataSourceRef  имя бина {@code DataSource} для фабрики или пустая строка, если не задано
      * @param factoryRef     имя бина {@code PlsqlApiFactory} или пустая строка
      * @param resourceLoader загрузчик ресурсов для сканера; {@code null} — загрузчик классов
      *                       по умолчанию
      * @param environment    окружение для сканера
+     * @throws IllegalStateException если и простое, и полное имя интерфейса заняты другими бинами
      */
     public static void register(BeanDefinitionRegistry registry, List<String> packages, String dataSourceRef,
                                 String factoryRef, ResourceLoader resourceLoader, Environment environment) {
@@ -147,12 +149,19 @@ public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, Resourc
             for (BeanDefinition candidate : scanner.findCandidateComponents(pkg)) {
                 Class<?> api = ClassUtils.resolveClassName(candidate.getBeanClassName(), cl);
                 String beanName = ClassUtils.getShortNameAsProperty(api);
+                if (registered(registry, beanName, api)) {
+                    continue; // тот же интерфейс, найденный через два сканируемых пакета
+                }
                 if (registry.containsBeanDefinition(beanName)) {
-                    BeanDefinition existing = registry.getBeanDefinition(beanName);
-                    if (api.equals(existing.getAttribute(FactoryBean.OBJECT_TYPE_ATTRIBUTE))) {
-                        continue; // тот же интерфейс, найденный через два сканируемых пакета
-                    }
                     beanName = api.getName(); // два интерфейса с одинаковым простым именем
+                    if (registered(registry, beanName, api)) {
+                        continue;
+                    }
+                    if (registry.containsBeanDefinition(beanName)) {
+                        throw new IllegalStateException("cannot register " + api.getName()
+                                + ": bean names '" + ClassUtils.getShortNameAsProperty(api) + "' and '" + beanName
+                                + "' are both taken by other beans");
+                    }
                 }
                 BeanDefinitionBuilder b = BeanDefinitionBuilder.genericBeanDefinition(PlsqlApiFactoryBean.class)
                         .addConstructorArgValue(api)
@@ -164,5 +173,18 @@ public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, Resourc
                 registry.registerBeanDefinition(beanName, bd);
             }
         }
+    }
+
+    /**
+     * Проверяет, зарегистрирован ли под этим именем бин именно этого интерфейса.
+     *
+     * @param registry реестр описаний бинов
+     * @param beanName имя бина
+     * @param api      интерфейс {@code @PlsqlApi}
+     * @return {@code true}, если под именем уже лежит фабричный бин этого интерфейса
+     */
+    private static boolean registered(BeanDefinitionRegistry registry, String beanName, Class<?> api) {
+        return registry.containsBeanDefinition(beanName)
+                && api.equals(registry.getBeanDefinition(beanName).getAttribute(FactoryBean.OBJECT_TYPE_ATTRIBUTE));
     }
 }

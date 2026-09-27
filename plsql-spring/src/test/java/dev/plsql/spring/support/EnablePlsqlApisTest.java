@@ -2,10 +2,13 @@ package dev.plsql.spring.support;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.core.env.StandardEnvironment;
 
 import dev.plsql.spring.PlsqlApiFactory;
 import dev.plsql.spring.support.enablefixture.EnableApp;
@@ -28,5 +31,22 @@ class EnablePlsqlApisTest {
             assertThat(ctx.getBeansOfType(PlsqlApiFactory.class)).isEmpty();
             assertThat(ctx.getBean(PlsqlApiFactoryBean.SHARED_FACTORIES, Map.class).keySet()).containsExactly("dataSource");
         }
+    }
+    /**
+     * Проверяет, что два интерфейса с одинаковым простым именем, найденные через пересекающиеся
+     * пакеты сканирования, регистрируются по одному разу: второй под полным именем, а повторная
+     * находка того же интерфейса пропускается. Раньше повторная находка регистрировалась ещё раз
+     * под полным именем и при запрете переопределения бинов (как в Spring Boot) роняла старт.
+     */
+    @Test
+    void sameSimpleNamesInOverlappingPackagesRegisterOnce() {
+        DefaultListableBeanFactory registry = new DefaultListableBeanFactory();
+        registry.setAllowBeanDefinitionOverriding(false);
+
+        PlsqlApiRegistrar.register(registry, List.of("dev.plsql.spring.support.clashfixture",
+                "dev.plsql.spring.support.clashfixture.a", "dev.plsql.spring.support.clashfixture.b"),
+                "dataSource", "", null, new StandardEnvironment());
+
+        assertThat(registry.getBeanDefinitionNames()).hasSize(2).contains("api");
     }
 }

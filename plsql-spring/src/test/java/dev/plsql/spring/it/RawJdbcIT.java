@@ -2,6 +2,7 @@ package dev.plsql.spring.it;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.sql.CallableStatement;
 import java.sql.Clob;
@@ -42,13 +43,15 @@ class RawJdbcIT {
      *
      * <p>Это причина, по которой библиотека вызывает процедуры через анонимный блок с локальными
      * переменными: JDBC передаёт только SQL-типы, а {@code BOOLEAN} и {@code RECORD} на 11.2
-     * существуют лишь внутри PL/SQL.
+     * существуют лишь внутри PL/SQL. С 12c JDBC умеет передавать часть типов пакетов напрямую,
+     * поэтому на базе новее 11 тест пропускается.
      *
      * @throws SQLException если не удалось соединиться с базой
      */
     @Test
     void plainJdbcCannotBindPlsqlOnlyTypes() throws SQLException {
         try (Connection c = ItDatabase.connect()) {
+            assumeTrue(c.getMetaData().getDatabaseMajorVersion() == 11, "only Oracle 11 lacks these binds");
             assertThatThrownBy(() -> {
                 try (CallableStatement cs = c.prepareCall("{call lab_pkg.bool_inout(?)}")) {
                     cs.setBoolean(1, true);
@@ -72,8 +75,8 @@ class RawJdbcIT {
      * ({@code LAB_PKG.SET_STATE}) и возвращает соединение; «пользователь B» получает ту же сессию
      * Oracle и читает секрет A. Через {@code SessionContextDataSource} то же самое уже не проходит:
      * при каждой выдаче соединения состояние пакетов сбрасывается, и B видит {@code NULL}, а
-     * {@code CLIENT_IDENTIFIER} сессии равен {@code USER_B} (поставщик текущего пользователя в тесте
-     * всегда возвращает {@code USER_B}).
+     * {@code CLIENT_IDENTIFIER} той же сессии меняется с {@code USER_A} на {@code USER_B} вместе с
+     * тем, кто взял соединение.
      *
      * <p>Код, написанный под APEX или Oracle Forms, часто хранит «кто работает» и контекст в
      * переменных пакетов; в пуле это прямая утечка данных между пользователями.
@@ -90,10 +93,13 @@ class RawJdbcIT {
                 assertThat(state(b)).isEqualTo("secret of user A");
             }
 
-            SessionContextDataSource guarded = new SessionContextDataSource(pool, () -> "USER_B");
+            java.util.concurrent.atomic.AtomicReference<String> user = new java.util.concurrent.atomic.AtomicReference<>("USER_A");
+            SessionContextDataSource guarded = new SessionContextDataSource(pool, user::get);
             try (Connection a = guarded.getConnection(); Statement s = a.createStatement()) {
+                assertThat(clientIdentifier(a)).isEqualTo("USER_A");
                 s.execute("begin lab_pkg.set_state('secret of user A'); end;");
             }
+            user.set("USER_B");
             try (Connection b = guarded.getConnection()) {
                 assertThat(state(b)).isNull();
                 assertThat(clientIdentifier(b)).isEqualTo("USER_B");

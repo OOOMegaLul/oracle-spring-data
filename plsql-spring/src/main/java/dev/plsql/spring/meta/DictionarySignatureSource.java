@@ -107,9 +107,11 @@ public class DictionarySignatureSource implements SignatureSource {
      *
      * <p>Пакет в Oracle состоит из спецификации (объявления, видимые снаружи) и тела
      * (реализация); они компилируются отдельно. Если пакета нет (ORA-06564), каждому имени
-     * достаётся пустой список. Если тело пакета в статусе {@code INVALID} (не компилируется),
-     * сигнатуры всё равно читаются по спецификации, но в лог пишется предупреждение: вызовы
-     * будут падать с ORA-04063, пока тело не скомпилируется.
+     * достаётся пустой список. Если тело пакета в статусе {@code INVALID} (не компилируется) или
+     * тела нет вовсе, сигнатуры всё равно читаются по спецификации, но в лог пишется
+     * предупреждение: вызовы будут падать с ORA-04063 или ORA-04067, пока тело не
+     * скомпилируется или не будет создано. Об отсутствии тела предупреждение пишется только для
+     * пакета своей схемы: тело чужого пакета не видно тому, у кого есть лишь право EXECUTE.
      *
      * @param con    соединение, на котором читается словарь
      * @param schema схема-владелец или {@code null}
@@ -133,8 +135,14 @@ public class DictionarySignatureSource implements SignatureSource {
             return out;
         }
         Map<String, List<SubprogramInfo>> all = reader.readPackage(con, p.owner(), p.packageName());
-        if ("INVALID".equals(reader.packageBodyStatus(con, p.owner(), p.packageName()))) {
+        String body = reader.packageBodyStatus(con, p.owner(), p.packageName());
+        if ("INVALID".equals(body)) {
             log.warn("{}.{}: the package body is INVALID; calls will fail with ORA-04063 until it compiles",
+                    p.owner(), p.packageName());
+        } else if (body == null && !all.isEmpty() && java.util.Objects.equals(p.owner(), con.getMetaData().getUserName())) {
+            // Чужое тело пакета в ALL_OBJECTS не видно тому, у кого есть только EXECUTE
+            // (проверено на 11.2.0.4), поэтому о пропавшем теле можно судить только в своей схеме.
+            log.warn("{}.{}: the package has no body; calls will fail with ORA-04067 until it is created",
                     p.owner(), p.packageName());
         }
         for (String n : names) {

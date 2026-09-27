@@ -162,8 +162,8 @@ public final class ItDatabase {
 
     /**
      * Поднимает базу и готовит схему. Записывает {@link #url} только когда схема готова, поэтому
-     * наполовину подготовленная база никогда не используется (локальная переменная {@code url}
-     * намеренно скрывает статическое поле до последней строки).
+     * наполовину подготовленная база никогда не используется: до последней строки адрес живёт в
+     * локальной переменной {@code jdbcUrl}.
      *
      * <p>Порядок:
      * <ol>
@@ -183,11 +183,11 @@ public final class ItDatabase {
      */
     @SuppressWarnings("resource")
     private static void start() {
-        String url = System.getProperty("plsql.it.url");
+        String jdbcUrl = System.getProperty("plsql.it.url");
         String image = System.getProperty("plsql.it.image", "gvenzl/oracle-xe:11-slim");
         String dbaUser;
         String dbaPassword;
-        if (url == null || url.isBlank()) {
+        if (jdbcUrl == null || jdbcUrl.isBlank()) {
             GenericContainer<?> db = new GenericContainer<>(image)
                     .withEnv("ORACLE_PASSWORD", "it_password")
                     .withExposedPorts(1521)
@@ -198,7 +198,7 @@ public final class ItDatabase {
             // Контейнер останавливает и «чистильщик» Testcontainers (Ryuk); хук нужен на случай
             // TESTCONTAINERS_RYUK_DISABLED=true, когда Ryuk выключен.
             Runtime.getRuntime().addShutdownHook(new Thread(db::stop, "stop-oracle-it"));
-            url = "jdbc:oracle:thin:@//" + db.getHost() + ":" + db.getMappedPort(1521) + "/XE";
+            jdbcUrl = "jdbc:oracle:thin:@//" + db.getHost() + ":" + db.getMappedPort(1521) + "/XE";
             // В gvenzl/oracle-xe:11 нет PDB (подключаемых баз, они появились в 12c): сервис — XE.
             dbaUser = "system";
             dbaPassword = "it_password";
@@ -209,8 +209,8 @@ public final class ItDatabase {
                 throw new IllegalStateException("-Dplsql.it.url needs -Dplsql.it.dba.password: the tests create their own schema");
             }
         }
-        log.info("integration tests on {}", url);
-        try (Connection dba = DriverManager.getConnection(url, dbaUser, dbaPassword)) {
+        log.info("integration tests on {}", jdbcUrl);
+        try (Connection dba = DriverManager.getConnection(jdbcUrl, dbaUser, dbaPassword)) {
             charset = single(dba, "select value from nls_database_parameters where parameter = 'NLS_CHARACTERSET'");
             if (single(dba, "select count(*) from dba_users where username = '" + USER + "'").equals("1")) {
                 try (Statement s = dba.createStatement()) {
@@ -219,14 +219,14 @@ public final class ItDatabase {
             }
             run(dba, "/it/schema-dba.sql");
         } catch (SQLException e) {
-            throw new IllegalStateException("cannot prepare the test schema on " + url, e);
+            throw new IllegalStateException("cannot prepare the test schema on " + jdbcUrl, e);
         }
-        try (Connection c = DriverManager.getConnection(url, USER, PASSWORD)) {
+        try (Connection c = DriverManager.getConnection(jdbcUrl, USER, PASSWORD)) {
             run(c, "/it/schema-objects.sql");
         } catch (SQLException e) {
-            throw new IllegalStateException("cannot create test objects on " + url, e);
+            throw new IllegalStateException("cannot create test objects on " + jdbcUrl, e);
         }
-        ItDatabase.url = url;
+        url = jdbcUrl;
     }
 
     /**
