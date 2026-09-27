@@ -37,6 +37,26 @@ jobs:
           print('::error title=Build failed::' + esc)
           EOF
 
+      # Test times as a notice on the run page, also readable through the public API: a slow
+      # build shows where the time went without the raw log (0.2.0 once took 16 minutes).
+      - name: Report timings
+        if: success()
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import re
+          lines = open('build.log', encoding='utf-8', errors='replace').read().splitlines()
+          classes = []
+          for l in lines:
+              m = re.search(r'Time elapsed: ([0-9.]+) s.* in (dev\.plsql\.\S+)', l)
+              if m:
+                  classes.append((float(m.group(1)), m.group(2).rsplit('.', 1)[-1]))
+          classes.sort(reverse=True)
+          text = [f'{t:7.1f} s  {c}' for t, c in classes[:8]]
+          text += [l.replace('[INFO] ', '') for l in lines if 'Total time' in l]
+          print('::notice title=Timings::' + '%0A'.join(text))
+          EOF
+
       - name: Keep test reports
         if: always()
         uses: actions/upload-artifact@v7
