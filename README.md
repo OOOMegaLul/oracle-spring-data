@@ -40,12 +40,12 @@ public interface Hr {
 <dependency>
   <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
   <artifactId>plsql-spring</artifactId>
-  <version>v0.2.0</version>
+  <version>v0.3.0</version>
 </dependency>
 ```
 
 Gradle: `maven { url 'https://jitpack.io' }` и
-`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.2.0'`.
+`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.3.0'`.
 
 **Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
 у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
@@ -96,7 +96,7 @@ Hr hr = factory.create(Hr.class);
 
 | Что | Правило |
 |---|---|
-| Имя подпрограммы | `setTenant` → `SET_TENANT`, или `@Procedure("P_X")` |
+| Имя подпрограммы | `setTenant` → `SET_TENANT`, `loadXMLData` → `LOAD_XML_DATA` (аббревиатура отделяется от следующего слова), или `@Procedure("P_X")` |
 | Схема и пакет | `@PlsqlApi(schema, packageName)`; синонимы разрешаются как у компилятора PL/SQL (`DBMS_UTILITY.NAME_RESOLVE`) |
 | Аргументы | по имени параметра Java без учёта регистра, подчёркиваний и префиксов `P_`, `V_` и однобуквенных типовых: `tenant` → `NTENANT`, `beginDate` → `DBEGIN_DATE`; или `@Arg("NRN")` (с ним имя сравнивается целиком, без префиксов). Две равноценные кандидатуры — ошибка при старте, а не угадывание |
 | Объект-параметр | record или бин, чьи свойства — аргументы процедуры (как форма); `@Arg` работает на компоненте record и на поле, getter'е или setter'е бина |
@@ -209,7 +209,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (133, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (134, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования.
 
 ```bash

@@ -513,4 +513,20 @@ class PlsqlApiInvocationHandlerTest {
         assertThatThrownBy(() -> factory().create(Both.class))
                 .hasMessageContaining("Both.both: has both @SqlQuery and @Procedure");
     }
+
+    /**
+     * Проверяет перевод имени метода в имя процедуры: слова через подчёркивание, аббревиатура
+     * отделяется от следующего слова ({@code loadXMLData} → {@code LOAD_XML_DATA}), в конце
+     * остаётся целой, цифра не разрывает слово.
+     */
+    @Test
+    void methodNamesBecomeOracleNames() {
+        assertThat(PlsqlApiInvocationHandler.oracleName("setTenant")).isEqualTo("SET_TENANT");
+        assertThat(PlsqlApiInvocationHandler.oracleName("loadXMLData")).isEqualTo("LOAD_XML_DATA");
+        assertThat(PlsqlApiInvocationHandler.oracleName("getHTTPStatus")).isEqualTo("GET_HTTP_STATUS");
+        assertThat(PlsqlApiInvocationHandler.oracleName("getURL")).isEqualTo("GET_URL");
+        assertThat(PlsqlApiInvocationHandler.oracleName("parseXML2Json")).isEqualTo("PARSE_XML2_JSON");
+        assertThat(PlsqlApiInvocationHandler.oracleName("version2Of")).isEqualTo("VERSION2_OF");
+        assertThat(PlsqlApiInvocationHandler.oracleName("noop")).isEqualTo("NOOP");
+    }
 }

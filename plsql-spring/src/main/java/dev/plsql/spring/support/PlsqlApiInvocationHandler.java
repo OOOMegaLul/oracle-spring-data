@@ -197,11 +197,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * Возвращает имя подпрограммы PL/SQL для метода Java.
      *
      * <p>Если на методе есть {@link Procedure} с непустым значением, берётся оно, в верхнем
-     * регистре. Иначе имя метода переводится из camelCase в стиль Oracle: перед заглавной буквой,
-     * которая стоит после строчной буквы или цифры, вставляется подчёркивание, и всё имя
-     * переводится в верхний регистр: {@code setParam} → {@code SET_PARAM}. Несколько заглавных
-     * подряд не разделяются: {@code loadXMLData} → {@code LOAD_XMLDATA}. Верхний регистр нужен
-     * потому, что имена, объявленные без кавычек, Oracle хранит в словаре в верхнем регистре.
+     * регистре. Иначе имя метода переводится из camelCase в стиль Oracle ({@link #oracleName}):
+     * {@code setParam} → {@code SET_PARAM}, {@code loadXMLData} → {@code LOAD_XML_DATA}.
      *
      * @param m метод интерфейса
      * @return имя процедуры или функции в верхнем регистре, без схемы и пакета
@@ -211,7 +208,27 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         if (p != null && !p.value().isEmpty()) {
             return p.value().toUpperCase(Locale.ROOT);
         }
-        return m.getName().replaceAll("([a-z0-9])([A-Z])", "$1_$2").toUpperCase(Locale.ROOT);
+        return oracleName(m.getName());
+    }
+
+    /**
+     * Переводит имя из camelCase в стиль Oracle: слова через подчёркивание, всё в верхнем
+     * регистре.
+     *
+     * <p>Новое слово начинается с заглавной буквы после строчной или цифры ({@code setParam} →
+     * {@code SET_PARAM}) и с последней заглавной в ряду заглавных, если за ней идёт строчная:
+     * так аббревиатура отделяется от следующего слова ({@code loadXMLData} →
+     * {@code LOAD_XML_DATA}, {@code getHTTPStatus} → {@code GET_HTTP_STATUS}). Аббревиатура в
+     * конце остаётся целой ({@code getURL} → {@code GET_URL}). Верхний регистр нужен потому, что
+     * имена, объявленные без кавычек, Oracle хранит в словаре в верхнем регистре.
+     *
+     * @param javaName имя метода Java
+     * @return имя в стиле Oracle
+     */
+    static String oracleName(String javaName) {
+        return javaName.replaceAll("([a-z0-9])([A-Z])", "$1_$2")
+                .replaceAll("([A-Z])([A-Z][a-z])", "$1_$2")
+                .toUpperCase(Locale.ROOT);
     }
 
     /**
