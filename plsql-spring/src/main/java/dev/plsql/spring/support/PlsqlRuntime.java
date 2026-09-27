@@ -7,11 +7,29 @@ import dev.plsql.spring.call.CallPlanner;
 import dev.plsql.spring.meta.SignatureSource;
 
 /**
- * Everything a generated implementation needs at runtime. Built by
- * {@link dev.plsql.spring.PlsqlApiFactory}.
+ * Хранит всё, что нужно созданной реализации интерфейса {@code @PlsqlApi} во время работы.
  *
- * @param retryDiscardedState repeat a call once after ORA-04068 (package recompiled under a
- *                            live session); the failed call never ran, so this is safe
+ * <p>Собирается в {@link dev.plsql.spring.PlsqlApiFactory} (в её {@code Builder}) один раз на
+ * фабрику и передаётся каждой реализации, которую фабрика создаёт. Это record — неизменяемый
+ * класс-«запись» Java: поля задаются в конструкторе, а читаются одноимёнными методами
+ * ({@code dataSource()}, {@code planner()} и т.д.).
+ *
+ * @param dataSource          пул соединений, из которого берётся соединение на каждый вызов (в
+ *                            транзакции Spring — соединение этой транзакции)
+ * @param signatures          источник сигнатур подпрограмм: по умолчанию словарь Oracle, в
+ *                            тестах можно подставить заготовки
+ * @param planner             планировщик: при старте сопоставляет метод Java с подпрограммой и
+ *                            собирает анонимный PL/SQL-блок для вызова
+ * @param executor            исполнитель: при каждом вызове передаёт значения в собранный блок,
+ *                            выполняет его и читает результат
+ * @param translator          переводит ошибки JDBC в исключения Spring и
+ *                            {@link PlsqlBusinessException}
+ * @param charsetGuard        проверяет, что текст можно сохранить в кодировке базы, до отправки
+ *                            (отсюда его берут запросы {@code @SqlQuery}; исполнителю вызовов
+ *                            процедур тот же объект передан при создании)
+ * @param retryDiscardedState повторять вызов один раз после ORA-04068 (пакет перекомпилировали
+ *                            под живой сессией); неудачный вызов не выполнялся, поэтому это
+ *                            безопасно
  */
 public record PlsqlRuntime(
         DataSource dataSource,

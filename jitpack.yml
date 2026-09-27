@@ -1,0 +1,6 @@
+# JitPack builds the library from a git tag on the first request:
+# com.github.OOOMegaLul.oracle-spring-data:plsql-spring:<tag>
+jdk:
+  - openjdk17
+install:
+  - ./mvnw -B -ntp install -DskipTests -pl plsql-spring -am

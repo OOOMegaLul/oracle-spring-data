@@ -1,7 +1,8 @@
-# plsql-spring
+# Oracle Spring Data (plsql-spring)
 
-Процедуры и пакеты PL/SQL как бины Spring, в стиле Spring Data. Вы пишете интерфейс,
+Процедуры и пакеты PL/SQL как бины Spring, в стиле Spring Data: вы пишете интерфейс,
 реализацию библиотека создаёт сама и при старте сверяет каждый метод со словарём Oracle.
+Сама библиотека (Maven-артефакт) называется `plsql-spring`.
 
 ```java
 @PlsqlApi(packageName = "APP_CONTEXT")
@@ -25,13 +26,34 @@ public interface Hr {
 
 ## Подключение
 
+**Maven через JitPack.** JitPack сам собирает библиотеку из тега на GitHub; зависимости
+(ojdbc, orai18n, Spring) подтягиваются как обычно:
+
 ```xml
+<repositories>
+  <repository>
+    <id>jitpack.io</id>
+    <url>https://jitpack.io</url>
+  </repository>
+</repositories>
+
 <dependency>
-  <groupId>dev.plsql</groupId>
+  <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
   <artifactId>plsql-spring</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>v0.1.0</version>
 </dependency>
 ```
+
+Gradle: `maven { url 'https://jitpack.io' }` и
+`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.1.0'`.
+
+**Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
+у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
+документация (`-javadoc.jar`). Зависимости в этом случае кладутся рядом вручную:
+`ojdbc10` и `orai18n` версии 19.x, `spring-jdbc`, `spring-context`, `slf4j-api`.
+
+**Из исходников.** `./mvnw install -pl plsql-spring -am`, затем зависимость
+`dev.plsql:plsql-spring:<версия из pom.xml>`.
 
 Java 17+, Spring Framework 6.2+/7, Spring Boot 3.5+/4 (необязательно). Драйвер ojdbc
 зафиксирован на ветке 19.x: драйверы 21 и 23 с сервером 11.2 официально не работают.
@@ -149,6 +171,9 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 ```bash
 ./mvnw verify
 ```
+
+Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
+`release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
 Юнит-тесты (77, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования.

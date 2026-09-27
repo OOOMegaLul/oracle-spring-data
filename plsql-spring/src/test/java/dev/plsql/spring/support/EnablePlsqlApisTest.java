@@ -8,9 +8,15 @@ import org.springframework.context.annotation.AnnotationConfigApplicationContext
 import dev.plsql.spring.PlsqlApiFactory;
 import dev.plsql.spring.support.enablefixture.EnableApp;
 
-/** Without Boot and without a factory bean, every interface shares one factory. */
+/** Без Spring Boot и без бина-фабрики все интерфейсы получают одну общую фабрику. */
 class EnablePlsqlApisTest {
 
+    /**
+     * Проверяет, что {@code @EnablePlsqlApis} регистрирует бины обоих интерфейсов, а фабрика
+     * {@link PlsqlApiFactory} создаётся одна на {@code DataSource} (бин
+     * {@code plsqlApiFactory#dataSource}), а не по одной на интерфейс: иначе для каждого
+     * интерфейса повторялись бы сборка окружения и запрос {@code NLS_CHARACTERSET}.
+     */
     @Test
     void interfacesShareOneFactory() {
         try (AnnotationConfigApplicationContext ctx = new AnnotationConfigApplicationContext(EnableApp.class)) {

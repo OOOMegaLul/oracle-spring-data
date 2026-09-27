@@ -11,9 +11,20 @@ import org.springframework.context.annotation.Import;
 import dev.plsql.spring.support.PlsqlApiRegistrar;
 
 /**
- * Scans for {@link PlsqlApi} interfaces and registers an implementation for each,
- * like {@code @EnableJdbcRepositories}. With Spring Boot this is not needed: the
- * auto-configuration scans the application's package.
+ * Включает поиск интерфейсов {@link PlsqlApi} и регистрирует реализацию для каждого из них,
+ * как {@code @EnableJdbcRepositories} в Spring Data.
+ *
+ * <p>Ставится на класс конфигурации Spring ({@code @Configuration}). Через {@code @Import}
+ * аннотация подключает {@link PlsqlApiRegistrar}: при разборе конфигурации он сканирует
+ * пакеты и регистрирует бины, то есть добавляет в контекст описания будущих бинов
+ * ({@code BeanDefinition}) ещё до того, как какой-либо бин создан. Каждый интерфейс
+ * описывается как {@code PlsqlApiFactoryBean} — FactoryBean, то есть бин-фабрика, которую
+ * Spring просит изготовить настоящий объект; в контексте виден уже готовый объект с типом
+ * интерфейса, и его можно внедрять через {@code @Autowired}.
+ *
+ * <p>Со Spring Boot аннотация не нужна: автоконфигурация (конфигурация, которую Boot
+ * подключает сам, найдя библиотеку в classpath) сканирует пакет приложения. Если же
+ * {@code @EnablePlsqlApis} всё-таки стоит, автоконфигурация своё сканирование пропускает.
  */
 @Documented
 @Retention(RetentionPolicy.RUNTIME)
@@ -21,12 +32,36 @@ import dev.plsql.spring.support.PlsqlApiRegistrar;
 @Import(PlsqlApiRegistrar.class)
 public @interface EnablePlsqlApis {
 
-    /** Packages to scan. Empty means the package of the annotated class. */
+    /**
+     * Возвращает пакеты, в которых ищутся интерфейсы {@link PlsqlApi}; вложенные пакеты тоже
+     * просматриваются.
+     *
+     * <p>Пустой массив означает пакет класса, на котором стоит аннотация.
+     *
+     * @return имена пакетов для сканирования
+     */
     String[] basePackages() default {};
 
-    /** Bean name of the DataSource, used when no {@code PlsqlApiFactory} bean exists. */
+    /**
+     * Возвращает имя бина {@code DataSource} (пула соединений с базой), на котором строится
+     * фабрика реализаций.
+     *
+     * <p>Используется, только если {@link #factoryRef()} пуст и в контексте нет ровно одного
+     * бина {@code PlsqlApiFactory}. Тогда одна общая фабрика строится на этом
+     * {@code DataSource} для всех найденных интерфейсов.
+     *
+     * @return имя бина {@code DataSource}; по умолчанию {@code dataSource}
+     */
     String dataSourceRef() default "dataSource";
 
-    /** Bean name of the {@code PlsqlApiFactory} to use; for several databases in one application. */
+    /**
+     * Возвращает имя бина {@code PlsqlApiFactory}, которым создаются реализации; нужно, когда
+     * в одном приложении несколько баз.
+     *
+     * <p>Пустая строка означает: взять единственный бин {@code PlsqlApiFactory} из контекста,
+     * а если такого бина нет или их несколько — построить фабрику на {@link #dataSourceRef()}.
+     *
+     * @return имя бина {@code PlsqlApiFactory} или пустая строка
+     */
     String factoryRef() default "";
 }

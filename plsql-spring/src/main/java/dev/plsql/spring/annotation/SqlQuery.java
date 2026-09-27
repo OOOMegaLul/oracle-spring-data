@@ -7,16 +7,34 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 
 /**
- * A plain SELECT on the same interface, like {@code @Query} in Spring Data.
- * Parameters are bound by name ({@code :rn}); rows map to records or classes by
- * column name, {@code BEGIN_DATE} to {@code beginDate}.
+ * Помечает метод, который выполняет обычный SQL-запрос (как правило, SELECT) в том же
+ * интерфейсе {@link PlsqlApi}, вместо вызова процедуры; аналог {@code @Query} в Spring Data.
  *
- * <p>Return types: {@code List<T>}, {@code Optional<T>}, {@code T}, or a scalar.
+ * <p>Параметры передаются по имени ({@code :rn}): имя берётся из имени параметра Java или из
+ * {@link Arg}. Запрос разбирается один раз при старте, и если он ссылается на параметр,
+ * которого у метода нет, старт приложения останавливается с ошибкой. Строки превращаются в
+ * record или обычные классы по именам колонок: {@code BEGIN_DATE} попадает в
+ * {@code beginDate}; одна колонка — в простой тип, прочее — в {@code Map}.
+ *
+ * <p>Типы результата: {@code List<T>}, {@code Optional<T>}, {@code T} или скалярное значение.
+ * Если метод ждёт одну строку, а запрос вернул несколько, при вызове бросается
+ * {@code IncorrectResultSizeDataAccessException}. Возвращает ли оператор строки или число
+ * изменённых строк (для UPDATE и т.п.), решает JDBC при выполнении, а не догадка по первому
+ * слову запроса; число изменённых строк приводится к типу результата метода.
+ *
+ * <p>Ошибки разбираются так же, как у процедур: {@code RAISE_APPLICATION_ERROR} (способ, которым
+ * PL/SQL-код, например триггер, сообщает о нарушении бизнес-правила с кодом ORA-20000..20999)
+ * становится {@code PlsqlBusinessException}.
  */
 @Documented
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.METHOD)
 public @interface SqlQuery {
 
+    /**
+     * Возвращает текст SQL-запроса с именованными параметрами вида {@code :name}.
+     *
+     * @return текст запроса
+     */
     String value();
 }

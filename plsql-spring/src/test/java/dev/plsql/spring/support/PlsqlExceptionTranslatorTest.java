@@ -8,10 +8,20 @@ import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.DuplicateKeyException;
 
+/**
+ * Тесты {@link PlsqlExceptionTranslator}: ошибки ORA-20000..20999 из
+ * {@code RAISE_APPLICATION_ERROR} становятся {@link PlsqlBusinessException} с чистым текстом,
+ * остальные переводятся стандартной таблицей кодов Oracle из Spring.
+ */
 class PlsqlExceptionTranslatorTest {
 
     final PlsqlExceptionTranslator translator = new PlsqlExceptionTranslator();
 
+    /**
+     * Проверяет, что от ошибки ORA-20001 остаётся только текст сообщения — без префикса
+     * {@code ORA-20001:} и без строк стека ORA-06512, — код ошибки сохраняется, а исходное
+     * исключение становится причиной.
+     */
     @Test
     void applicationErrorsKeepOnlyTheText() {
         SQLException e = new SQLException("""
@@ -25,6 +35,11 @@ class PlsqlExceptionTranslatorTest {
         assertThat(r.getCause()).isSameAs(e);
     }
 
+    /**
+     * Проверяет, что остальные ошибки переводятся по кодам Oracle, известным Spring: ORA-00001
+     * (нарушение уникальности) → {@code DuplicateKeyException}, ORA-01400 (NULL в обязательной
+     * колонке) → {@code DataIntegrityViolationException}.
+     */
     @Test
     void otherErrorsUseSpringsOracleCodes() {
         assertThat(translator.translate("t", "s", new SQLException("ORA-00001: unique constraint", "23000", 1)))
@@ -33,6 +48,12 @@ class PlsqlExceptionTranslatorTest {
                 .isInstanceOf(DataIntegrityViolationException.class);
     }
 
+    /**
+     * Проверяет, какие ошибки считаются сбросом состояния пакета, после которого вызов можно
+     * повторить: ORA-04068 и ORA-06508 сами по себе и ORA-04061, вложенная причиной в другую
+     * ошибку (ORA-06550). Обычная ошибка ORA-00942 (таблица или представление не существует)
+     * сбросом не считается.
+     */
     @Test
     void discardedPackageStateIsRecognisedAlsoWhenChained() {
         assertThat(PlsqlExceptionTranslator.isStateDiscarded(new SQLException("ORA-04068", "72000", 4068))).isTrue();
@@ -43,6 +64,11 @@ class PlsqlExceptionTranslatorTest {
         assertThat(PlsqlExceptionTranslator.isStateDiscarded(new SQLException("ORA-00942", "42000", 942))).isFalse();
     }
 
+    /**
+     * Проверяет крайние случаи извлечения текста: сообщение без префикса {@code ORA-20001:}
+     * остаётся как есть, а вместо отсутствующего сообщения возвращается сам код
+     * ({@code ORA-20001}).
+     */
     @Test
     void messageWithoutPrefixIsKept() {
         assertThat(PlsqlExceptionTranslator.userMessage("plain", 20001)).isEqualTo("plain");

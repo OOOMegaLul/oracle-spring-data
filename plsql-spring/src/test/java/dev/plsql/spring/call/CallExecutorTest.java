@@ -31,19 +31,56 @@ import dev.plsql.spring.support.CharsetGuard;
 import oracle.jdbc.OracleConnection;
 import oracle.jdbc.OracleTypes;
 
-/** Binding and reading with ojdbc, on mocks: what is set, what is registered, what is freed. */
+/**
+ * Тесты {@link CallExecutor} на моках ojdbc: как значения привязываются ({@code set...}), какие
+ * OUT-параметры регистрируются, как читаются результаты и что освобождается после вызова.
+ * План вызова строит настоящий {@link CallPlanner} по сигнатурам из фикстуры {@code Signatures}.
+ */
 class CallExecutorTest {
 
+    /** Методы-образцы; каждый стоит за процедурой определённой формы из тестов ниже. */
     interface Api {
+        /**
+         * Процедура {@code P_INSERT(NTENANT IN NUMBER, SNAME IN VARCHAR2, NRN OUT NUMBER)}.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         * @param name   идёт в {@code SNAME}
+         * @return значение OUT-аргумента {@code NRN}
+         */
         long insert(long tenant, String name);
 
+        /**
+         * Функция {@code F_LEN(P_TEXT IN CLOB) RETURN NUMBER}: текст уходит через временный
+         * {@code CLOB}.
+         *
+         * @param text идёт в {@code P_TEXT}
+         * @return результат функции
+         */
         long length(String text);
 
+        /**
+         * Функция {@code PKG.WRAP(P_X IN XMLTYPE) RETURN XMLTYPE}; XML в обе стороны идёт текстом.
+         *
+         * @param x XML-текст для {@code P_X}
+         * @return XML-текст результата
+         */
         String wrap(String x);
 
+        /**
+         * Процедура {@code PKG.CUR(P_MIN_ID IN NUMBER, P_CUR IN OUT REF CURSOR)}.
+         *
+         * @param minId идёт в {@code P_MIN_ID}
+         * @return строки курсора {@code P_CUR}, каждая как карта «колонка → значение»
+         */
         List<Map<String, Object>> cursor(long minId);
     }
 
+    /**
+     * Находит метод {@link Api} по имени; перегрузок в {@code Api} нет.
+     *
+     * @param name имя метода
+     * @return метод интерфейса {@link Api}
+     */
     static Method m(String name) {
         return Arrays.stream(Api.class.getMethods()).filter(x -> x.getName().equals(name)).findFirst().orElseThrow();
     }
@@ -52,6 +89,13 @@ class CallExecutorTest {
     OracleConnection con;
     CallableStatement cs;
 
+    /**
+     * Готовит моки: соединение Oracle, у которого {@code unwrap(OracleConnection.class)}
+     * возвращает его же, а {@code prepareCall} с любым текстом возвращает один и тот же мок
+     * {@code CallableStatement}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @BeforeEach
     void setUp() throws SQLException {
         con = mock(OracleConnection.class);
@@ -60,6 +104,14 @@ class CallExecutorTest {
         when(con.prepareCall(anyString())).thenReturn(cs);
     }
 
+    /**
+     * Проверяет простой вызов целиком и порядок действий: {@code NUMBER} привязывается через
+     * {@code setBigDecimal}, строка через {@code setString}, OUT-аргумент регистрируется как
+     * {@code NUMERIC}, затем {@code execute()} и закрытие оператора. Прочитанный
+     * {@code BigDecimal} превращается в {@code long} — тип результата метода.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void scalarsInAndOut() throws SQLException {
         CallPlan p = planner.plan(m("insert"), proc(null, "P_INSERT").in("NTENANT", "NUMBER").in("SNAME", "VARCHAR2")
@@ -77,6 +129,13 @@ class CallExecutorTest {
         order.verify(cs).close();
     }
 
+    /**
+     * Проверяет, что {@code null} привязывается через {@code setNull} с типом SQL, который
+     * соответствует аргументу: {@code NUMERIC} для {@code NUMBER} и {@code VARCHAR} для
+     * {@code VARCHAR2}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void nullsAreTypedNulls() throws SQLException {
         CallPlan p = planner.plan(m("insert"), proc(null, "P_INSERT").in("NTENANT", "NUMBER").in("SNAME", "VARCHAR2")
@@ -86,6 +145,14 @@ class CallExecutorTest {
         verify(cs).setNull(2, Types.VARCHAR);
     }
 
+    /**
+     * Проверяет, что временный {@code CLOB}, созданный для входного текста, освобождается
+     * ({@code free()}), даже когда вызов упал (здесь ORA-01013, отмена операции). Неосвобождённый
+     * временный LOB остаётся во временном табличном пространстве сессии до закрытия соединения,
+     * а соединение из пула практически никогда не закрывается.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void temporaryClobIsFreedEvenWhenTheCallFails() throws SQLException {
         CallPlan p = planner.plan(m("length"), func(null, "F_LEN", "NUMBER").in("P_TEXT", "CLOB").build());
@@ -100,6 +167,14 @@ class CallExecutorTest {
         verify(clob).free();
     }
 
+    /**
+     * Проверяет, что при политике {@code FAIL} текст, который база в CL8MSWIN1251 сохранить не
+     * может (казахская буква «Ә»), отвергается с именем аргумента {@code P_TEXT} ещё до создания
+     * временного {@code CLOB} и до выполнения вызова. Без этой проверки база молча заменила бы
+     * символ на {@code ?}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void textTheDatabaseCannotStoreIsRejectedBeforeAnythingIsSent() throws SQLException {
         CallPlan p = planner.plan(m("length"), func(null, "F_LEN", "NUMBER").in("P_TEXT", "CLOB").build());
@@ -112,6 +187,12 @@ class CallExecutorTest {
         verify(cs, never()).execute();
     }
 
+    /**
+     * Проверяет, что {@code XMLTYPE} на выходе регистрируется как {@code CLOB} и читается
+     * текстом, а оба {@code CLOB} — временный входной и полученный на выходе — освобождаются.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void xmltypeIsReadAsClobText() throws SQLException {
         CallPlan p = planner.plan(m("wrap"), func("PKG", "WRAP", xml(null, "OUT")).add(xml("P_X", "IN")).build());
@@ -130,6 +211,13 @@ class CallExecutorTest {
         verify(out).free();
     }
 
+    /**
+     * Проверяет, что курсор {@code IN OUT}, который процедура так и не открыла (при чтении
+     * ORA-24338), даёт результат {@code null}, а не ошибку; OUT-параметр при этом
+     * зарегистрирован как {@code OracleTypes.CURSOR}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void cursorLeftUnopenedReadsAsNull() throws SQLException {
         CallPlan p = planner.plan(m("cursor"), proc("PKG", "CUR").in("P_MIN_ID", "NUMBER").inOut("P_CUR", "REF CURSOR").build());
@@ -139,6 +227,12 @@ class CallExecutorTest {
         verify(cs).registerOutParameter(2, OracleTypes.CURSOR);
     }
 
+    /**
+     * Проверяет, что остальные ошибки чтения курсора (здесь ORA-01001, недопустимый курсор) не
+     * глотаются, а выходят наружу как {@code SQLException}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void otherCursorErrorsPropagate() throws SQLException {
         CallPlan p = planner.plan(m("cursor"), proc("PKG", "CUR").in("P_MIN_ID", "NUMBER").inOut("P_CUR", "REF CURSOR").build());
@@ -146,6 +240,10 @@ class CallExecutorTest {
         assertThatThrownBy(() -> new CallExecutor(100).execute(con, p, new Object[]{1L})).isInstanceOf(SQLException.class);
     }
 
+    /**
+     * Проверяет {@code foldRecords}: выходы полей записи ({@code P_REC.ID}, {@code P_REC.NAME})
+     * собираются в одну карту под ключом {@code P_REC}, а прочие выходы остаются как были.
+     */
     @Test
     void recordOutputsAreFoldedIntoOneMap() {
         Map<String, Object> outs = new java.util.LinkedHashMap<>();
@@ -156,6 +254,14 @@ class CallExecutorTest {
         assertThat(outs).containsEntry("P_REC", Map.of("ID", 1, "NAME", "a")).containsEntry("P_OTHER", 2).hasSize(2);
     }
 
+    /**
+     * Проверяет, что если упали и вызов (ORA-04068), и освобождение LOB (ORA-03113), наружу
+     * выходит ошибка вызова, а ошибка освобождения прикреплена к ней как suppressed. Исходная
+     * ошибка решает, повторять ли вызов (после ORA-04068 его повторяют), и именно её видит
+     * вызывающий.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void failureToFreeIsAttachedToTheCallErrorNotSwappedForIt() throws SQLException {
         CallPlan p = planner.plan(m("length"), func(null, "F_LEN", "NUMBER").in("P_TEXT", "CLOB").build());
@@ -172,6 +278,12 @@ class CallExecutorTest {
                 });
     }
 
+    /**
+     * Проверяет, что если вызов прошёл, а освободить временный LOB не удалось (ORA-22922), эта
+     * ошибка не теряется, а выбрасывается из {@code execute}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void failureToFreeAfterASuccessfulCallIsReported() throws SQLException {
         CallPlan p = planner.plan(m("length"), func(null, "F_LEN", "NUMBER").in("P_TEXT", "CLOB").build());

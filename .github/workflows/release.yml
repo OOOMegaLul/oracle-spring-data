@@ -1,0 +1,60 @@
+name: release
+
+# A tag vX.Y.Z publishes version X.Y.Z: the jar, sources and javadoc go to GitHub Releases.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Tag matches the version in pom.xml
+        shell: bash
+        run: |
+          V=$(./mvnw -B -q -N help:evaluate -Dexpression=project.version -DforceStdout)
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pom.xml version $V"
+            exit 1
+          fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      # Unit tests run here; the integration tests run in the ci workflow for the same push.
+      - name: Build jar, sources and javadoc
+        run: ./mvnw -B -ntp -Prelease verify -pl plsql-spring -am
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          T=plsql-spring/target
+          cat > notes.md <<EOF
+          Oracle Spring Data (plsql-spring) $VERSION.
+
+          **Maven (JitPack):** repository \`https://jitpack.io\`, dependency
+          \`com.github.${GITHUB_REPOSITORY_OWNER}.oracle-spring-data:plsql-spring:$GITHUB_REF_NAME\`.
+
+          **Files:** \`plsql-spring-$VERSION.jar\` is the library, \`-sources.jar\` its source,
+          \`-javadoc.jar\` its documentation. Using the jar directly, put these next to it:
+          ojdbc10 and orai18n 19.x, spring-jdbc and spring-context 6.2+ or 7.x, slf4j-api.
+
+          Java 17+. Oracle 11.2 and newer. See README.md.
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Oracle Spring Data $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            "$T/plsql-spring-$VERSION.jar" \
+            "$T/plsql-spring-$VERSION-sources.jar" \
+            "$T/plsql-spring-$VERSION-javadoc.jar"

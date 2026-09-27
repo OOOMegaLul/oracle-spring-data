@@ -8,13 +8,32 @@ import org.springframework.jdbc.support.SQLErrorCodeSQLExceptionTranslator;
 import org.springframework.jdbc.support.SQLExceptionTranslator;
 
 /**
- * ORA-20000..20999 become {@link PlsqlBusinessException} with a clean message;
- * everything else goes through Spring's standard Oracle error-code mapping.
+ * Превращает {@link SQLException} от драйвера Oracle в непроверяемые исключения Spring.
+ *
+ * <p>Ошибки ORA-20000..20999 (их поднимает PL/SQL-код через RAISE_APPLICATION_ERROR) становятся
+ * {@link PlsqlBusinessException} с очищенным текстом; всё остальное проходит через стандартное
+ * сопоставление кодов ошибок Oracle в Spring ({@code SQLErrorCodeSQLExceptionTranslator}):
+ * например, ORA-00001 (нарушение уникальности) становится {@code DuplicateKeyException}.
+ *
+ * <p>Используется и для вызовов процедур, и для запросов {@code @SqlQuery}. Свой вариант можно
+ * передать в {@code PlsqlApiFactory.Builder.exceptionTranslator}.
  */
 public class PlsqlExceptionTranslator {
 
     private final SQLExceptionTranslator fallback = new SQLErrorCodeSQLExceptionTranslator("Oracle");
 
+    /**
+     * Переводит ошибку JDBC в исключение Spring.
+     *
+     * <p>Метод не бросает исключение, а возвращает его: бросает вызывающий код.
+     *
+     * @param task описание операции для текста ошибки (например, имя вызываемой процедуры)
+     * @param sql  выполнявшийся SQL или PL/SQL-блок; может быть {@code null}
+     * @param e    исходная ошибка JDBC
+     * @return {@link PlsqlBusinessException} для кодов 20000..20999; иначе исключение из
+     *         стандартной иерархии Spring, а если стандартный переводчик ничего не подобрал —
+     *         {@link UncategorizedSQLException}
+     */
     public RuntimeException translate(String task, String sql, SQLException e) {
         int code = e.getErrorCode();
         if (code >= 20000 && code <= 20999) {
@@ -24,7 +43,19 @@ public class PlsqlExceptionTranslator {
         return dae != null ? dae : new UncategorizedSQLException(task, sql, e);
     }
 
-    /** "ORA-20001: Отпуск пересекается с командировкой\nORA-06512: at ..." -> "Отпуск пересекается с командировкой" */
+    /**
+     * Вырезает из сообщения Oracle текст, который написал PL/SQL-код.
+     *
+     * <p>{@code "ORA-20001: Отпуск пересекается с командировкой\nORA-06512: at ..."} превращается
+     * в {@code "Отпуск пересекается с командировкой"}: отбрасывается всё до префикса
+     * {@code ORA-<код>: } включительно и всё, начиная со следующей строки, которая начинается с
+     * {@code ORA-} (стек ORA-06512 — строки «где произошла ошибка»). Если префикса нет, текст
+     * берётся с начала сообщения. Пробелы по краям убираются.
+     *
+     * @param message полное сообщение исключения; может быть {@code null}
+     * @param code    код ошибки Oracle, например 20001
+     * @return текст для пользователя; для {@code null} — строка вида {@code ORA-20001}
+     */
     static String userMessage(String message, int code) {
         if (message == null) {
             return "ORA-" + code;
@@ -39,7 +70,22 @@ public class PlsqlExceptionTranslator {
         return s.strip();
     }
 
-    /** Package state was discarded (someone recompiled a package): the call never ran and can be repeated. */
+    /**
+     * Проверяет, сброшено ли состояние пакета (кто-то перекомпилировал пакет): вызов не выполнялся,
+     * и его можно повторить.
+     *
+     * <p>Состояние пакета — значения его переменных, которые Oracle хранит отдельно для каждой
+     * сессии. После перекомпиляции пакета Oracle сбрасывает это состояние в сессиях, которые
+     * пакетом уже пользовались, и первый следующий вызов в такой сессии падает с ORA-04068.
+     *
+     * <p>Проверяются коды 4068, 4061, 4065 и 6508 (ORA-04068, ORA-04061, ORA-04065, ORA-06508) у
+     * самого исключения и дальше по цепочке: на каждом шаге берётся следующее исключение
+     * ({@code getNextException()}), а если его нет — причина ({@code getCause()}); обход
+     * останавливается на первом звене, которое не {@code SQLException}.
+     *
+     * @param e ошибка JDBC
+     * @return {@code true}, если это сброс состояния пакета и вызов можно повторить
+     */
     public static boolean isStateDiscarded(SQLException e) {
         for (Throwable t = e; t instanceof SQLException s; t = s.getNextException() != null ? s.getNextException() : s.getCause()) {
             int c = s.getErrorCode();

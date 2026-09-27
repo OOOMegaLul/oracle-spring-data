@@ -23,39 +23,69 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
 /**
- * The database the integration tests run on, with a fresh PLSQL_IT schema.
+ * База данных, на которой идут интеграционные тесты, со свежей схемой {@code PLSQL_IT}.
  *
+ * <p>Откуда берётся база:
  * <ul>
- *   <li>default: a throwaway {@code gvenzl/oracle-xe:11-slim} container (Testcontainers);
- *       {@code -Dplsql.it.image=...} picks another image, {@code -Dplsql.it.port=...} a fixed host port;</li>
- *   <li>{@code -Dplsql.it.url=... -Dplsql.it.dba.password=...} (and optionally
- *       {@code -Dplsql.it.dba.user}, default {@code system}): an existing Oracle.</li>
+ *   <li>по умолчанию — одноразовый контейнер {@code gvenzl/oracle-xe:11-slim} (Testcontainers, нужен
+ *       Docker); {@code -Dplsql.it.image=...} выбирает другой образ, {@code -Dplsql.it.port=...} —
+ *       фиксированный порт на хосте;</li>
+ *   <li>{@code -Dplsql.it.url=... -Dplsql.it.dba.password=...} (и при необходимости
+ *       {@code -Dplsql.it.dba.user}, по умолчанию {@code system}) — уже существующая база Oracle.</li>
  * </ul>
- * The schema is dropped and recreated once per JVM, so a run never depends on the last one.
+ *
+ * <p>Схема удаляется и создаётся заново один раз на JVM, поэтому прогон никогда не зависит от
+ * предыдущего. Сначала под DBA выполняется {@code it/schema-dba.sql} (пользователь {@code PLSQL_IT}
+ * и его права), затем под самим {@code PLSQL_IT} — {@code it/schema-objects.sql} (таблица
+ * {@code LAB_EMP}, SQL-типы и пакет {@code LAB_PKG}). Все методы статические; база поднимается
+ * лениво, при первом обращении к {@link #url()}.
  */
 public final class ItDatabase {
 
+    /** Имя тестовой схемы (пользователя Oracle), в которой создаются все объекты тестов. */
     public static final String USER = "PLSQL_IT";
+    /** Пароль пользователя {@link #USER}; тот же, что задан в {@code it/schema-dba.sql}. */
     public static final String PASSWORD = "plsql_it";
 
     static {
-        // ojdbc sends the JVM time zone to the server by region name at logon. Oracle 11.2
-        // does not know "Etc/UTC" (the default on CI runners and in most containers) and
-        // refuses the logon with ORA-01882; an offset works with every time zone file.
+        // При входе ojdbc передаёт серверу часовой пояс JVM по имени региона. Oracle 11.2
+        // не знает "Etc/UTC" (пояс по умолчанию на CI-раннерах и в большинстве контейнеров)
+        // и отказывает во входе с ORA-01882; смещение от UTC работает с любым файлом часовых
+        // поясов. Свойство выставляется, только если его не задали явно (например, через -D).
         if (System.getProperty("oracle.jdbc.timezoneAsRegion") == null) {
             System.setProperty("oracle.jdbc.timezoneAsRegion", "false");
         }
     }
 
+    /** Журнал: сообщает, на какой базе идут тесты. */
     private static final Logger log = LoggerFactory.getLogger(ItDatabase.class);
+    /** JDBC URL готовой базы; {@code null}, пока схема не подготовлена. */
     private static String url;
+    /** {@code NLS_CHARACTERSET} тестовой базы, прочитанный при подготовке схемы. */
     private static String charset;
-    /** A failed start is not repeated for every test class (each attempt could start a container). */
+    /**
+     * Ошибка первого запуска. Неудачный старт не повторяется для каждого тестового класса
+     * (каждая попытка могла бы запускать новый контейнер).
+     */
     private static RuntimeException startFailure;
 
+    /** Класс только со статическими методами: экземпляры не создаются. */
     private ItDatabase() {
     }
 
+    /**
+     * Возвращает JDBC URL тестовой базы, при первом обращении поднимая базу и создавая схему.
+     *
+     * <p>Первый вызов выполняет {@link #start()}: запускает контейнер (или берёт внешнюю базу) и
+     * пересоздаёт схему {@code PLSQL_IT}; следующие вызовы сразу возвращают готовый URL. Если
+     * первый запуск упал, ошибка запоминается, и все последующие вызовы (в том числе из других
+     * тестовых классов) сразу бросают исключение с исходной причиной, не пытаясь стартовать
+     * заново. Метод синхронизирован, так что база поднимается ровно один раз.
+     *
+     * @return JDBC URL вида {@code jdbc:oracle:thin:@//host:port/service}
+     * @throws IllegalStateException если база не поднялась при одном из предыдущих вызовов; при
+     *                               первой неудаче пробрасывается исходное исключение
+     */
     public static synchronized String url() {
         if (startFailure != null) {
             throw new IllegalStateException("test database failed to start earlier", startFailure);
@@ -71,20 +101,53 @@ public final class ItDatabase {
         return url;
     }
 
-    /** NLS_CHARACTERSET of the test database. */
+    /**
+     * Возвращает {@code NLS_CHARACTERSET} тестовой базы — кодировку, в которой она хранит
+     * {@code VARCHAR2} и {@code CLOB} (например {@code AL32UTF8} или {@code CL8MSWIN1251}).
+     * При необходимости сначала поднимает базу через {@link #url()}.
+     *
+     * @return имя кодировки базы в терминах Oracle
+     */
     public static synchronized String charset() {
         url();
         return charset;
     }
 
+    /**
+     * Проверяет, что тестовая база в однобайтовой кириллической кодировке {@code CL8MSWIN1251}.
+     * В такой базе символ вне кодовой страницы Windows-1251 (например казахская {@code Ә})
+     * молча заменяется на {@code ?}, поэтому тесты кодировки ожидают там другое поведение, чем в
+     * базе с Unicode.
+     *
+     * @return {@code true}, если {@code NLS_CHARACTERSET} равен {@code CL8MSWIN1251}
+     */
     public static boolean singleByteCyrillic() {
         return "CL8MSWIN1251".equals(charset());
     }
 
+    /**
+     * Открывает новое отдельное соединение (без пула) под пользователем {@link #USER}; autoCommit
+     * включён, как по умолчанию в JDBC. Закрывать соединение должен вызывающий код, обычно через
+     * try-with-resources.
+     *
+     * @return новое соединение JDBC с тестовой схемой
+     * @throws SQLException если соединиться не удалось
+     */
     public static Connection connect() throws SQLException {
         return DriverManager.getConnection(url(), USER, PASSWORD);
     }
 
+    /**
+     * Создаёт пул соединений HikariCP к тестовой схеме.
+     *
+     * <p>Пул держит минимум одно простаивающее соединение и включает у драйвера неявный кэш
+     * подготовленных операторов на 50 штук ({@code oracle.jdbc.implicitStatementCacheSize}), как
+     * это обычно делают в приложениях. Закрыть пул должен вызывающий код.
+     *
+     * @param size       максимальное число соединений в пуле
+     * @param autoCommit режим autoCommit, в котором пул отдаёт соединения
+     * @return новый пул; его нужно закрыть после тестов
+     */
     public static HikariDataSource pool(int size, boolean autoCommit) {
         HikariConfig c = new HikariConfig();
         c.setJdbcUrl(url());
@@ -97,7 +160,27 @@ public final class ItDatabase {
         return new HikariDataSource(c);
     }
 
-    /** Sets {@link #url} only when the schema is ready, so a half-prepared database is never used. */
+    /**
+     * Поднимает базу и готовит схему. Записывает {@link #url} только когда схема готова, поэтому
+     * наполовину подготовленная база никогда не используется (локальная переменная {@code url}
+     * намеренно скрывает статическое поле до последней строки).
+     *
+     * <p>Порядок:
+     * <ol>
+     *   <li>без {@code -Dplsql.it.url} запускается контейнер (образ из {@code -Dplsql.it.image}, по
+     *       умолчанию {@code gvenzl/oracle-xe:11-slim}); готовность — строка
+     *       {@code DATABASE IS READY TO USE!} в журнале контейнера, ждём её до 10 минут; DBA —
+     *       {@code system} с паролем, заданным контейнеру. С {@code -Dplsql.it.url} используется
+     *       внешняя база, и пароль DBA обязателен;</li>
+     *   <li>под DBA читается {@code NLS_CHARACTERSET}, удаляется старый пользователь {@link #USER}
+     *       вместе со всеми его объектами ({@code drop user ... cascade}), если он есть, и
+     *       выполняется {@code /it/schema-dba.sql};</li>
+     *   <li>под {@link #USER} выполняется {@code /it/schema-objects.sql}.</li>
+     * </ol>
+     *
+     * @throws IllegalStateException если для внешней базы не задан пароль DBA или не удалось
+     *                               выполнить скрипты схемы
+     */
     @SuppressWarnings("resource")
     private static void start() {
         String url = System.getProperty("plsql.it.url");
@@ -112,10 +195,11 @@ public final class ItDatabase {
                     .waitingFor(Wait.forLogMessage(".*DATABASE IS READY TO USE!.*\\n", 1)
                             .withStartupTimeout(Duration.ofMinutes(10)));
             db.start();
-            // The Testcontainers reaper stops it too; the hook covers TESTCONTAINERS_RYUK_DISABLED=true.
+            // Контейнер останавливает и «чистильщик» Testcontainers (Ryuk); хук нужен на случай
+            // TESTCONTAINERS_RYUK_DISABLED=true, когда Ryuk выключен.
             Runtime.getRuntime().addShutdownHook(new Thread(db::stop, "stop-oracle-it"));
             url = "jdbc:oracle:thin:@//" + db.getHost() + ":" + db.getMappedPort(1521) + "/XE";
-            // gvenzl/oracle-xe:11 has no PDB; the service is XE.
+            // В gvenzl/oracle-xe:11 нет PDB (подключаемых баз, они появились в 12c): сервис — XE.
             dbaUser = "system";
             dbaPassword = "it_password";
         } else {
@@ -146,9 +230,12 @@ public final class ItDatabase {
     }
 
     /**
-     * {@code -Dplsql.it.port=1541}: publish the container on a fixed host port. On some
-     * Windows Docker Desktop setups randomly published ports refuse connections
-     * ("Cannot assign requested address") while fixed ones work.
+     * {@code -Dplsql.it.port=1541}: публикует порт 1521 контейнера на фиксированном порту хоста. В
+     * некоторых установках Docker Desktop под Windows случайно выбранные порты отказывают в
+     * соединении ("Cannot assign requested address"), а фиксированные работают. Без свойства метод
+     * ничего не меняет, и Testcontainers выбирает случайный порт.
+     *
+     * @param cmd команда создания контейнера Docker, в которую добавляется привязка порта
      */
     private static void fixedPort(com.github.dockerjava.api.command.CreateContainerCmd cmd) {
         String port = System.getProperty("plsql.it.port");
@@ -159,6 +246,15 @@ public final class ItDatabase {
         }
     }
 
+    /**
+     * Выполняет запрос и возвращает первую колонку первой строки как строку. Запрос должен вернуть
+     * хотя бы одну строку.
+     *
+     * @param c   соединение
+     * @param sql текст запроса
+     * @return значение первой колонки первой строки
+     * @throws SQLException при ошибке запроса
+     */
     private static String single(Connection c, String sql) throws SQLException {
         try (PreparedStatement ps = c.prepareStatement(sql); ResultSet rs = ps.executeQuery()) {
             rs.next();
@@ -166,7 +262,17 @@ public final class ItDatabase {
         }
     }
 
-    /** Runs a script whose statements are separated by lines holding a single "/". */
+    /**
+     * Выполняет скрипт из ресурсов, в котором операторы разделены строками из одного символа
+     * {@code /} (как в SQL*Plus). Операторы выполняются по одному; после каждого
+     * {@code CREATE OR REPLACE PACKAGE} или {@code CREATE OR REPLACE TYPE} проверяются ошибки
+     * компиляции ({@link #checkCompiled}). При ошибке к сообщению добавляется первая строка
+     * упавшего оператора.
+     *
+     * @param c        соединение, под которым выполняется скрипт
+     * @param resource путь к ресурсу в classpath, например {@code /it/schema-objects.sql}
+     * @throws SQLException если оператор упал или код не скомпилировался
+     */
     static void run(Connection c, String resource) throws SQLException {
         for (String stmt : statements(resource)) {
             try (Statement s = c.createStatement()) {
@@ -178,7 +284,19 @@ public final class ItDatabase {
         }
     }
 
-    /** CREATE PACKAGE succeeds even with compile errors; fail loudly instead. */
+    /**
+     * {@code CREATE PACKAGE} (как и {@code CREATE TYPE}) проходит без исключения даже с ошибками
+     * компиляции: Oracle просто сохраняет объект в состоянии INVALID. Этот метод вместо этого
+     * громко падает.
+     *
+     * <p>Проверка срабатывает только для операторов, начинающихся с
+     * {@code CREATE OR REPLACE PACKAGE} или {@code CREATE OR REPLACE TYPE}, и читает все строки
+     * {@code USER_ERRORS} схемы, а не только ошибки последнего объекта.
+     *
+     * @param c    соединение со схемой, где создан объект
+     * @param stmt только что выполненный оператор
+     * @throws SQLException со списком ошибок компиляции, если они есть
+     */
     private static void checkCompiled(Connection c, String stmt) throws SQLException {
         String head = stmt.toUpperCase(Locale.ROOT);
         if (!head.startsWith("CREATE OR REPLACE PACKAGE") && !head.startsWith("CREATE OR REPLACE TYPE")) {
@@ -197,6 +315,18 @@ public final class ItDatabase {
         }
     }
 
+    /**
+     * Читает скрипт из ресурсов (в UTF-8) и режет его на операторы по строкам, где стоит один
+     * {@code /}.
+     *
+     * <p>Строки комментариев {@code --} перед началом оператора отбрасываются, внутри оператора
+     * сохраняются. Каждый кусок проходит через {@link #add}: пустые пропускаются, у обычных
+     * SQL-операторов снимается завершающая {@code ;}.
+     *
+     * @param resource путь к ресурсу в classpath
+     * @return операторы в порядке следования в скрипте
+     * @throws IllegalStateException если ресурс не найден или не читается
+     */
     static List<String> statements(String resource) {
         String text;
         try (InputStream in = ItDatabase.class.getResourceAsStream(resource)) {
@@ -221,6 +351,18 @@ public final class ItDatabase {
         return out;
     }
 
+    /**
+     * Добавляет оператор в список, подготовив его к выполнению через JDBC.
+     *
+     * <p>Пробелы по краям обрезаются, пустой оператор пропускается. Завершающая {@code ;}
+     * снимается у обычного SQL ({@code CREATE TABLE}, {@code INSERT}, {@code COMMIT}...): через
+     * JDBC оператор SQL передаётся без неё. У блоков PL/SQL ({@code CREATE OR REPLACE PACKAGE},
+     * {@code PROCEDURE}, {@code FUNCTION}, анонимных {@code BEGIN}/{@code DECLARE}) точка с
+     * запятой — часть синтаксиса и остаётся.
+     *
+     * @param out  список, куда добавляется оператор
+     * @param stmt текст оператора как он есть в скрипте
+     */
     private static void add(List<String> out, String stmt) {
         String s = stmt.strip();
         if (s.isEmpty()) {

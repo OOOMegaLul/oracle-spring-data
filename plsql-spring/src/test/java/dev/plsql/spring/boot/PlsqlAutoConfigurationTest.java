@@ -10,14 +10,24 @@ import dev.plsql.spring.PlsqlApiFactory;
 import dev.plsql.spring.boot.fixture.FixtureApp;
 import dev.plsql.spring.support.CharsetGuard;
 
-/** Auto-configuration without a database: signatures from a fixture bean. */
+/**
+ * Автоконфигурация без базы данных: сигнатуры берутся из бина-фикстуры. Кодировка базы задана
+ * свойством {@code plsql.database-charset}, поэтому фабрика не запрашивает её у базы.
+ */
 class PlsqlAutoConfigurationTest {
 
+    /** Контекст с автоконфигурацией, приложением {@link FixtureApp} и кодировкой CL8MSWIN1251. */
     final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withConfiguration(AutoConfigurations.of(PlsqlAutoConfiguration.class))
             .withUserConfiguration(FixtureApp.class)
             .withPropertyValues("plsql.database-charset=CL8MSWIN1251");
 
+    /**
+     * Проверяет, что автоконфигурация создаёт одну фабрику {@link PlsqlApiFactory} и регистрирует
+     * бин интерфейса {@code Sequences} из пакета приложения. При кодировке CL8MSWIN1251 и
+     * политике по умолчанию ({@code FAIL}) проверка символов включена, а {@code toString}
+     * прокси называет интерфейс.
+     */
     @Test
     void factoryAndInterfaceBeans() {
         runner.run(ctx -> {
@@ -27,6 +37,11 @@ class PlsqlAutoConfigurationTest {
         });
     }
 
+    /**
+     * Проверяет, что свойства {@code plsql.*} доходят до фабрики: {@code charset-policy=IGNORE}
+     * выключает проверку символов ({@code CharsetGuard.none()}), а
+     * {@code retry-discarded-state=false} выключает повтор вызова после ORA-04068.
+     */
     @Test
     void propertiesAreBound() {
         runner.withPropertyValues("plsql.charset-policy=IGNORE", "plsql.retry-discarded-state=false").run(ctx -> {
@@ -36,6 +51,11 @@ class PlsqlAutoConfigurationTest {
         });
     }
 
+    /**
+     * Проверяет, что собственный бин {@link PlsqlApiFactory} приложения отменяет фабрику
+     * автоконфигурации: в контексте ровно одна фабрика, и это {@code myFactory}. Собственная
+     * фабрика собрана с политикой {@code IGNORE}, поэтому не запрашивает кодировку у мока.
+     */
     @Test
     void ownFactoryWins() {
         runner.withBean("myFactory", PlsqlApiFactory.class, () -> PlsqlApiFactory

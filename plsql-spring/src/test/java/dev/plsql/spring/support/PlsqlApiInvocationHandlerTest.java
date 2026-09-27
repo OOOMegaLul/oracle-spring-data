@@ -28,39 +28,96 @@ import dev.plsql.spring.annotation.PlsqlApi;
 import dev.plsql.spring.test.Signatures;
 import oracle.jdbc.OracleConnection;
 
-/** Proxy behaviour on mocks: startup validation, units of work, retries, error mapping. */
+/**
+ * Поведение прокси {@link PlsqlApiInvocationHandler} на моках: проверка интерфейса при
+ * создании, единица работы (фиксация и откат), повтор вызова, преобразование ошибок и методы
+ * {@code @SqlQuery}. Сигнатуры приходят из фикстуры {@code Signatures}, база не нужна.
+ */
 class PlsqlApiInvocationHandlerTest {
 
+    /** Рабочий интерфейс пакета {@code PKG}; сигнатуры его подпрограмм задаёт {@code factory()}. */
     @PlsqlApi(packageName = "PKG")
     interface Api {
+        /**
+         * Функция {@code PKG.NEXT(NTENANT IN NUMBER) RETURN NUMBER}.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         * @return результат функции
+         */
         long next(long tenant);
 
+        /**
+         * Процедура {@code PKG.TOUCH(NTENANT IN NUMBER)}.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         */
         void touch(long tenant);
 
+        /**
+         * Default-метод: процедуру для него не ищут, прокси выполняет его тело как обычный код
+         * Java, а тело само вызывает {@link #next}.
+         *
+         * @param tenant передаётся в {@link #next}
+         * @return удвоенный результат {@link #next}
+         */
         default long twice(long tenant) {
             return next(tenant) * 2;
         }
     }
 
+    /** Методы {@code @SqlQuery}: обычный SQL с именованными параметрами вместо вызова процедуры. */
     @PlsqlApi(packageName = "PKG")
     interface Queries {
+        /**
+         * {@code UPDATE}, текст которого начинается с комментария, поэтому по первому слову вид
+         * запроса не определить.
+         *
+         * @param id значение параметра {@code :id}
+         * @return число изменённых строк
+         */
         @dev.plsql.spring.annotation.SqlQuery("/* audit */ update t set x = 1 where id = :id")
         int touch(long id);
 
+        /**
+         * {@code SELECT} одной колонки.
+         *
+         * @param id значение параметра {@code :id}
+         * @return имя или пустой {@code Optional}, если строки нет
+         */
         @dev.plsql.spring.annotation.SqlQuery("select name from t where id = :id")
         java.util.Optional<String> name(long id);
     }
 
+    /** Запрос ссылается на параметр {@code :missing}, которого у метода нет. */
     @PlsqlApi(packageName = "PKG")
     interface BadQuery {
+        /**
+         * Метод с параметром {@code other}, а не {@code missing}.
+         *
+         * @param other параметр, о котором SQL ничего не знает
+         * @return результат запроса; до вызова дело не доходит
+         */
         @dev.plsql.spring.annotation.SqlQuery("select 1 from dual where x = :missing")
         int q(long other);
     }
 
+    /** Интерфейс, который расходится с базой сразу в двух методах. */
     @PlsqlApi(packageName = "PKG")
     interface Broken {
+        /**
+         * Функция {@code PKG.MISSING}, которой в фикстуре нет.
+         *
+         * @return результат функции; до вызова дело не доходит
+         */
         long missing();
 
+        /**
+         * Функция {@code PKG.NEXT} существует, но параметр {@code wrongName} не совпадает с её
+         * аргументом {@code NTENANT}.
+         *
+         * @param wrongName параметр без пары среди аргументов
+         * @return результат функции; до вызова дело не доходит
+         */
         long next(String wrongName);
     }
 
@@ -69,6 +126,13 @@ class PlsqlApiInvocationHandlerTest {
     CallableStatement cs;
     Api api;
 
+    /**
+     * Готовит моки: {@code DataSource} выдаёт соединение Oracle, {@code prepareCall} с любым
+     * текстом возвращает один и тот же {@code CallableStatement}, соединение по умолчанию в
+     * режиме {@code autoCommit=true}. Затем создаёт прокси {@link Api}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @BeforeEach
     void setUp() throws SQLException {
         ds = mock(DataSource.class);
@@ -81,6 +145,13 @@ class PlsqlApiInvocationHandlerTest {
         api = factory().create(Api.class);
     }
 
+    /**
+     * Фабрика на моке {@code DataSource} с сигнатурами {@code PKG.NEXT} (функция) и
+     * {@code PKG.TOUCH} (процедура). Кодировка базы AL32UTF8 задана явно: фабрика не читает
+     * {@code NLS_CHARACTERSET} из базы, а проверка символов для Unicode не нужна.
+     *
+     * @return новая фабрика
+     */
     PlsqlApiFactory factory() {
         return PlsqlApiFactory.builder(ds)
                 .signatureSource(Signatures.source(
@@ -90,6 +161,14 @@ class PlsqlApiInvocationHandlerTest {
                 .build();
     }
 
+    /**
+     * Проверяет, что метод прокси исполняет заранее построенный блок
+     * ({@code ? := APP.PKG.NEXT(NTENANT => ?)}) и возвращает результат функции, default-метод
+     * {@code twice} работает поверх него, {@code toString} называет интерфейс, а {@code equals}
+     * сравнивает по ссылке.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void callsGoThroughThePlannedBlock() throws SQLException {
         when(cs.getBigDecimal(1)).thenReturn(BigDecimal.TEN);
@@ -100,6 +179,11 @@ class PlsqlApiInvocationHandlerTest {
         assertThat(api).isEqualTo(api).isNotEqualTo(new Object());
     }
 
+    /**
+     * Проверяет, что все расхождения интерфейса с базой сообщаются одним исключением при
+     * создании, а не при первом вызове: и отсутствующая функция, и параметр без пары. Класс,
+     * который не является интерфейсом, отвергается с {@code IllegalArgumentException}.
+     */
     @Test
     void allMismatchesAreReportedAtCreation() {
         assertThatThrownBy(() -> factory().create(Broken.class))
@@ -109,6 +193,13 @@ class PlsqlApiInvocationHandlerTest {
         assertThatThrownBy(() -> factory().create(String.class)).isInstanceOf(IllegalArgumentException.class);
     }
 
+    /**
+     * Проверяет, что ошибка {@code RAISE_APPLICATION_ERROR} (ORA-20001) становится
+     * {@link PlsqlBusinessException} с чистым текстом, без стека ORA-06512, и что соединение
+     * при этом закрывается, то есть возвращается в пул.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void applicationErrorBecomesBusinessException() throws SQLException {
         when(cs.execute()).thenThrow(new SQLException("ORA-20001: Нельзя\nORA-06512: at line 1", "72000", 20001));
@@ -116,6 +207,13 @@ class PlsqlApiInvocationHandlerTest {
         verify(con).close();
     }
 
+    /**
+     * Проверяет, что после ORA-04068 (состояние пакета сброшено, например пакет
+     * перекомпилировали под живой сессией) вызов повторяется и повтор проходит: {@code execute}
+     * вызван дважды. Неудачный вызов не выполнялся, поэтому повторять его безопасно.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void discardedPackageStateIsRetriedOnce() throws SQLException {
         when(cs.execute())
@@ -125,6 +223,12 @@ class PlsqlApiInvocationHandlerTest {
         verify(cs, times(2)).execute();
     }
 
+    /**
+     * Проверяет, что повтор только один: если ORA-04068 пришла и во второй раз, ошибка выходит
+     * наружу, а {@code execute} вызван ровно дважды.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void secondDiscardIsNotRetried() throws SQLException {
         when(cs.execute()).thenThrow(new SQLException("ORA-04068", "72000", 4068));
@@ -132,6 +236,14 @@ class PlsqlApiInvocationHandlerTest {
         verify(cs, times(2)).execute();
     }
 
+    /**
+     * Проверяет, что вне транзакции Spring при {@code autoCommit=false} каждый вызов — своя
+     * единица работы: успешный фиксируется ({@code commit}), неудачный (ORA-00001, он же
+     * {@code DuplicateKeyException}) откатывается ({@code rollback}). Иначе незафиксированную
+     * работу откатил бы пул при возврате соединения.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void withoutATransactionAndAutoCommitOffTheCallIsItsOwnUnitOfWork() throws SQLException {
         when(con.getAutoCommit()).thenReturn(false);
@@ -143,6 +255,12 @@ class PlsqlApiInvocationHandlerTest {
         verify(con).rollback();
     }
 
+    /**
+     * Проверяет, что на соединении с {@code autoCommit=true} прокси сам не вызывает ни
+     * {@code commit}, ни {@code rollback}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void autoCommitConnectionsAreLeftAlone() throws SQLException {
         api.touch(1);
@@ -150,6 +268,13 @@ class PlsqlApiInvocationHandlerTest {
         verify(con, never()).rollback();
     }
 
+    /**
+     * Проверяет, что внутри транзакции Spring вызовы ничего не фиксируют сами: оба вызова идут
+     * через одно соединение (из {@code DataSource} оно берётся один раз), а {@code commit}
+     * один раз делает менеджер транзакций в конце.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void insideASpringTransactionNothingIsCommittedPerCall() throws SQLException {
         when(con.getAutoCommit()).thenReturn(false);
@@ -163,10 +288,15 @@ class PlsqlApiInvocationHandlerTest {
                 throw new AssertionError(e);
             }
         });
-        verify(con, times(1)).commit(); // by the transaction manager, once
+        verify(con, times(1)).commit(); // делает менеджер транзакций, один раз
         verify(ds, times(1)).getConnection();
     }
 
+    /**
+     * Проверяет служебные методы: {@code sqlOf} показывает сгенерированный блок метода и
+     * возвращает {@code null} для default-метода, у которого блока нет; {@code subprogramName}
+     * даёт имя подпрограммы в верхнем регистре с подчёркиваниями.
+     */
     @Test
     void sqlOfShowsTheBlock() {
         assertThat(PlsqlApiInvocationHandler.sqlOf(api, "touch")).isEqualTo("BEGIN\n  APP.PKG.TOUCH(NTENANT => ?);\nEND;");
@@ -175,6 +305,11 @@ class PlsqlApiInvocationHandlerTest {
                 Api.class.getMethods()[0])).matches("[A-Z_]+");
     }
 
+    /**
+     * Проверяет, что сигнатуры всех методов интерфейса запрашиваются одним пакетным вызовом
+     * {@code findAll} (с именами {@code NEXT} и {@code TOUCH}), а поштучный {@code find} не
+     * вызывается ни разу. На настоящей базе это экономит запросы к словарю при старте.
+     */
     @Test
     void signaturesOfAnInterfaceAreReadInOneBatch() {
         java.util.concurrent.atomic.AtomicInteger single = new java.util.concurrent.atomic.AtomicInteger();
@@ -183,12 +318,29 @@ class PlsqlApiInvocationHandlerTest {
                 func("PKG", "NEXT", "NUMBER").in("NTENANT", "NUMBER").build(),
                 proc("PKG", "TOUCH").in("NTENANT", "NUMBER").build());
         dev.plsql.spring.meta.SignatureSource counting = new dev.plsql.spring.meta.SignatureSource() {
+            /**
+             * Считает поштучные запросы и отдаёт сигнатуры из фикстуры.
+             *
+             * @param schema схема или {@code null}
+             * @param pkg    пакет или {@code null}
+             * @param name   имя подпрограммы
+             * @return перегрузки из фикстуры
+             */
             @Override
             public java.util.List<dev.plsql.spring.meta.SubprogramInfo> find(String schema, String pkg, String name) {
                 single.incrementAndGet();
                 return fixture.find(schema, pkg, name);
             }
 
+            /**
+             * Считает пакетные запросы, проверяет, что запрошены ровно {@code NEXT} и
+             * {@code TOUCH}, и отдаёт их сигнатуры из фикстуры.
+             *
+             * @param schema схема или {@code null}
+             * @param pkg    пакет или {@code null}
+             * @param names  имена подпрограмм
+             * @return карта «имя → перегрузки»
+             */
             @Override
             public java.util.Map<String, java.util.List<dev.plsql.spring.meta.SubprogramInfo>> findAll(
                     String schema, String pkg, java.util.Collection<String> names) {
@@ -204,12 +356,25 @@ class PlsqlApiInvocationHandlerTest {
         assertThat(single).hasValue(0);
     }
 
+    /**
+     * Проверяет, что именованный параметр SQL {@code :missing}, которого нет у метода,
+     * обнаруживается при создании прокси, и сообщение называет метод и параметр.
+     */
     @Test
     void queryParametersAreCheckedAtCreation() {
         assertThatThrownBy(() -> factory().create(BadQuery.class))
                 .hasMessageContaining("BadQuery.q").hasMessageContaining("missing");
     }
 
+    /**
+     * Проверяет, что вид результата {@code @SqlQuery} определяет JDBC, а не первое слово
+     * запроса: {@code execute()} вернул {@code false} — метод получает число изменённых строк
+     * (здесь для {@code UPDATE}, который начинается с комментария), {@code true} — строки
+     * результата ({@code SELECT} одной колонки в {@code Optional}). Заодно видно, что
+     * {@code :id} в тексте заменяется на {@code ?}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
     @Test
     void queryResultKindComesFromJdbcNotFromTheFirstWord() throws SQLException {
         java.sql.PreparedStatement ps = mock(java.sql.PreparedStatement.class);

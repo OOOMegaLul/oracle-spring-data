@@ -6,26 +6,40 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Where subprogram signatures come from. The default reads the data dictionary
- * ({@link DictionarySignatureSource}); tests and offline tools can supply fixtures.
+ * Определяет, откуда берутся сигнатуры подпрограмм (имена, типы и направления аргументов).
+ *
+ * <p>По умолчанию сигнатуры читаются из словаря данных Oracle
+ * ({@link DictionarySignatureSource}); тесты и офлайн-инструменты могут подставить
+ * заранее заготовленные описания без обращения к базе.
  */
 @FunctionalInterface
 public interface SignatureSource {
 
     /**
-     * All overloads of a procedure or function.
+     * Возвращает все перегрузки процедуры или функции.
      *
-     * @param schema      owner, or null for the connecting user's name resolution (synonyms work)
-     * @param packageName package, or null for a standalone subprogram
-     * @param name        subprogram name
-     * @return overloads; empty when the subprogram does not exist
+     * @param schema      схема-владелец или {@code null}, чтобы имя разрешалось так, как его
+     *                    видит подключённый пользователь (тогда работают синонимы)
+     * @param packageName пакет или {@code null} для автономной подпрограммы
+     * @param name        имя подпрограммы
+     * @return перегрузки; пустой список, если такой подпрограммы нет
      */
     List<SubprogramInfo> find(String schema, String packageName, String name);
 
     /**
-     * Several subprograms of one package (or several standalone ones) at once: name ->
-     * overloads, one entry per requested name. A dictionary-backed source reads them in a
-     * few queries instead of a few per name.
+     * Возвращает сигнатуры сразу нескольких подпрограмм одного пакета (или нескольких
+     * автономных): имя → перегрузки, по одной записи на каждое запрошенное имя.
+     *
+     * <p>Источник на основе словаря читает их за несколько запросов на всех, а не по
+     * несколько запросов на каждое имя. Реализация по умолчанию просто вызывает
+     * {@link #find} для каждого имени по очереди.
+     *
+     * @param schema      схема-владелец или {@code null}, чтобы имя разрешалось так, как его
+     *                    видит подключённый пользователь
+     * @param packageName пакет или {@code null} для автономных подпрограмм
+     * @param names       имена подпрограмм
+     * @return {@code Map} «запрошенное имя → перегрузки» в порядке {@code names}; пустой
+     *         список перегрузок означает, что подпрограммы нет
      */
     default Map<String, List<SubprogramInfo>> findAll(String schema, String packageName, Collection<String> names) {
         Map<String, List<SubprogramInfo>> out = new LinkedHashMap<>();

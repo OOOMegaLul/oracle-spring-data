@@ -25,23 +25,60 @@ import dev.plsql.spring.annotation.EnablePlsqlApis;
 import dev.plsql.spring.annotation.PlsqlApi;
 
 /**
- * Finds {@code @PlsqlApi} interfaces and registers a {@link PlsqlApiFactoryBean} for each.
+ * Находит интерфейсы {@code @PlsqlApi} и регистрирует для каждого {@link PlsqlApiFactoryBean}.
+ *
+ * <p>Регистрация бинов — это добавление в контекст Spring описания будущего бина
+ * ({@code BeanDefinition}: какой класс создать, какие аргументы и свойства ему передать) ещё до
+ * того, как создан хоть один бин. Сами объекты Spring создаст позже по этим описаниям.
+ *
+ * <p>Класс реализует {@link ImportBeanDefinitionRegistrar} — точку расширения Spring для такой
+ * регистрации. Его подключает {@link EnablePlsqlApis} через {@code @Import}; статический метод
+ * {@link #register} вызывает также автоконфигурация Spring Boot.
  */
 public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, ResourceLoaderAware, EnvironmentAware {
 
     private ResourceLoader resourceLoader;
     private Environment environment;
 
+    /**
+     * Запоминает загрузчик ресурсов; вызывается Spring автоматически, потому что класс реализует
+     * {@link ResourceLoaderAware}.
+     *
+     * <p>Через него сканер читает файлы классов и получает загрузчик классов приложения.
+     *
+     * @param resourceLoader загрузчик ресурсов контекста
+     */
     @Override
     public void setResourceLoader(ResourceLoader resourceLoader) {
         this.resourceLoader = resourceLoader;
     }
 
+    /**
+     * Запоминает окружение (свойства и профили); вызывается Spring автоматически, потому что
+     * класс реализует {@link EnvironmentAware}.
+     *
+     * <p>Окружение передаётся сканеру классов.
+     *
+     * @param environment окружение контекста
+     */
     @Override
     public void setEnvironment(Environment environment) {
         this.environment = environment;
     }
 
+    /**
+     * Читает параметры {@link EnablePlsqlApis} с класса конфигурации и регистрирует бины для
+     * найденных интерфейсов.
+     *
+     * <p>Вызывается Spring при разборе класса конфигурации, на котором стоит
+     * {@code @EnablePlsqlApis}. Если {@code basePackages} пуст, сканируется пакет этого класса.
+     * Если аннотации на классе нет (регистратор подключён через {@code @Import} напрямую),
+     * берутся значения по умолчанию: {@code DataSource} с именем {@code dataSource}, без
+     * {@code factoryRef}, пакет класса конфигурации.
+     *
+     * @param metadata метаданные класса конфигурации, который подключил регистратор
+     * @param registry реестр описаний бинов, куда добавляются новые бины
+     */
     @Override
     public void registerBeanDefinitions(AnnotationMetadata metadata, BeanDefinitionRegistry registry) {
         Map<String, Object> attrs = metadata.getAnnotationAttributes(EnablePlsqlApis.class.getName());
@@ -59,10 +96,43 @@ public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, Resourc
         register(registry, packages, dataSourceRef, factoryRef, resourceLoader, environment);
     }
 
-    /** Registers one factory bean per {@code @PlsqlApi} interface found under {@code packages}. */
+    /**
+     * Регистрирует по одному фабричному бину на каждый интерфейс {@code @PlsqlApi}, найденный в
+     * {@code packages}.
+     *
+     * <p>Пакеты сканируются вместе с вложенными. Имя бина — простое имя интерфейса с маленькой
+     * буквы ({@code TenantContext} даёт {@code tenantContext}). Если бин с таким именем уже
+     * есть и описывает тот же интерфейс (интерфейс попал сюда через два сканируемых пакета),
+     * повторная регистрация пропускается. Если это другой бин (два интерфейса с одинаковым
+     * простым именем), используется полное имя интерфейса с пакетом.
+     *
+     * <p>Каждому описанию бина передаются класс интерфейса (аргумент конструктора),
+     * {@code dataSourceRef} и {@code factoryRef} (свойства) и атрибут
+     * {@code FactoryBean.OBJECT_TYPE_ATTRIBUTE} с типом интерфейса.
+     *
+     * @param registry       реестр описаний бинов, куда добавляются новые бины
+     * @param packages       пакеты для сканирования
+     * @param dataSourceRef  имя бина {@code DataSource} для фабрики, если она строится сама
+     * @param factoryRef     имя бина {@code PlsqlApiFactory} или пустая строка
+     * @param resourceLoader загрузчик ресурсов для сканера; {@code null} — загрузчик классов
+     *                       по умолчанию
+     * @param environment    окружение для сканера
+     */
     public static void register(BeanDefinitionRegistry registry, List<String> packages, String dataSourceRef,
                                 String factoryRef, ResourceLoader resourceLoader, Environment environment) {
+        // Сканер классов Spring без стандартных фильтров (@Component и т.п.): ищет только
+        // интерфейсы с @PlsqlApi.
         ClassPathScanningCandidateComponentProvider scanner = new ClassPathScanningCandidateComponentProvider(false, environment) {
+            /**
+             * Проверяет, подходит ли найденный класс: нужен интерфейс, который можно загрузить
+             * отдельно (верхнего уровня или статический вложенный).
+             *
+             * <p>Стандартная проверка сканера пропускает только конкретные классы, а здесь нужны,
+             * наоборот, интерфейсы.
+             *
+             * @param bd описание найденного класса с его метаданными
+             * @return {@code true}, если класс — самостоятельный интерфейс
+             */
             @Override
             protected boolean isCandidateComponent(AnnotatedBeanDefinition bd) {
                 return bd.getMetadata().isInterface() && bd.getMetadata().isIndependent();
@@ -80,16 +150,16 @@ public class PlsqlApiRegistrar implements ImportBeanDefinitionRegistrar, Resourc
                 if (registry.containsBeanDefinition(beanName)) {
                     BeanDefinition existing = registry.getBeanDefinition(beanName);
                     if (api.equals(existing.getAttribute(FactoryBean.OBJECT_TYPE_ATTRIBUTE))) {
-                        continue; // the same interface reached through two scanned packages
+                        continue; // тот же интерфейс, найденный через два сканируемых пакета
                     }
-                    beanName = api.getName(); // two interfaces with one simple name
+                    beanName = api.getName(); // два интерфейса с одинаковым простым именем
                 }
                 BeanDefinitionBuilder b = BeanDefinitionBuilder.genericBeanDefinition(PlsqlApiFactoryBean.class)
                         .addConstructorArgValue(api)
                         .addPropertyValue("dataSourceRef", dataSourceRef)
                         .addPropertyValue("factoryRef", factoryRef);
                 AbstractBeanDefinition bd = b.getBeanDefinition();
-                // Lets @Autowired find the bean by interface type before the factory runs.
+                // Позволяет @Autowired найти бин по типу интерфейса ещё до того, как фабрика отработала.
                 bd.setAttribute(FactoryBean.OBJECT_TYPE_ATTRIBUTE, api);
                 registry.registerBeanDefinition(beanName, bd);
             }
