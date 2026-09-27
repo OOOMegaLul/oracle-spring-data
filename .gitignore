@@ -1,0 +1,16 @@
+# Build output
+target/
+*.class
+*.log
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Database dumps never belong here
+*.DMP
+*.dmp
