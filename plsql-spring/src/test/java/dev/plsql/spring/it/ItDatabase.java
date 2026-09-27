@@ -38,6 +38,15 @@ public final class ItDatabase {
     public static final String USER = "PLSQL_IT";
     public static final String PASSWORD = "plsql_it";
 
+    static {
+        // ojdbc sends the JVM time zone to the server by region name at logon. Oracle 11.2
+        // does not know "Etc/UTC" (the default on CI runners and in most containers) and
+        // refuses the logon with ORA-01882; an offset works with every time zone file.
+        if (System.getProperty("oracle.jdbc.timezoneAsRegion") == null) {
+            System.setProperty("oracle.jdbc.timezoneAsRegion", "false");
+        }
+    }
+
     private static final Logger log = LoggerFactory.getLogger(ItDatabase.class);
     private static String url;
     private static String charset;

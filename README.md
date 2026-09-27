@@ -38,6 +38,17 @@ Java 17+, Spring Framework 6.2+/7, Spring Boot 3.5+/4 (необязательн�
 `orai18n.jar` подтягивается сам. Без него ojdbc не входит в базу с однобайтовой
 кодировкой (CL8MSWIN1251 и т.п.) вообще: ORA-17056 уже на логине.
 
+**ORA-01882 при подключении к 11.2.** ojdbc передаёт базе часовой пояс JVM по имени, а
+Oracle 11.2 не знает, например, `Etc/UTC` — пояс по умолчанию в Docker, Kubernetes и
+на CI. Вход падает с `ORA-00604` / `ORA-01882`. Лечится свойством драйвера, тогда
+передаётся смещение:
+
+```properties
+spring.datasource.hikari.data-source-properties.oracle.jdbc.timezoneAsRegion=false
+```
+
+или `-Doracle.jdbc.timezoneAsRegion=false` для всей JVM.
+
 **Spring Boot.** Ничего включать не нужно: автоконфигурация находит `@PlsqlApi` в пакете
 приложения, как Spring Data находит репозитории.
 
