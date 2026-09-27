@@ -106,6 +106,30 @@ class SessionContextDataSourceTest {
     }
 
     /**
+     * Проверяет, что при сбое подготовки наружу идёт сама причина, даже если и соединение
+     * закрыть не удалось: ошибка закрытия прикладывается к ней как подавленная.
+     *
+     * @throws SQLException не бросается: драйвер подменён
+     */
+    @Test
+    void failureToCloseDoesNotHideTheCause() throws SQLException {
+        SQLException cause = new SQLException("ORA-06550", "65000", 6550);
+        SQLException closeFailure = new SQLException("Closed Connection", "08003", 17008);
+        when(init.execute()).thenThrow(cause);
+        org.mockito.Mockito.doThrow(closeFailure).when(con).close();
+
+        assertThatThrownBy(() -> guarded().getConnection()).isSameAs(cause);
+        assertThat(cause.getSuppressed()).containsExactly(closeFailure);
+    }
+
+    /** Проверяет, что поставщик пользователя обязателен: ошибка при создании, а не при выдаче. */
+    @Test
+    void currentUserIsRequired() {
+        assertThatThrownBy(() -> new SessionContextDataSource(target, null))
+                .isInstanceOf(NullPointerException.class).hasMessageContaining("currentUser");
+    }
+
+    /**
      * Проверяет, что без пользователя {@code CLIENT_IDENTIFIER} очищается пустой строкой, а не
      * остаётся от предыдущего владельца соединения.
      *

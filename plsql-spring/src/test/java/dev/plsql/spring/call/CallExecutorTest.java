@@ -1,6 +1,7 @@
 package dev.plsql.spring.call;
 
 import static dev.plsql.spring.test.Signatures.func;
+import static dev.plsql.spring.test.Signatures.indexTable;
 import static dev.plsql.spring.test.Signatures.proc;
 import static dev.plsql.spring.test.Signatures.xml;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -28,6 +29,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 import dev.plsql.spring.support.CharsetGuard;
+import oracle.jdbc.OracleCallableStatement;
 import oracle.jdbc.OracleConnection;
 import oracle.jdbc.OracleTypes;
 
@@ -73,6 +75,22 @@ class CallExecutorTest {
          * @return строки курсора {@code P_CUR}, каждая как карта «колонка → значение»
          */
         List<Map<String, Object>> cursor(long minId);
+
+        /**
+         * Сумма index-by таблицы чисел, переданной массивом примитивов.
+         *
+         * @param vals числа
+         * @return сумма
+         */
+        BigDecimal sum(long[] vals);
+
+        /**
+         * Строки из OUT index-by таблицы.
+         *
+         * @param n сколько строк
+         * @return строки, среди которых может быть {@code null}
+         */
+        List<String> items(long n);
     }
 
     /**
@@ -276,6 +294,28 @@ class CallExecutorTest {
                     assertThat(e.getErrorCode()).isEqualTo(4068);
                     assertThat(e.getSuppressed()).containsExactly(freeFailure);
                 });
+    }
+
+    /**
+     * Проверяет index-by таблицы: массив примитивов {@code long[]} передаётся как таблица
+     * чисел (раньше при старте он принимался, а при вызове отвергался), а элемент-{@code NULL}
+     * в OUT-таблице читается как {@code null} (раньше {@code List.of} падал на нём).
+     *
+     * @throws SQLException не бросается: драйвер подменён
+     */
+    @Test
+    void indexTablesTakePrimitiveArraysAndKeepNullElements() throws SQLException {
+        OracleCallableStatement ocs = mock(OracleCallableStatement.class);
+        when(cs.unwrap(OracleCallableStatement.class)).thenReturn(ocs);
+
+        CallPlan sum = planner.plan(m("sum"), func("PKG", "SUM", "NUMBER").add(indexTable("P_VALS", "IN", "NUMBER")).build());
+        new CallExecutor(100).execute(con, sum, new Object[]{new long[]{1, 2}});
+        verify(ocs).setPlsqlIndexTable(2, new BigDecimal[]{BigDecimal.ONE, BigDecimal.valueOf(2)}, 2, 2, OracleTypes.NUMBER, 0);
+
+        CallPlan items = planner.plan(m("items"), proc("PKG", "ITEMS").in("P_N", "NUMBER")
+                .add(indexTable("P_VALS", "OUT", "VARCHAR2")).build());
+        when(ocs.getPlsqlIndexTable(2)).thenReturn(new String[]{"a", null});
+        assertThat(new CallExecutor(100).execute(con, items, new Object[]{2L})).isEqualTo(Arrays.asList("a", null));
     }
 
     /**

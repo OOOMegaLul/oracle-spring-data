@@ -206,11 +206,12 @@ public final class PlsqlApiFactory {
          * {@code VARCHAR2} и {@code CLOB}. Если значение не задано, а политика {@code FAIL},
          * {@link #build()} прочитает его из базы отдельным запросом.
          *
-         * @param oracleCharset имя кодировки в терминах Oracle; {@code null} — прочитать из базы
+         * @param oracleCharset имя кодировки в терминах Oracle; {@code null} или пустая строка
+         *                      (например, пустое {@code plsql.database-charset=}) — прочитать из базы
          * @return этот же построитель
          */
         public Builder databaseCharset(String oracleCharset) {
-            this.databaseCharset = oracleCharset;
+            this.databaseCharset = oracleCharset == null || oracleCharset.isBlank() ? null : oracleCharset.strip();
             return this;
         }
 
@@ -237,8 +238,9 @@ public final class PlsqlApiFactory {
          * Включает или выключает повтор вызова после ORA-04068; по умолчанию повтор включён.
          *
          * <p>ORA-04068 возникает, когда пакет перекомпилировали, пока сессия держала его состояние
-         * (значения переменных пакета). Oracle сбрасывает это состояние, а неудачный вызов не
-         * выполняется, поэтому повторить его один раз безопасно.
+         * (значения переменных пакета). Oracle сбрасывает это состояние, а изменения данных
+         * неудачного вызова откатывает сам, поэтому повторить его один раз безопасно. Не
+         * откатываются только автономные транзакции, последовательности и действия вне базы.
          *
          * @param retry {@code true} — повторять один раз
          * @return этот же построитель

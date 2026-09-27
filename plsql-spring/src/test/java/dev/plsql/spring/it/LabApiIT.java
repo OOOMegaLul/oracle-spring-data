@@ -109,6 +109,21 @@ class LabApiIT {
     }
 
     /**
+     * Проверяет {@code %ROWTYPE}, объявленный через синоним ({@code EMP_ROW_SYN}) и через курсор
+     * пакета ({@code EMP_BRIEF}). Блок компилируется в схеме пользователя соединения, поэтому имя
+     * из объявления нужно разрешить так, как его видел компилятор пакета: синоним раскрывается до
+     * таблицы, курсор получает имя пакета. Раньше такой метод проходил проверку при старте и
+     * падал на первом вызове.
+     */
+    @Test
+    void rowtypeThroughASynonymOrAPackageCursor() {
+        assertThat(api.empRowSyn(1)).isEqualTo(new LabApi.Emp(1, "Иванов", LocalDate.of(2020, 1, 15), true));
+        assertThat(PlsqlApiInvocationHandler.sqlOf(api, "empRowSyn")).contains("PLSQL_IT.LAB_EMP%ROWTYPE");
+        assertThat(api.empBrief(3)).isEqualTo(new LabApi.Brief(3, "Smith"));
+        assertThat(PlsqlApiInvocationHandler.sqlOf(api, "empBrief")).contains("PLSQL_IT.LAB_PKG.C_EMP%ROWTYPE");
+    }
+
+    /**
      * Проверяет index-by таблицы скаляров: {@code NUMBER} на входе ({@code SUM_IBT}, в том числе
      * пустая таблица) и {@code VARCHAR2} на выходе ({@code IBT_OUT}).
      *
@@ -126,7 +141,7 @@ class LabApiIT {
     /**
      * Проверяет объектный SQL-тип и SQL-коллекции: коллекцию объектов как результат ({@code OBJS}),
      * коллекцию чисел на входе ({@code SUM_NUMS}), объект на входе и выходе ({@code ECHO_OBJ}) и
-     * коллекцию объектов на входе ({@code COUNT_OBJS}; функция считает суммарную длину имён:
+     * коллекцию объектов на входе ({@code NAME_CHARS}; функция считает суммарную длину имён:
      * {@code Ёж} и {@code Ёлка} дают 2 + 4 = 6 символов).
      *
      * <p>Эти типы объявлены через {@code CREATE TYPE} и передаются как {@code java.sql.Struct} и
@@ -141,7 +156,7 @@ class LabApiIT {
         assertThat(api.sumNums(List.of(5L, 6L))).isEqualTo(11);
         assertThat(api.echoObj(new LabApi.Obj(1L, "x", LocalDate.of(2024, 1, 1))))
                 .isEqualTo(new LabApi.Obj(2L, "x!", LocalDate.of(2024, 1, 2)));
-        assertThat(api.countObjs(List.of(new LabApi.Obj(1L, "Ёж", null), new LabApi.Obj(2L, "Ёлка", null)))).isEqualTo(6);
+        assertThat(api.nameChars(List.of(new LabApi.Obj(1L, "Ёж", null), new LabApi.Obj(2L, "Ёлка", null)))).isEqualTo(6);
     }
 
     /**

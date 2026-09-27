@@ -224,6 +224,11 @@ public class CallPlanner {
                 returnKey = outs.get(0).name();
                 outTypes.put(returnKey, returnType);
             } else {
+                if (!canHoldSeveralValues(returnType)) {
+                    throw new PlanException("returns " + rawReturn.getSimpleName() + " but the procedure has "
+                            + outs.size() + " OUT arguments " + outs.stream().map(ArgumentInfo::name).toList()
+                            + "; return a record, a bean or a Map with one component per OUT argument");
+                }
                 outsToType = true;
                 for (ArgumentInfo o : outs) {
                     outTypes.put(o.name(), componentType(rawReturn, o.name()));
@@ -245,10 +250,14 @@ public class CallPlanner {
             Function<Object[], Object> in = null;
             if (a.isIn()) {
                 in = supplied.get(a);
+                if (in != null && a.kind() == ArgKind.REF_CURSOR) {
+                    throw new PlanException("argument " + a.name() + " is an IN OUT REF CURSOR; a cursor cannot be sent"
+                            + " from Java, so the procedure always gets an unopened one: remove the parameter");
+                }
                 if (in == null) {
                     Supplier<Object> d = defaults.lookup(sp, a);
                     if (d != null) {
-                        in = args -> d.get();
+                        in = new FromDefaults(d);
                     } else if (a.isOut()) {
                         in = args -> null;
                     } else if (a.defaulted()) {
@@ -487,7 +496,8 @@ public class CallPlanner {
         String t = a.declaredType();
         if (t == null) {
             throw new PlanException("record " + (a.name() == null ? "return value" : a.name())
-                    + " has no type name in ALL_ARGUMENTS or ALL_SOURCE");
+                    + " has no type name in ALL_ARGUMENTS, and its %ROWTYPE could not be resolved from ALL_SOURCE"
+                    + " (wrapped source, or a table this user cannot see)");
         }
         // У аргументов %ROWTYPE TYPE_NAME указывает на таблицу, а TYPE_SUBNAME пуст.
         return a.typeSubname() == null ? t + "%ROWTYPE" : t;
@@ -705,11 +715,45 @@ public class CallPlanner {
      * @throws PlanException если имя одинаково хорошо подходит к нескольким аргументам
      */
     private static ArgumentInfo find(String javaName, SubprogramInfo sp) {
+        return match(javaName, sp.arguments(), ArgumentInfo::name);
+    }
+
+    /**
+     * Ищет имя Java среди имён PL/SQL через {@code NameMatcher}; неоднозначность становится
+     * {@link PlanException}, чтобы попасть в общий отчёт о старте вместе с остальными ошибками.
+     *
+     * @param javaName имя параметра, свойства или компонента record
+     * @param items    кандидаты
+     * @param plsqlName имя кандидата в PL/SQL
+     * @param <T>      тип кандидата
+     * @return подошедший кандидат или {@code null}
+     * @throws PlanException если имя одинаково хорошо подходит к нескольким кандидатам
+     */
+    private static <T> T match(String javaName, Collection<T> items, Function<T, String> plsqlName) {
         try {
-            return NameMatcher.find(javaName, sp.arguments(), ArgumentInfo::name);
+            return NameMatcher.find(javaName, items, plsqlName);
         } catch (IllegalStateException e) {
             throw new PlanException(e.getMessage());
         }
+    }
+
+    /**
+     * Проверяет, может ли тип результата принять несколько OUT-аргументов сразу: по компоненту
+     * или свойству на каждый.
+     *
+     * <p>Подходят record, бин, {@code Map} и {@code Object} (тогда вернётся {@code Map}), в том
+     * числе внутри {@code Optional}. Не подходят простые значения (числа, строки, даты), массивы,
+     * коллекции и узлы DOM: в них несколько значений разложить нельзя.
+     *
+     * @param returnType тип результата Java-метода
+     * @return {@code true}, если в тип можно собрать несколько OUT-аргументов
+     */
+    private static boolean canHoldSeveralValues(ResolvableType returnType) {
+        Class<?> raw = returnType.resolve(Object.class);
+        if (raw == java.util.Optional.class) {
+            raw = returnType.getGeneric(0).resolve(Object.class);
+        }
+        return raw == Object.class || Map.class.isAssignableFrom(raw) || isParameterObject(raw);
     }
 
     /**
@@ -724,8 +768,8 @@ public class CallPlanner {
      * обязан принимать тип параметра (см. {@link #accepts}).
      *
      * <p>Поля записей (в {@code ALL_ARGUMENTS} у них {@code DATA_LEVEL} больше 0) и свойства
-     * объектов-параметров так не проверяются. Попутно вычисляются и поставщики из
-     * {@link ArgumentDefaults}; их исключения игнорируются.
+     * объектов-параметров так не проверяются. Поставщики из {@link ArgumentDefaults} при этом не
+     * вызываются: при старте их значения ещё не имеют смысла (нет запроса, нет пользователя).
      *
      * @param m    Java-метод
      * @param plan план вызова одной перегрузки
@@ -737,13 +781,34 @@ public class CallPlanner {
             Object[] probe = new Object[params.length];
             probe[i] = MARKER;
             for (CallPlan.Bind b : plan.binds()) {
-                if (b.in() != null && b.arg().dataLevel() == 0 && safeApply(b, probe) == MARKER
+                if (b.in() != null && !(b.in() instanceof FromDefaults) && b.arg().dataLevel() == 0
+                        && safeApply(b, probe) == MARKER
                         && !accepts(b.arg().kind(), params[i].getType())) {
                     return false;
                 }
             }
         }
         return true;
+    }
+
+    /**
+     * Источник входного значения из {@link ArgumentDefaults}. Отдельный тип нужен, чтобы
+     * {@code typesFit} мог отличить его от параметра метода и не вызывать поставщика при старте.
+     *
+     * @param supplier поставщик значения; вызывается при каждом вызове метода
+     */
+    private record FromDefaults(Supplier<Object> supplier) implements Function<Object[], Object> {
+
+        /**
+         * Возвращает текущее значение поставщика; аргументы вызова не нужны.
+         *
+         * @param args аргументы вызова Java-метода
+         * @return значение поставщика
+         */
+        @Override
+        public Object apply(Object[] args) {
+            return supplier.get();
+        }
     }
 
     /**
@@ -776,8 +841,9 @@ public class CallPlanner {
      *   <li>{@code NUMBER} — наследники {@code Number};</li>
      *   <li>строки и {@code CLOB} — {@code CharSequence}, перечисления, {@code Character};</li>
      *   <li>{@code XMLTYPE} — {@code CharSequence} или узел DOM ({@code org.w3c.dom.Node});</li>
-     *   <li>{@code DATE}, {@code TIMESTAMP} — типы {@code java.time} ({@code Temporal}) и
-     *       {@code java.util.Date} с наследниками;</li>
+     *   <li>{@code DATE}, {@code TIMESTAMP} — {@code LocalDate}, {@code LocalDateTime},
+     *       {@code Instant}, {@code OffsetDateTime}, {@code ZonedDateTime} и {@code java.util.Date}
+     *       с наследниками: ровно то, что умеет передать {@code Values.toTimestamp};</li>
      *   <li>{@code BOOLEAN} — {@code Boolean};</li>
      *   <li>{@code BLOB}, {@code RAW} — {@code byte[]};</li>
      *   <li>SQL-коллекции и index-by таблицы — {@code Collection} или массив;</li>
@@ -796,7 +862,9 @@ public class CallPlanner {
             case NUMBER -> Number.class.isAssignableFrom(c);
             case STRING, CLOB -> CharSequence.class.isAssignableFrom(c) || c.isEnum() || c == Character.class;
             case XMLTYPE -> CharSequence.class.isAssignableFrom(c) || org.w3c.dom.Node.class.isAssignableFrom(c);
-            case DATE, TIMESTAMP -> java.time.temporal.Temporal.class.isAssignableFrom(c) || java.util.Date.class.isAssignableFrom(c);
+            case DATE, TIMESTAMP -> c == java.time.LocalDate.class || c == java.time.LocalDateTime.class
+                    || c == java.time.Instant.class || c == java.time.OffsetDateTime.class
+                    || c == java.time.ZonedDateTime.class || java.util.Date.class.isAssignableFrom(c);
             case BOOLEAN -> c == Boolean.class;
             case BLOB, RAW -> c == byte[].class;
             case SQL_COLLECTION, INDEX_TABLE -> Collection.class.isAssignableFrom(c) || c.isArray();
@@ -873,7 +941,7 @@ public class CallPlanner {
             return false;
         }
         RecordComponent[] rc = type.getRecordComponents();
-        return rc.length > 0 && NameMatcher.find(rc[0].getName(), outs, ArgumentInfo::name) != null
+        return rc.length > 0 && match(rc[0].getName(), outs, ArgumentInfo::name) != null
                 && outs.get(0).kind() != ArgKind.RECORD;
     }
 
@@ -883,9 +951,8 @@ public class CallPlanner {
      * <p>Такой компонент всегда оставался бы пустым, поэтому планировщик считает его ошибкой.
      * Компонент с {@code @Arg} сравнивается с именами OUT-аргументов точно (без учёта
      * регистра), без аннотации — через {@code NameMatcher}. Если имя компонента одинаково
-     * хорошо подходит к нескольким OUT-аргументам, {@code NameMatcher} бросает
-     * {@code IllegalStateException} (а не {@link PlanException}). Бин и {@code Map} не
-     * проверяются.
+     * хорошо подходит к нескольким OUT-аргументам, это {@link PlanException}. Бин и {@code Map}
+     * не проверяются.
      *
      * @param holder тип результата Java-метода
      * @param outs   OUT-аргументы процедуры
@@ -900,7 +967,7 @@ public class CallPlanner {
             Arg a = rc.getAnnotation(Arg.class);
             boolean matched = a != null
                     ? outs.stream().anyMatch(o -> a.value().equalsIgnoreCase(o.name()))
-                    : NameMatcher.find(rc.getName(), outs, ArgumentInfo::name) != null;
+                    : match(rc.getName(), outs, ArgumentInfo::name) != null;
             if (!matched) {
                 out.add(rc.getName());
             }
@@ -924,7 +991,7 @@ public class CallPlanner {
             for (RecordComponent rc : holder.getRecordComponents()) {
                 Arg a = rc.getAnnotation(Arg.class);
                 if (a != null ? a.value().equalsIgnoreCase(outName)
-                        : NameMatcher.find(rc.getName(), List.of(outName), x -> x) != null) {
+                        : match(rc.getName(), List.of(outName), x -> x) != null) {
                     return ResolvableType.forType(rc.getGenericType());
                 }
             }

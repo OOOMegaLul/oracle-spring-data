@@ -76,6 +76,11 @@ spring.datasource.hikari.data-source-properties.oracle.jdbc.timezoneAsRegion=fal
 
 **Spring без Boot.** `@EnablePlsqlApis(basePackages = "...")` на конфигурации.
 
+**Несколько баз.** На каждую базу своя конфигурация со своим пакетом интерфейсов:
+`@EnablePlsqlApis(basePackages = "...reports", dataSourceRef = "reportsDataSource")`.
+Каждая база получает свою фабрику. Если фабрика для базы собрана вручную (например, поверх
+`SessionContextDataSource`), укажите её явно: `factoryRef = "reportsFactory"`.
+
 **Без Spring-контекста.**
 
 ```java
@@ -115,7 +120,7 @@ END;
 | `NUMBER`, `VARCHAR2`, `DATE`, `TIMESTAMP`, `RAW` | числа, `String`, `java.time`, `byte[]` | прямой bind |
 | `CLOB`, `BLOB` | `String`, `byte[]` | временный LOB, освобождается после вызова |
 | `BOOLEAN` | `boolean` | через переменную блока (на 11.2 JDBC не умеет) |
-| `RECORD`, `%ROWTYPE` | record / бин / `Map` | поле за полем через переменную блока; поля: скаляры, `BOOLEAN`, `XMLTYPE` |
+| `RECORD`, `%ROWTYPE` | record / бин / `Map` | поле за полем через переменную блока; поля: скаляры, `BOOLEAN`, `XMLTYPE`; `%ROWTYPE` таблицы, синонима или курсора пакета |
 | `XMLTYPE` | `String`, `org.w3c.dom.Document` | через `CLOB` и переменную блока; `NULL` остаётся `NULL` (на 11.2 `XMLTYPE(NULL)` падает) |
 | `SYS_REFCURSOR` OUT / IN OUT / возврат | `List<record>` | строки по именам колонок: `BEGIN_DATE` → `beginDate` |
 | объектный тип SQL | record / бин | `java.sql.Struct` |
@@ -123,7 +128,8 @@ END;
 | index-by таблица `NUMBER` / `VARCHAR2` | `List` | `setPlsqlIndexTable` |
 
 Не поддержаны: index-by таблицы записей и дат, `REF CURSOR` как входной параметр,
-прочие `OPAQUE`-типы. Такие подпрограммы останавливают старт с понятной причиной.
+прочие `OPAQUE`-типы, `%ROWTYPE` в пакете, зашифрованном через `wrap` (таблицу не прочитать
+из исходника). Такие подпрограммы останавливают старт с понятной причиной.
 
 ## Сессия и пул соединений
 
@@ -155,7 +161,8 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
   текстом без стека ORA-06512. Остальное → стандартная иерархия Spring
   (`DuplicateKeyException`...).
 - **ORA-04068.** Если пакет перекомпилировали под живой сессией, вызов повторяется один
-  раз: неудачный вызов не выполнялся.
+  раз. Изменения данных неудачного вызова Oracle уже откатил сам; не откатываются только
+  автономные транзакции, последовательности и действия вне базы (файлы, почта).
 - **Кодировка.** В базе CL8MSWIN1251 символ вне кодовой страницы молча становится `?`.
   По умолчанию библиотека не отправляет такой текст:
   `UnrepresentableCharacterException: SNAME: character 'Ә' (U+04D8) at position 10 ...`.
@@ -175,14 +182,14 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (77, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (90, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования.
 
 ```bash
 ./mvnw verify -Pit
 ```
 
-Интеграционные тесты (29) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
+Интеграционные тесты (30) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
 пересоздают при каждом запуске. Где взять базу:
 
 - по умолчанию одноразовый контейнер `gvenzl/oracle-xe:11-slim` (Testcontainers, нужен Docker);

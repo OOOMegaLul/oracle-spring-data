@@ -7,6 +7,9 @@ import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -110,6 +113,20 @@ class ValuesTest {
         assertThat(convert(ts, LocalDateTime.class)).isEqualTo(LocalDateTime.of(2024, 2, 29, 13, 45));
         assertThat(Values.toTimestamp(LocalDate.of(2024, 1, 2))).isEqualTo(Timestamp.valueOf("2024-01-02 00:00:00"));
         assertThatThrownBy(() -> Values.toTimestamp("2024-01-02")).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /**
+     * Проверяет {@code ZonedDateTime} и {@code OffsetDateTime}: на вход идут как момент времени
+     * (пояс не сохраняется, база видит часы JVM), из базы возвращаются в поясе JVM.
+     */
+    @Test
+    void zonedDatesTravelAsMoments() {
+        ZonedDateTime z = ZonedDateTime.of(2024, 2, 29, 10, 30, 0, 0, ZoneId.of("Asia/Almaty"));
+        Timestamp ts = Values.toTimestamp(z);
+        assertThat(ts.toInstant()).isEqualTo(z.toInstant());
+        ZonedDateTime local = z.withZoneSameInstant(ZoneId.systemDefault());
+        assertThat(convert(ts, ZonedDateTime.class)).isEqualTo(local);
+        assertThat(convert(ts, OffsetDateTime.class)).isEqualTo(local.toOffsetDateTime());
     }
 
     /**

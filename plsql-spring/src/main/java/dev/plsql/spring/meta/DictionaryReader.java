@@ -22,9 +22,9 @@ import java.util.regex.Pattern;
  * <p>Словарь данных — набор системных представлений, в которых база описывает свои объекты.
  * Здесь используются {@code ALL_ARGUMENTS} (аргументы подпрограмм), {@code ALL_OBJECTS}
  * (объекты и их статус), {@code ALL_PROCEDURES} (список подпрограмм), {@code ALL_SOURCE}
- * (исходный текст), {@code ALL_TYPE_ATTRS}, {@code ALL_TYPES} и {@code ALL_COLL_TYPES}
- * (устройство объектных типов и коллекций SQL). Префикс {@code ALL_} означает «всё, что
- * доступно текущему пользователю».
+ * (исходный текст), {@code ALL_SYNONYMS} (синонимы в {@code %ROWTYPE}), {@code ALL_TYPE_ATTRS},
+ * {@code ALL_TYPES} и {@code ALL_COLL_TYPES} (устройство объектных типов и коллекций SQL).
+ * Префикс {@code ALL_} означает «всё, что доступно текущему пользователю».
  *
  * <p>Имена разрешаются через {@code DBMS_UTILITY.NAME_RESOLVE} — ту же процедуру, которой
  * пользуется компилятор PL/SQL, поэтому частные и публичные синонимы работают ровно так же,
@@ -556,7 +556,11 @@ public class DictionaryReader {
      * {@code ALL_SOURCE} (исходный текст объектов).
      *
      * <p>Исходник читается, только если такие аргументы есть. Обрабатываются аргументы верхнего
-     * уровня и возвращаемое значение; если таблицу найти не удалось, аргумент остаётся без типа.
+     * уровня и возвращаемое значение. Имя из объявления разрешается уже при старте
+     * ({@link #resolveRowtype}): синоним раскрывается до таблицы, курсор пакета получает имя
+     * пакета. Если разрешить не удалось (исходник зашифрован через {@code wrap}, таблица не
+     * видна этому пользователю), аргумент остаётся без типа, и планировщик останавливает старт с
+     * понятной причиной, а не падает на первом вызове.
      *
      * @param con соединение, на котором читается словарь
      * @param sp  подпрограмма, собранная из строк {@code ALL_ARGUMENTS}
@@ -569,16 +573,156 @@ public class DictionaryReader {
         if (!needed) {
             return sp;
         }
-        String decl = declarationText(con, sp);
+        String source = sourceText(con, sp);
+        String decl = findDeclaration(source, sp.name(), sp.overload());
         List<ArgumentInfo> args = new ArrayList<>();
         for (ArgumentInfo a : sp.arguments()) {
-            args.add(isAnonymousRecord(a) ? withRowtype(a, rowtypeOf(decl, a.name(), sp.owner())) : a);
+            args.add(isAnonymousRecord(a)
+                    ? withRowtype(a, resolveRowtype(con, sp, source, rowtypeOf(decl, a.name())))
+                    : a);
         }
         ArgumentInfo ret = sp.returnValue();
         if (ret != null && isAnonymousRecord(ret)) {
-            ret = withRowtype(ret, returnRowtypeOf(decl, sp.owner()));
+            ret = withRowtype(ret, resolveRowtype(con, sp, source, returnRowtypeOf(decl)));
         }
         return new SubprogramInfo(sp.owner(), sp.packageName(), sp.name(), sp.overload(), ret, args);
+    }
+
+    /**
+     * Сколько синонимов подряд раскрывается, прежде чем цепочка считается неразрешимой.
+     */
+    private static final int MAX_SYNONYM_HOPS = 10;
+
+    /**
+     * Превращает имя из {@code ...%ROWTYPE}, как оно написано в объявлении, в полное имя,
+     * которое можно написать в анонимном блоке.
+     *
+     * <p>Анонимный блок компилируется в схеме пользователя соединения, а не в схеме владельца
+     * пакета, поэтому имя нужно разрешить так, как его видел компилятор пакета:
+     * <ul>
+     *   <li>{@code C_EMP}, объявленный в спецификации этого же пакета как {@code CURSOR}, — это
+     *       курсор: {@code OWNER.PKG.C_EMP};</li>
+     *   <li>иначе имя без точки — таблица или представление схемы владельца, её частный синоним
+     *       или публичный синоним; синонимы раскрываются до таблицы;</li>
+     *   <li>{@code X.Y} — таблица или синоним {@code Y} в схеме {@code X}, а если такого нет и
+     *       {@code X} — пакет схемы владельца, то курсор этого пакета;</li>
+     *   <li>имя из трёх частей возвращается как есть.</li>
+     * </ul>
+     *
+     * @param con     соединение, на котором читается словарь
+     * @param sp      подпрограмма, которой принадлежит объявление
+     * @param source  исходный текст спецификации пакета или самой подпрограммы
+     * @param written имя из объявления в верхнем регистре или {@code null}
+     * @return полное имя таблицы или курсора; {@code null}, если имя не задано или не
+     *         разрешилось (такой таблицы этот пользователь не видит, синоним ведёт по dblink)
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private static String resolveRowtype(Connection con, SubprogramInfo sp, String source, String written)
+            throws SQLException {
+        if (written == null) {
+            return null;
+        }
+        String[] parts = written.replace("\"", "").split("\\.");
+        if (parts.length == 1) {
+            if (sp.packageName() != null && declaresCursor(source, parts[0])) {
+                return sp.owner() + "." + sp.packageName() + "." + parts[0];
+            }
+            return resolveTable(con, sp.owner(), parts[0], true);
+        }
+        if (parts.length == 2) {
+            String table = resolveTable(con, parts[0], parts[1], false);
+            if (table != null || !isPackage(con, sp.owner(), parts[0])) {
+                return table;
+            }
+            return sp.owner() + "." + parts[0] + "." + parts[1];
+        }
+        return String.join(".", parts);
+    }
+
+    /**
+     * Находит таблицу или представление по имени так, как это делает компилятор PL/SQL в схеме
+     * {@code schema}: сначала объект самой схемы, затем её частный синоним, затем публичный
+     * синоним. Синоним раскрывается по цепочке, пока не дойдёт до таблицы.
+     *
+     * <p>Каждый шаг — один запрос: три ветки {@code UNION ALL} упорядочены по приоритету, берётся
+     * первая строка.
+     *
+     * @param con            соединение, на котором читается словарь
+     * @param schema         схема, в которой разрешается имя
+     * @param name           имя без схемы
+     * @param publicSynonyms искать ли публичные синонимы (только для имени, написанного без схемы)
+     * @return {@code OWNER.TABLE} или {@code null}, если ничего не нашлось, синоним ведёт в
+     *         другую базу (dblink) или цепочка синонимов длиннее {@link #MAX_SYNONYM_HOPS}
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private static String resolveTable(Connection con, String schema, String name, boolean publicSynonyms)
+            throws SQLException {
+        String sql = """
+                select 1, owner, object_name, cast(null as varchar2(128)) from all_objects
+                 where owner = ? and object_name = ? and object_type in ('TABLE', 'VIEW')
+                union all
+                select 2, table_owner, table_name, db_link from all_synonyms
+                 where owner = ? and synonym_name = ?
+                union all
+                select 3, table_owner, table_name, db_link from all_synonyms
+                 where owner = 'PUBLIC' and synonym_name = ? and ? = 'Y'
+                 order by 1""";
+        for (int hop = 0; hop < MAX_SYNONYM_HOPS; hop++) {
+            try (PreparedStatement ps = con.prepareStatement(sql)) {
+                ps.setString(1, schema);
+                ps.setString(2, name);
+                ps.setString(3, schema);
+                ps.setString(4, name);
+                ps.setString(5, name);
+                ps.setString(6, publicSynonyms ? "Y" : "N");
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next() || rs.getString(4) != null) {
+                        return null;
+                    }
+                    if (rs.getInt(1) == 1) {
+                        return schema + "." + name;
+                    }
+                    schema = rs.getString(2);
+                    name = rs.getString(3);
+                    publicSynonyms = false; // у цели синонима схема указана всегда
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Проверяет, есть ли в схеме пакет с таким именем.
+     *
+     * @param con   соединение, на котором читается словарь
+     * @param owner схема
+     * @param name  имя пакета
+     * @return {@code true}, если пакет виден текущему пользователю
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private static boolean isPackage(Connection con, String owner, String name) throws SQLException {
+        try (PreparedStatement ps = con.prepareStatement(
+                "select 1 from all_objects where owner = ? and object_name = ? and object_type = 'PACKAGE'")) {
+            ps.setString(1, owner);
+            ps.setString(2, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    /**
+     * Проверяет, объявлен ли в исходнике курсор с таким именем: {@code CURSOR C_EMP IS ...}.
+     *
+     * <p>Комментарии не учитываются, имя ищется целым словом без учёта регистра.
+     *
+     * @param source исходный текст спецификации пакета
+     * @param name   имя курсора
+     * @return {@code true}, если курсор объявлен
+     */
+    static boolean declaresCursor(String source, String name) {
+        return Pattern.compile("\\bCURSOR\\s+\"?" + Pattern.quote(name.toUpperCase(Locale.ROOT)) + "\"?(?![A-Z0-9_$#])")
+                .matcher(stripComments(source).toUpperCase(Locale.ROOT)).find();
     }
 
     /**
@@ -610,19 +754,15 @@ public class DictionaryReader {
     }
 
     /**
-     * Возвращает текст объявления подпрограммы (до первой {@code ;} или {@code IS}/{@code AS}) в
-     * верхнем регистре.
-     *
-     * <p>Читает из {@code ALL_SOURCE} исходник спецификации пакета (или самой автономной
-     * подпрограммы), склеивая строки по порядку, и ищет в нём объявление нужной перегрузки
-     * через {@link #findDeclaration}.
+     * Читает из {@code ALL_SOURCE} исходник спецификации пакета (или самой автономной
+     * подпрограммы), склеивая строки по порядку.
      *
      * @param con соединение, на котором читается словарь
-     * @param sp  подпрограмма, чьё объявление нужно
-     * @return текст объявления или пустая строка, если объявление не найдено
+     * @param sp  подпрограмма, чей исходник нужен
+     * @return исходный текст как есть; пустая строка, если его не видно
      * @throws SQLException при ошибке обращения к словарю
      */
-    private String declarationText(Connection con, SubprogramInfo sp) throws SQLException {
+    private static String sourceText(Connection con, SubprogramInfo sp) throws SQLException {
         String sql = """
                 select text from all_source
                  where owner = ? and name = ? and type in ('PACKAGE', 'PROCEDURE', 'FUNCTION')
@@ -637,7 +777,7 @@ public class DictionaryReader {
                 }
             }
         }
-        return findDeclaration(src.toString(), sp.name(), sp.overload());
+        return src.toString();
     }
 
     /**
@@ -725,46 +865,34 @@ public class DictionaryReader {
     }
 
     /**
-     * Находит в объявлении таблицу, по которой объявлен аргумент {@code argName}:
-     * {@code P_ROW OUT NOCOPY EMP%ROWTYPE} превращается в {@code OWNER.EMP}.
+     * Находит в объявлении имя, по которому объявлен аргумент {@code argName}:
+     * {@code P_ROW OUT NOCOPY EMP%ROWTYPE} даёт {@code EMP}.
      *
      * <p>Понимает режимы {@code IN}, {@code OUT}, {@code IN OUT} и подсказку {@code NOCOPY}
-     * (просьбу передавать параметр по ссылке, без копирования). Имя без точки дополняется
-     * схемой {@code owner}, имя с точкой ({@code HR.EMP_HIST}) возвращается как есть.
+     * (просьбу передавать параметр по ссылке, без копирования). Имя возвращается как написано
+     * ({@code EMP}, {@code HR.EMP_HIST}, {@code C_EMP}); что оно означает — таблицу, синоним или
+     * курсор, — решает {@link #resolveRowtype}.
      *
      * @param decl    объявление в верхнем регистре (результат {@link #findDeclaration})
      * @param argName имя аргумента в верхнем регистре
-     * @param owner   схема подпрограммы
-     * @return {@code OWNER.TABLE} или {@code null}, если аргумент объявлен не через {@code %ROWTYPE}
+     * @return имя перед {@code %ROWTYPE} или {@code null}, если аргумент объявлен иначе
      */
-    static String rowtypeOf(String decl, String argName, String owner) {
+    static String rowtypeOf(String decl, String argName) {
         Matcher m = Pattern.compile("(?<![A-Z0-9_$#])" + Pattern.quote(argName)
                 + "\\s+(?:IN\\s+OUT\\s+|IN\\s+|OUT\\s+)?(?:NOCOPY\\s+)?([A-Z0-9_$#.\"]+)%ROWTYPE").matcher(decl);
-        return m.find() ? qualify(m.group(1), owner) : null;
+        return m.find() ? m.group(1) : null;
     }
 
     /**
-     * Находит в объявлении функции таблицу из {@code RETURN ...%ROWTYPE}:
-     * {@code RETURN EMP%ROWTYPE} превращается в {@code OWNER.EMP}.
+     * Находит в объявлении функции имя из {@code RETURN ...%ROWTYPE}:
+     * {@code RETURN EMP%ROWTYPE} даёт {@code EMP}.
      *
-     * @param decl  объявление в верхнем регистре (результат {@link #findDeclaration})
-     * @param owner схема подпрограммы
-     * @return {@code OWNER.TABLE} или {@code null}, если функция возвращает не {@code %ROWTYPE}
+     * @param decl объявление в верхнем регистре (результат {@link #findDeclaration})
+     * @return имя перед {@code %ROWTYPE} или {@code null}, если функция возвращает не {@code %ROWTYPE}
      */
-    static String returnRowtypeOf(String decl, String owner) {
+    static String returnRowtypeOf(String decl) {
         Matcher m = Pattern.compile("\\bRETURN\\s+([A-Z0-9_$#.\"]+)%ROWTYPE").matcher(decl);
-        return m.find() ? qualify(m.group(1), owner) : null;
-    }
-
-    /**
-     * Дополняет имя схемой, если в имени ещё нет точки.
-     *
-     * @param name  имя таблицы из объявления
-     * @param owner схема подпрограммы
-     * @return {@code name}, если в нём есть точка, иначе {@code OWNER.NAME}
-     */
-    private static String qualify(String name, String owner) {
-        return name.contains(".") ? name : owner + "." + name;
+        return m.find() ? m.group(1) : null;
     }
 
     /**

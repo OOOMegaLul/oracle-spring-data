@@ -16,6 +16,7 @@ import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import org.junit.jupiter.api.Test;
@@ -246,6 +247,48 @@ class CallPlannerTest {
          * @return OUT-аргументы в record, который им не соответствует
          */
         Wrong twoOutsWrong(long in);
+
+        /**
+         * Процедура с двумя OUT-аргументами, но результат — одно число: разложить их некуда.
+         *
+         * @param in входное значение
+         * @return одно число
+         */
+        long twoOutsIntoALong(long in);
+
+        /**
+         * Те же два OUT-аргумента в {@code Map}: ключ — имя аргумента.
+         *
+         * @param in входное значение
+         * @return OUT-аргументы по именам
+         */
+        Map<String, Object> twoOutsIntoAMap(long in);
+
+        /**
+         * Результат, чей компонент {@code name} одинаково хорошо подходит к двум OUT-аргументам.
+         *
+         * @param name имя
+         * @param id   номер
+         */
+        record Ambiguous(String name, BigDecimal id) {
+        }
+
+        /**
+         * Метод для проверки неоднозначного компонента результата.
+         *
+         * @param in входное значение
+         * @return результат с неоднозначным компонентом
+         */
+        Ambiguous ambiguousOuts(long in);
+
+        /**
+         * Пытается передать значение в IN OUT курсор: курсор из Java не отправить.
+         *
+         * @param minId нижняя граница номера
+         * @param cur   значение для курсора
+         * @return строки курсора
+         */
+        List<Map<String, Object>> cursorWithValue(long minId, List<Object> cur);
     }
 
     /**
@@ -315,8 +358,8 @@ class CallPlannerTest {
         SubprogramInfo sp = proc(null, "P_X").in("NTENANT", "NUMBER").in("NRN", "NUMBER").build();
         assertThatThrownBy(() -> PLANNER.plan(m("withDefault"), sp))
                 .hasMessageContaining("'a' has no matching argument").hasMessageContaining("NTENANT IN");
-        Method rnOnly = m("unknown");
-        assertThatThrownBy(() -> PLANNER.plan(rnOnly, proc(null, "P_X").in("NOPE", "NUMBER").in("NRN", "NUMBER").build()))
+        Method onlyNope = m("unknown");
+        assertThatThrownBy(() -> PLANNER.plan(onlyNope, proc(null, "P_X").in("NOPE", "NUMBER").in("NRN", "NUMBER").build()))
                 .hasMessageContaining("required argument NRN (NUMBER) is not supplied");
     }
 
@@ -553,6 +596,76 @@ class CallPlannerTest {
                 .out("P_DOUBLE", "NUMBER").out("P_TEXT", "VARCHAR2").build()))
                 .hasMessageContaining("Wrong components [doubled] match no OUT argument")
                 .hasMessageContaining("[P_DOUBLE, P_TEXT]");
+    }
+
+    /**
+     * Проверяет, что несколько OUT-аргументов нельзя вернуть одним простым значением: это
+     * ошибка при старте, а не при вызове. В {@code Map} — можно.
+     */
+    @Test
+    void severalOutsNeedAHolder() {
+        SubprogramInfo sp = proc("PKG", "TWO").in("P_IN", "NUMBER").out("P_DOUBLED", "NUMBER").out("P_TEXT", "VARCHAR2").build();
+        assertThatThrownBy(() -> PLANNER.plan(m("twoOutsIntoALong"), sp))
+                .isInstanceOf(CallPlanner.PlanException.class)
+                .hasMessageContaining("returns long but the procedure has 2 OUT arguments [P_DOUBLED, P_TEXT]");
+        CallPlan map = PLANNER.plan(m("twoOutsIntoAMap"), sp);
+        assertThat(map.result().assemble(Map.of("P_DOUBLED", BigDecimal.TEN, "P_TEXT", "t")))
+                .isEqualTo(Map.of("P_DOUBLED", BigDecimal.TEN, "P_TEXT", "t"));
+    }
+
+    /**
+     * Проверяет, что неоднозначное имя компонента результата — {@code PlanException}, которое
+     * попадает в общий отчёт о старте, а не голое {@code IllegalStateException}.
+     */
+    @Test
+    void ambiguousResultComponentIsAPlanError() {
+        SubprogramInfo sp = proc("PKG", "AMB").in("P_IN", "NUMBER")
+                .out("SNAME", "VARCHAR2").out("P_NAME", "VARCHAR2").out("NID", "NUMBER").build();
+        assertThatThrownBy(() -> PLANNER.plan(m("ambiguousOuts"), List.of(sp)))
+                .isInstanceOf(CallPlanner.PlanException.class)
+                .hasMessageContaining("'name' matches several arguments");
+    }
+
+    /**
+     * Проверяет, что параметр Java, попавший в IN OUT курсор, — ошибка при старте: раньше его
+     * значение молча отбрасывалось.
+     */
+    @Test
+    void valueForAnInOutCursorIsRejected() {
+        assertThatThrownBy(() -> PLANNER.plan(m("cursorWithValue"),
+                proc("PKG", "CUR").in("P_MIN_ID", "NUMBER").inOut("P_CUR", "REF CURSOR").build()))
+                .hasMessageContaining("P_CUR is an IN OUT REF CURSOR").hasMessageContaining("remove the parameter");
+    }
+
+    /**
+     * Проверяет, что при выборе перегрузки поставщики {@link ArgumentDefaults} не вызываются:
+     * при старте нет ни запроса, ни пользователя, и поставщик мог бы упасть или сделать лишнее.
+     */
+    @Test
+    void choosingAnOverloadDoesNotCallDefaults() {
+        AtomicInteger calls = new AtomicInteger();
+        CallPlanner planner = new CallPlanner(ArgumentDefaults.byName(Map.of("NTENANT", () -> {
+            calls.incrementAndGet();
+            return 1L;
+        })));
+        SubprogramInfo number = proc("PKG", "OVER").overload("1").in("NTENANT", "NUMBER").in("P_X", "NUMBER")
+                .out("P_OUT", "VARCHAR2").build();
+        SubprogramInfo text = proc("PKG", "OVER").overload("2").in("NTENANT", "NUMBER").in("P_X", "VARCHAR2")
+                .out("P_OUT", "VARCHAR2").build();
+        assertThat(planner.plan(m("over"), List.of(number, text)).target()).isSameAs(number);
+        assertThat(calls).hasValue(0);
+    }
+
+    /**
+     * Проверяет, какие типы дат принимает {@code DATE}: те, что умеет передать исполнитель
+     * ({@code ZonedDateTime} в том числе), но не {@code LocalTime}.
+     */
+    @Test
+    void dateAcceptsOnlyTypesThatCanBeBound() {
+        assertThat(CallPlanner.accepts(ArgKind.DATE, java.time.ZonedDateTime.class)).isTrue();
+        assertThat(CallPlanner.accepts(ArgKind.DATE, java.time.LocalDate.class)).isTrue();
+        assertThat(CallPlanner.accepts(ArgKind.TIMESTAMP, java.sql.Timestamp.class)).isTrue();
+        assertThat(CallPlanner.accepts(ArgKind.DATE, java.time.LocalTime.class)).isFalse();
     }
 
     /**

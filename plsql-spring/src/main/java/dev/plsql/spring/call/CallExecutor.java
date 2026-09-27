@@ -11,12 +11,14 @@ import java.sql.SQLException;
 import java.sql.Struct;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import org.springframework.core.ResolvableType;
+import org.springframework.util.ObjectUtils;
 
 import dev.plsql.spring.meta.ArgKind;
 import dev.plsql.spring.meta.ArgumentInfo;
@@ -369,14 +371,12 @@ public class CallExecutor {
 
     /**
      * Представляет значение как коллекцию: {@code null} — пустой список, коллекция —
-     * как есть, массив объектов — список поверх массива.
-     *
-     * <p>Массив примитивов ({@code long[]}, {@code int[]}) сюда не подходит: это не
-     * {@code Object[]}.
+     * как есть, массив — список его элементов (массив примитивов вроде {@code long[]}
+     * копируется в массив обёрток).
      *
      * @param v значение из Java
      * @return коллекция элементов
-     * @throws IllegalArgumentException если значение — не коллекция и не массив объектов
+     * @throws IllegalArgumentException если значение — не коллекция и не массив
      */
     private static Collection<?> asCollection(Object v) {
         if (v == null) {
@@ -386,7 +386,11 @@ public class CallExecutor {
             return col;
         }
         if (v instanceof Object[] arr) {
-            return java.util.Arrays.asList(arr);
+            return Arrays.asList(arr);
+        }
+        if (v.getClass().isArray()) {
+            // long[], int[] и другие массивы примитивов.
+            return Arrays.asList(ObjectUtils.toObjectArray(v));
         }
         throw new IllegalArgumentException("expected a collection or an array, got " + v.getClass().getName());
     }
@@ -540,8 +544,8 @@ public class CallExecutor {
      *   <li>{@code SQL_COLLECTION} — список; {@code OBJECT} — {@code Map} атрибутов;</li>
      *   <li>{@code INDEX_TABLE} — список элементов.</li>
      * </ul>
-     * SQL {@code NULL} возвращается как {@code null}; только для {@code INDEX_TABLE} такой
-     * проверки нет — ответ драйвера сразу оборачивается в {@code List.of}.
+     * SQL {@code NULL} возвращается как {@code null}. Index-by таблица возвращается списком
+     * всегда (пустым, если элементов нет); её элементы-{@code NULL} остаются {@code null}.
      *
      * @param cs  выполненный вызов блока
      * @param idx номер позиции {@code ?}, с единицы
@@ -568,9 +572,11 @@ public class CallExecutor {
                 if (bl == null) {
                     yield null;
                 }
-                byte[] bytes = bl.getBytes(1, (int) bl.length());
-                bl.free();
-                yield bytes;
+                try {
+                    yield bl.getBytes(1, (int) bl.length());
+                } finally {
+                    bl.free();
+                }
             }
             case RAW -> cs.getBytes(idx);
             case REF_CURSOR -> readCursor(cs, idx, b.outType());
@@ -582,7 +588,11 @@ public class CallExecutor {
                 Object o = cs.getObject(idx);
                 yield o == null ? null : fromStruct((Struct) o, b.arg());
             }
-            case INDEX_TABLE -> List.of((Object[]) cs.unwrap(OracleCallableStatement.class).getPlsqlIndexTable(idx));
+            case INDEX_TABLE -> {
+                // Arrays.asList, а не List.of: элемент index-by таблицы может быть NULL.
+                Object[] raw = (Object[]) cs.unwrap(OracleCallableStatement.class).getPlsqlIndexTable(idx);
+                yield raw == null ? List.of() : Arrays.asList(raw);
+            }
             default -> throw new IllegalStateException("cannot read " + b.kind());
         };
     }
@@ -637,13 +647,16 @@ public class CallExecutor {
      */
     private List<Object> fromArray(Array a, ArgumentInfo coll) throws SQLException {
         ArgumentInfo el = coll.children().isEmpty() ? null : coll.children().get(0);
-        Object[] raw = (Object[]) a.getArray();
-        List<Object> out = new ArrayList<>(raw.length);
-        for (Object o : raw) {
-            out.add(o instanceof Struct s && el != null ? fromStruct(s, el) : o);
+        try {
+            Object[] raw = (Object[]) a.getArray();
+            List<Object> out = new ArrayList<>(raw.length);
+            for (Object o : raw) {
+                out.add(o instanceof Struct s && el != null ? fromStruct(s, el) : o);
+            }
+            return out;
+        } finally {
+            a.free();
         }
-        a.free();
-        return out;
     }
 
     /**

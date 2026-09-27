@@ -91,7 +91,7 @@ public class SessionContextDataSource extends DelegatingDataSource {
      */
     public SessionContextDataSource(DataSource target, Supplier<String> currentUser) {
         super(target);
-        this.currentUser = currentUser;
+        this.currentUser = Objects.requireNonNull(currentUser, "currentUser");
     }
 
     /**
@@ -226,7 +226,8 @@ public class SessionContextDataSource extends DelegatingDataSource {
      * </ul>
      *
      * <p>Если любой шаг упал, соединение закрывается (у пула это значит «возвращается в пул»), и
-     * ошибка пробрасывается дальше: полуподготовленное соединение наружу не отдаётся.
+     * ошибка пробрасывается дальше: полуподготовленное соединение наружу не отдаётся. Если и
+     * закрыть не удалось, эта вторая ошибка прикладывается к первой как подавленная.
      *
      * @param con только что выданное соединение
      * @return то же соединение, готовое к работе
@@ -270,7 +271,11 @@ public class SessionContextDataSource extends DelegatingDataSource {
             }
             return con;
         } catch (SQLException | RuntimeException e) {
-            con.close();
+            try {
+                con.close();
+            } catch (SQLException closeFailure) {
+                e.addSuppressed(closeFailure); // наружу идёт причина, а не ошибка закрытия
+            }
             throw e;
         }
     }

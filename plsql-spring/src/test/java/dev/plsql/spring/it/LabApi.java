@@ -159,6 +159,39 @@ public interface LabApi {
     Emp empRow(long id);
 
     /**
+     * Вызывает процедуру {@code LAB_PKG.EMP_ROW_SYN(P_ID, P_ROW OUT LAB_EMP_SYN%ROWTYPE)}: то же, что
+     * {@link #empRow}, но запись объявлена через синоним {@code LAB_EMP_SYN} таблицы {@code LAB_EMP}.
+     *
+     * <p>Форма: {@code %ROWTYPE} синонима. Анонимный блок компилируется в схеме пользователя
+     * соединения, поэтому библиотека раскрывает синоним до таблицы уже при старте.
+     *
+     * @param id значение {@code P_ID}
+     * @return строка таблицы
+     */
+    Emp empRowSyn(long id);
+
+    /**
+     * Краткая строка {@code LAB_EMP}: столбцы курсора {@code LAB_PKG.C_EMP}.
+     *
+     * @param id   номер
+     * @param name имя
+     */
+    record Brief(long id, String name) {
+    }
+
+    /**
+     * Вызывает процедуру {@code LAB_PKG.EMP_BRIEF(P_ID, P_ROW OUT C_EMP%ROWTYPE)}: номер и имя
+     * сотрудника.
+     *
+     * <p>Форма: {@code %ROWTYPE} курсора, объявленного в спецификации пакета. В блоке переменная
+     * объявляется как {@code PLSQL_IT.LAB_PKG.C_EMP%ROWTYPE}.
+     *
+     * @param id значение {@code P_ID}
+     * @return номер и имя
+     */
+    Brief empBrief(long id);
+
+    /**
      * Вызывает функцию {@code LAB_PKG.SUM_IBT(P_VALS NUM_IBT) RETURN NUMBER}: сумму элементов.
      *
      * <p>Форма: IN index-by таблица {@code NUMBER} ({@code TABLE OF NUMBER INDEX BY PLS_INTEGER}) —
@@ -196,8 +229,8 @@ public interface LabApi {
     List<Obj> objs(int n);
 
     /**
-     * Вызывает функцию {@code LAB_PKG.COUNT_OBJS(P_OBJS LAB_OBJ_TAB) RETURN NUMBER}. Несмотря на
-     * имя, функция возвращает не число объектов, а суммарную длину их имён в символах.
+     * Вызывает функцию {@code LAB_PKG.NAME_CHARS(P_OBJS LAB_OBJ_TAB) RETURN NUMBER}: суммарную
+     * длину имён объектов в символах.
      *
      * <p>Форма: IN SQL-коллекция объектов. Каждый {@link Obj} превращается в {@code Struct}, список —
      * в {@code Array} типа {@code LAB_OBJ_TAB}.
@@ -205,7 +238,7 @@ public interface LabApi {
      * @param objs объекты коллекции
      * @return сумма длин {@code name}; пустое имя считается за 0
      */
-    long countObjs(List<Obj> objs);
+    long nameChars(List<Obj> objs);
 
     /**
      * Вызывает функцию {@code LAB_PKG.SUM_NUMS(P_NUMS LAB_NUM_TAB) RETURN NUMBER}: сумму элементов.

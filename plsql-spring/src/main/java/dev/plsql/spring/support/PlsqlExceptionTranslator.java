@@ -1,6 +1,12 @@
 package dev.plsql.spring.support;
 
 import java.sql.SQLException;
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Set;
 
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.UncategorizedSQLException;
@@ -71,29 +77,45 @@ public class PlsqlExceptionTranslator {
     }
 
     /**
-     * Проверяет, сброшено ли состояние пакета (кто-то перекомпилировал пакет): вызов не выполнялся,
-     * и его можно повторить.
+     * Проверяет, сброшено ли состояние пакета (кто-то перекомпилировал пакет), то есть можно ли
+     * повторить вызов.
+     *
+     * <p>Повтор безопасен для данных: неудачный вызов блока — один оператор, и его изменения
+     * Oracle откатывает сам. Не откатываются только автономные транзакции, значения
+     * последовательностей и действия вне базы (файлы, почта), если процедура успела их сделать
+     * до ошибки.
      *
      * <p>Состояние пакета — значения его переменных, которые Oracle хранит отдельно для каждой
      * сессии. После перекомпиляции пакета Oracle сбрасывает это состояние в сессиях, которые
      * пакетом уже пользовались, и первый следующий вызов в такой сессии падает с ORA-04068.
      *
      * <p>Проверяются коды 4068, 4061, 4065 и 6508 (ORA-04068, ORA-04061, ORA-04065, ORA-06508) у
-     * самого исключения и дальше по цепочке: на каждом шаге берётся следующее исключение
-     * ({@code getNextException()}), а если его нет — причина ({@code getCause()}); обход
-     * останавливается на первом звене, которое не {@code SQLException}.
+     * самого исключения и у всех связанных с ним: и по цепочке следующих исключений
+     * ({@code getNextException()}), и по цепочке причин ({@code getCause()}). Каждое звено
+     * смотрится один раз, поэтому зацикленная цепочка не зависает.
      *
      * @param e ошибка JDBC
      * @return {@code true}, если это сброс состояния пакета и вызов можно повторить
      */
     public static boolean isStateDiscarded(SQLException e) {
-        for (Throwable t = e; t instanceof SQLException s; t = s.getNextException() != null ? s.getNextException() : s.getCause()) {
-            int c = s.getErrorCode();
-            if (c == 4068 || c == 4061 || c == 4065 || c == 6508) {
-                return true;
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        Deque<Throwable> todo = new ArrayDeque<>(List.of(e));
+        while (!todo.isEmpty()) {
+            Throwable t = todo.pop();
+            if (!seen.add(t)) {
+                continue;
             }
-            if (t.getCause() == t) {
-                break;
+            if (t instanceof SQLException s) {
+                int c = s.getErrorCode();
+                if (c == 4068 || c == 4061 || c == 4065 || c == 6508) {
+                    return true;
+                }
+                if (s.getNextException() != null) {
+                    todo.push(s.getNextException());
+                }
+            }
+            if (t.getCause() != null) {
+                todo.push(t.getCause());
             }
         }
         return false;

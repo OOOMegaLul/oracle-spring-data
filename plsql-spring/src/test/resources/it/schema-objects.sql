@@ -16,6 +16,8 @@ insert into lab_emp values (3, 'Smith', date '2022-03-10', 1)
 /
 commit
 /
+create or replace synonym lab_emp_syn for lab_emp
+/
 create or replace type lab_obj as object (id number, name varchar2(100), dt date)
 /
 create or replace type lab_obj_tab as table of lab_obj
@@ -30,17 +32,20 @@ create or replace package lab_pkg as
   type rec_ibt is table of rec_t index by pls_integer;
 
   g_state varchar2(100);
+  cursor c_emp is select id, name from lab_emp;
 
   function echo_bool(p_flag boolean) return boolean;
   procedure bool_inout(p_flag in out boolean);
   function make_rec(p_id number, p_name varchar2) return rec_t;
   procedure rec_inout(p_rec in out rec_t);
   procedure emp_row(p_id number, p_row out lab_emp%rowtype);
+  procedure emp_row_syn(p_id number, p_row out lab_emp_syn%rowtype);
+  procedure emp_brief(p_id number, p_row out c_emp%rowtype);
   function sum_ibt(p_vals num_ibt) return number;
   procedure ibt_out(p_n number, p_vals out str_ibt);
   function recs(p_n number) return rec_ibt;
   function objs(p_n number) return lab_obj_tab;
-  function count_objs(p_objs lab_obj_tab) return number;
+  function name_chars(p_objs lab_obj_tab) return number;
   function sum_nums(p_nums lab_num_tab) return number;
   function echo_obj(p_obj lab_obj) return lab_obj;
   procedure emps(p_min_id number, p_cur out sys_refcursor);
@@ -82,6 +87,14 @@ create or replace package body lab_pkg as
   begin
     select * into p_row from lab_emp where id = p_id;
   end;
+  procedure emp_row_syn(p_id number, p_row out lab_emp_syn%rowtype) is
+  begin
+    select * into p_row from lab_emp where id = p_id;
+  end;
+  procedure emp_brief(p_id number, p_row out c_emp%rowtype) is
+  begin
+    select id, name into p_row from lab_emp where id = p_id;
+  end;
   function sum_ibt(p_vals num_ibt) return number is
     s number := 0;
     i pls_integer := p_vals.first;
@@ -108,7 +121,7 @@ create or replace package body lab_pkg as
     end loop;
     return t;
   end;
-  function count_objs(p_objs lab_obj_tab) return number is
+  function name_chars(p_objs lab_obj_tab) return number is
     n number := 0;
   begin
     for i in 1..p_objs.count loop n := n + nvl(length(p_objs(i).name), 0); end loop;

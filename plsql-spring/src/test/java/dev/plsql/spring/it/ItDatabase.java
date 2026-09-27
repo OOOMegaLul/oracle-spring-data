@@ -289,9 +289,9 @@ public final class ItDatabase {
      * компиляции: Oracle просто сохраняет объект в состоянии INVALID. Этот метод вместо этого
      * громко падает.
      *
-     * <p>Проверка срабатывает только для операторов, начинающихся с
-     * {@code CREATE OR REPLACE PACKAGE} или {@code CREATE OR REPLACE TYPE}, и читает все строки
-     * {@code USER_ERRORS} схемы, а не только ошибки последнего объекта.
+     * <p>Проверка срабатывает для любого оператора {@code CREATE OR REPLACE} (пакеты, типы,
+     * процедуры, функции, триггеры, синонимы) и читает все строки {@code USER_ERRORS} схемы, а не
+     * только ошибки последнего объекта.
      *
      * @param c    соединение со схемой, где создан объект
      * @param stmt только что выполненный оператор
@@ -299,7 +299,7 @@ public final class ItDatabase {
      */
     private static void checkCompiled(Connection c, String stmt) throws SQLException {
         String head = stmt.toUpperCase(Locale.ROOT);
-        if (!head.startsWith("CREATE OR REPLACE PACKAGE") && !head.startsWith("CREATE OR REPLACE TYPE")) {
+        if (!head.startsWith("CREATE OR REPLACE")) {
             return;
         }
         try (PreparedStatement ps = c.prepareStatement(
@@ -357,8 +357,8 @@ public final class ItDatabase {
      * <p>Пробелы по краям обрезаются, пустой оператор пропускается. Завершающая {@code ;}
      * снимается у обычного SQL ({@code CREATE TABLE}, {@code INSERT}, {@code COMMIT}...): через
      * JDBC оператор SQL передаётся без неё. У блоков PL/SQL ({@code CREATE OR REPLACE PACKAGE},
-     * {@code PROCEDURE}, {@code FUNCTION}, анонимных {@code BEGIN}/{@code DECLARE}) точка с
-     * запятой — часть синтаксиса и остаётся.
+     * {@code PROCEDURE}, {@code FUNCTION}, {@code TYPE BODY}, {@code TRIGGER}, анонимных
+     * {@code BEGIN}/{@code DECLARE}) точка с запятой — часть синтаксиса и остаётся.
      *
      * @param out  список, куда добавляется оператор
      * @param stmt текст оператора как он есть в скрипте
@@ -370,7 +370,8 @@ public final class ItDatabase {
         }
         String up = s.toUpperCase(Locale.ROOT);
         boolean plsql = up.startsWith("CREATE OR REPLACE PACKAGE") || up.startsWith("CREATE OR REPLACE PROCEDURE")
-                || up.startsWith("CREATE OR REPLACE FUNCTION") || up.startsWith("BEGIN") || up.startsWith("DECLARE");
+                || up.startsWith("CREATE OR REPLACE FUNCTION") || up.startsWith("CREATE OR REPLACE TYPE BODY")
+                || up.startsWith("CREATE OR REPLACE TRIGGER") || up.startsWith("BEGIN") || up.startsWith("DECLARE");
         if (!plsql && s.endsWith(";")) {
             s = s.substring(0, s.length() - 1);
         }

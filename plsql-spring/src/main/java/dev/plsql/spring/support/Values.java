@@ -14,6 +14,8 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -116,11 +118,11 @@ public final class Values {
      * <p>{@code DATE} в Oracle хранит не только дату, но и время с точностью до секунды,
      * поэтому и для него передаётся {@code Timestamp}. Поддерживаются {@code Timestamp}
      * (как есть), {@link LocalDateTime}, {@link LocalDate} (полночь этого дня),
-     * {@link java.util.Date} (включая {@code java.sql.Date}), {@link Instant} и
-     * {@link OffsetDateTime} (через момент времени, смещение не сохраняется). Последние два
-     * обозначают момент, а не дату и время на часах, поэтому дата и время, которые увидит
-     * база, считаются в часовом поясе JVM.
-     * Других типов (например, {@code ZonedDateTime} или {@code LocalTime}) здесь нет.
+     * {@link java.util.Date} (включая {@code java.sql.Date}), {@link Instant},
+     * {@link OffsetDateTime} и {@link ZonedDateTime} (через момент времени, пояс не
+     * сохраняется). Последние три обозначают момент, а не дату и время на часах, поэтому дата
+     * и время, которые увидит база, считаются в часовом поясе JVM.
+     * Других типов (например, {@code LocalTime}) здесь нет.
      *
      * @param v значение из Java, может быть {@code null}
      * @return значение для привязки или {@code null}, если значение {@code null}
@@ -147,6 +149,9 @@ public final class Values {
         }
         if (v instanceof OffsetDateTime o) {
             return Timestamp.from(o.toInstant());
+        }
+        if (v instanceof ZonedDateTime z) {
+            return Timestamp.from(z.toInstant());
         }
         throw new IllegalArgumentException("Cannot bind " + v.getClass().getName() + " as DATE");
     }
@@ -413,6 +418,12 @@ public final class Values {
             }
             if (raw == Instant.class) {
                 return t.toInstant();
+            }
+            if (raw == OffsetDateTime.class) {
+                return t.toInstant().atZone(ZoneId.systemDefault()).toOffsetDateTime();
+            }
+            if (raw == ZonedDateTime.class) {
+                return t.toInstant().atZone(ZoneId.systemDefault());
             }
         }
         if ((raw == Boolean.class || raw == boolean.class) && v instanceof Number n) {

@@ -57,11 +57,23 @@ class PlsqlExceptionTranslatorTest {
     @Test
     void discardedPackageStateIsRecognisedAlsoWhenChained() {
         assertThat(PlsqlExceptionTranslator.isStateDiscarded(new SQLException("ORA-04068", "72000", 4068))).isTrue();
-        SQLException outer = new SQLException("ORA-06508", "72000", 6508);
-        assertThat(PlsqlExceptionTranslator.isStateDiscarded(outer)).isTrue();
+        SQLException alone = new SQLException("ORA-06508", "72000", 6508);
+        assertThat(PlsqlExceptionTranslator.isStateDiscarded(alone)).isTrue();
         SQLException wrapped = new SQLException("x", "72000", 6550, new SQLException("ORA-04061", "72000", 4061));
         assertThat(PlsqlExceptionTranslator.isStateDiscarded(wrapped)).isTrue();
         assertThat(PlsqlExceptionTranslator.isStateDiscarded(new SQLException("ORA-00942", "42000", 942))).isFalse();
+
+        // Причина проверяется и тогда, когда есть следующее исключение.
+        SQLException both = new SQLException("x", "72000", 6550, new SQLException("ORA-04068", "72000", 4068));
+        both.setNextException(new SQLException("ORA-06512", "72000", 6512));
+        assertThat(PlsqlExceptionTranslator.isStateDiscarded(both)).isTrue();
+
+        // Зацикленная цепочка не зависает.
+        SQLException a = new SQLException("a", "72000", 1);
+        SQLException b = new SQLException("b", "72000", 2);
+        a.setNextException(b);
+        b.setNextException(a);
+        assertThat(PlsqlExceptionTranslator.isStateDiscarded(a)).isFalse();
     }
 
     /**
