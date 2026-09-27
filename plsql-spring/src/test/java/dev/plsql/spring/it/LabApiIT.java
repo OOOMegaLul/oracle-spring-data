@@ -436,4 +436,17 @@ class LabApiIT {
         assertThat(api.empsPrefixed()).first()
                 .isEqualTo(new LabApi.Brief2(1, "Иванов", LocalDate.of(2020, 1, 15)));
     }
+    /**
+     * Проверяет записи внутри записей на настоящей базе: результат функции, туда и обратно через
+     * {@code IN OUT} (с {@code BOOLEAN} и кириллицей во вложенной записи) и поле
+     * {@code %ROWTYPE} внутри записи.
+     */
+    @Test
+    void recordsInsideRecords() {
+        assertThat(api.makePerson(7)).isEqualTo(new LabApi.Person(7L, "person 7", new LabApi.Addr("Омск", "Lenina 7", true)));
+        assertThat(api.personInout(new LabApi.Person(1L, "x", new LabApi.Addr("томск", "Мира 1", false))))
+                .isEqualTo(new LabApi.Person(2L, "x", new LabApi.Addr("ТОМСК", "Мира 1", true)));
+        assertThat(api.empCard(1)).isEqualTo(new LabApi.EmpCard(
+                new LabApi.Emp(1, "Иванов", LocalDate.of(2020, 1, 15), true), "card 1"));
+    }
 }

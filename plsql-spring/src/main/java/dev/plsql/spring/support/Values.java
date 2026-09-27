@@ -375,6 +375,37 @@ public final class Values {
     }
 
     /**
+     * Возвращает тип свойства, которое {@link #property} прочитает для имени PL/SQL: тип
+     * компонента record или getter'а бина, с параметрами типа. Нужна для проверок при старте
+     * вложенных записей.
+     *
+     * @param type      класс record или бина
+     * @param plsqlName имя поля записи или атрибута PL/SQL
+     * @return тип свойства или {@code null}, если свойства нет
+     */
+    public static ResolvableType propertyType(Class<?> type, String plsqlName) {
+        if (type.isRecord()) {
+            for (RecordComponent rc : type.getRecordComponents()) {
+                Arg a = rc.getAnnotation(Arg.class);
+                if (a != null ? a.value().equalsIgnoreCase(plsqlName) : matches(rc.getName(), plsqlName)) {
+                    return ResolvableType.forType(rc.getGenericType());
+                }
+            }
+            return null;
+        }
+        for (var pd : BeanUtils.getPropertyDescriptors(type)) {
+            if (pd.getReadMethod() == null || pd.getName().equals("class")) {
+                continue;
+            }
+            Arg a = argOf(type, pd);
+            if (a != null ? a.value().equalsIgnoreCase(plsqlName) : matches(pd.getName(), plsqlName)) {
+                return ResolvableType.forMethodReturnType(pd.getReadMethod());
+            }
+        }
+        return null;
+    }
+
+    /**
      * Находит {@link Arg} свойства бина: на поле с тем же именем (в классе или его предках), на
      * getter'е или на setter'е.
      *

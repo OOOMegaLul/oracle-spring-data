@@ -33,6 +33,9 @@ create or replace package lab_pkg as
   type str_ibt is table of varchar2(100) index by pls_integer;
   type rec_ibt is table of rec_t index by pls_integer;
   type long_ibt is table of varchar2(32767) index by pls_integer;
+  type addr_t is record (city varchar2(50), street varchar2(100), verified boolean);
+  type person_t is record (id number, name varchar2(100), addr addr_t);
+  type emp_card_t is record (emp lab_emp%rowtype, note varchar2(100));
 
   g_state varchar2(100);
   cursor c_emp is select id, name from lab_emp;
@@ -73,6 +76,9 @@ create or replace package lab_pkg as
   procedure long_out(p_n number, p_len number, p_vals out long_ibt);
   procedure emps_prefixed(p_cur out sys_refcursor);
   function xobj_id(p_obj lab_xobj) return number;
+  function make_person(p_id number) return person_t;
+  procedure person_inout(p_p in out person_t);
+  function emp_card(p_id number) return emp_card_t;
 end lab_pkg;
 /
 create or replace package body lab_pkg as
@@ -220,5 +226,28 @@ create or replace package body lab_pkg as
     open p_cur for select id nrn, name sname, hired dhired from lab_emp order by id;
   end;
   function xobj_id(p_obj lab_xobj) return number is begin return p_obj.id; end;
+  function make_person(p_id number) return person_t is
+    r person_t;
+  begin
+    r.id := p_id;
+    r.name := 'person ' || p_id;
+    r.addr.city := unistr('\041E\043C\0441\043A');
+    r.addr.street := 'Lenina ' || p_id;
+    r.addr.verified := p_id > 0;
+    return r;
+  end;
+  procedure person_inout(p_p in out person_t) is
+  begin
+    p_p.id := p_p.id + 1;
+    p_p.addr.city := upper(p_p.addr.city);
+    p_p.addr.verified := not p_p.addr.verified;
+  end;
+  function emp_card(p_id number) return emp_card_t is
+    r emp_card_t;
+  begin
+    select * into r.emp from lab_emp where id = p_id;
+    r.note := 'card ' || p_id;
+    return r;
+  end;
 end lab_pkg;
 /

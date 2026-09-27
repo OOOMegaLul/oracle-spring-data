@@ -501,13 +501,11 @@ public class DictionaryReader {
     /**
      * Читает атрибуты (поля) объектного типа SQL из {@code ALL_TYPE_ATTRS} в порядке объявления.
      *
-     * <p>Для каждого атрибута из {@code ALL_TYPES} берётся код типа ({@code TYPECODE}), чтобы
-     * отличить объект и коллекцию от встроенного типа, а из {@code ALL_COLL_TYPES} — вид
-     * коллекции, если атрибут сам коллекция. У встроенных типов ({@code NUMBER},
-     * {@code VARCHAR2}) владельца нет, и соединение с этими представлениями для них явно
-     * пропускается. Тип, объявленный через публичный синоним, словарь записывает с владельцем
-     * {@code PUBLIC} (так выглядит, например, {@code XMLTYPE}: {@code PUBLIC.XMLTYPE}); синоним
-     * раскрывается до настоящего типа ({@code SYS.XMLTYPE}).
+     * <p>Сначала один простой запрос к {@code ALL_TYPE_ATTRS}, затем для каждого атрибута
+     * пользовательского типа — короткие запросы по владельцу и имени ({@link #typedArg}). Соединять
+     * эти представления в одном запросе нельзя: на Oracle XE 11.2 соединение с
+     * {@code ALL_SYNONYMS} и {@code ALL_COLL_TYPES} выполнялось секунды на каждый тип, и чтение
+     * пакета с десятком объектных типов растягивалось на минуты.
      *
      * @param con   соединение, на котором читается словарь
      * @param owner схема типа
@@ -517,35 +515,30 @@ public class DictionaryReader {
      * @throws SQLException при ошибке обращения к словарю
      */
     private List<ArgumentInfo> typeAttributes(Connection con, String owner, String type, String inOut) throws SQLException {
-        String sql = """
-                select a.attr_name, nvl(s.table_owner, a.attr_type_owner), nvl(s.table_name, a.attr_type_name),
-                       t.typecode, c.coll_type
-                  from all_type_attrs a
-                  left join all_synonyms s on a.attr_type_owner = 'PUBLIC'
-                        and s.owner = 'PUBLIC' and s.synonym_name = a.attr_type_name
-                  left join all_types t on a.attr_type_owner is not null
-                        and t.owner = nvl(s.table_owner, a.attr_type_owner) and t.type_name = nvl(s.table_name, a.attr_type_name)
-                  left join all_coll_types c on a.attr_type_owner is not null
-                        and c.owner = nvl(s.table_owner, a.attr_type_owner) and c.type_name = nvl(s.table_name, a.attr_type_name)
-                 where a.owner = ? and a.type_name = ?
-                 order by a.attr_no""";
-        List<ArgumentInfo> out = new ArrayList<>();
-        try (PreparedStatement ps = con.prepareStatement(sql)) {
+        List<String[]> attrs = new ArrayList<>();
+        try (PreparedStatement ps = con.prepareStatement("""
+                select attr_name, attr_type_owner, attr_type_name from all_type_attrs
+                 where owner = ? and type_name = ?
+                 order by attr_no""")) {
             ps.setString(1, owner);
             ps.setString(2, type);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    out.add(sqlTypeArg(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4),
-                            rs.getString(5), inOut));
+                    attrs.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3)});
                 }
             }
+        }
+        List<ArgumentInfo> out = new ArrayList<>();
+        for (String[] a : attrs) {
+            out.add(typedArg(con, a[0], a[1], a[2], inOut));
         }
         return out;
     }
 
     /**
      * Читает тип элемента коллекции SQL ({@code TABLE OF} или {@code VARRAY}) из
-     * {@code ALL_COLL_TYPES}; публичный синоним типа элемента раскрывается, как у атрибутов.
+     * {@code ALL_COLL_TYPES}; тип элемента разбирается так же, как тип атрибута
+     * ({@link #typedArg}).
      *
      * @param con   соединение, на котором читается словарь
      * @param owner схема типа коллекции
@@ -555,23 +548,104 @@ public class DictionaryReader {
      * @throws SQLException при ошибке обращения к словарю
      */
     private ArgumentInfo collectionElement(Connection con, String owner, String type, String inOut) throws SQLException {
-        String sql = """
-                select nvl(s.table_owner, c.elem_type_owner), nvl(s.table_name, c.elem_type_name), t.typecode, cc.coll_type
-                  from all_coll_types c
-                  left join all_synonyms s on c.elem_type_owner = 'PUBLIC'
-                        and s.owner = 'PUBLIC' and s.synonym_name = c.elem_type_name
-                  left join all_types t on c.elem_type_owner is not null
-                        and t.owner = nvl(s.table_owner, c.elem_type_owner) and t.type_name = nvl(s.table_name, c.elem_type_name)
-                  left join all_coll_types cc on c.elem_type_owner is not null
-                        and cc.owner = nvl(s.table_owner, c.elem_type_owner) and cc.type_name = nvl(s.table_name, c.elem_type_name)
-                 where c.owner = ? and c.type_name = ?""";
-        try (PreparedStatement ps = con.prepareStatement(sql)) {
+        String elemOwner;
+        String elemName;
+        try (PreparedStatement ps = con.prepareStatement(
+                "select elem_type_owner, elem_type_name from all_coll_types where owner = ? and type_name = ?")) {
             ps.setString(1, owner);
             ps.setString(2, type);
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next()
-                        ? sqlTypeArg(null, rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), inOut)
-                        : null;
+                if (!rs.next()) {
+                    return null;
+                }
+                elemOwner = rs.getString(1);
+                elemName = rs.getString(2);
+            }
+        }
+        return typedArg(con, null, elemOwner, elemName, inOut);
+    }
+
+    /**
+     * Уже раскрытые публичные синонимы типов: {@code ALL_SYNONYMS} на XE отвечает медленно
+     * (около 0,6 с на запрос), а такие синонимы ({@code XMLTYPE}) встречаются в каждом типе,
+     * где есть атрибут этого типа.
+     */
+    private final Map<String, String[]> publicTypeSynonyms = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Описывает атрибут объекта или элемент коллекции по владельцу и имени его типа.
+     *
+     * <p>У встроенного типа ({@code NUMBER}, {@code VARCHAR2}) владельца нет, словарь не
+     * нужен. Тип, объявленный через публичный синоним, словарь записывает с владельцем
+     * {@code PUBLIC} (так выглядит, например, {@code XMLTYPE}: {@code PUBLIC.XMLTYPE}); синоним
+     * раскрывается до настоящего типа ({@code SYS.XMLTYPE}). Затем из {@code ALL_TYPES} берётся
+     * код типа, а для коллекции — её вид из {@code ALL_COLL_TYPES}.
+     *
+     * @param con       соединение, на котором читается словарь
+     * @param name      имя атрибута или {@code null} у элемента коллекции
+     * @param typeOwner владелец типа или {@code null} у встроенного
+     * @param typeName  имя типа
+     * @param inOut     направление, унаследованное от аргумента
+     * @return описание атрибута или элемента без вложенных строк
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private ArgumentInfo typedArg(Connection con, String name, String typeOwner, String typeName, String inOut)
+            throws SQLException {
+        if (typeOwner == null) {
+            return sqlTypeArg(name, null, typeName, null, null, inOut);
+        }
+        if ("PUBLIC".equals(typeOwner)) {
+            String[] target = publicTypeSynonyms.get(typeName);
+            if (target == null) {
+                target = synonymTarget(con, "PUBLIC", typeName);
+                if (target != null) {
+                    publicTypeSynonyms.put(typeName, target);
+                }
+            }
+            if (target != null && target[2] == null) {
+                typeOwner = target[0];
+                typeName = target[1];
+            }
+        }
+        String typecode = null;
+        try (PreparedStatement ps = con.prepareStatement(
+                "select typecode from all_types where owner = ? and type_name = ?")) {
+            ps.setString(1, typeOwner);
+            ps.setString(2, typeName);
+            try (ResultSet rs = ps.executeQuery()) {
+                typecode = rs.next() ? rs.getString(1) : null;
+            }
+        }
+        String collType = null;
+        if ("COLLECTION".equals(typecode)) {
+            try (PreparedStatement ps = con.prepareStatement(
+                    "select coll_type from all_coll_types where owner = ? and type_name = ?")) {
+                ps.setString(1, typeOwner);
+                ps.setString(2, typeName);
+                try (ResultSet rs = ps.executeQuery()) {
+                    collType = rs.next() ? rs.getString(1) : null;
+                }
+            }
+        }
+        return sqlTypeArg(name, typeOwner, typeName, typecode, collType, inOut);
+    }
+
+    /**
+     * Читает, куда ведёт синоним: владельца, имя и ссылку на другую базу.
+     *
+     * @param con     соединение, на котором читается словарь
+     * @param owner   владелец синонима ({@code PUBLIC} у публичного)
+     * @param synonym имя синонима
+     * @return {@code [владелец, имя, dblink]} цели или {@code null}, если синонима нет
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private static String[] synonymTarget(Connection con, String owner, String synonym) throws SQLException {
+        try (PreparedStatement ps = con.prepareStatement(
+                "select table_owner, table_name, db_link from all_synonyms where owner = ? and synonym_name = ?")) {
+            ps.setString(1, owner);
+            ps.setString(2, synonym);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? new String[]{rs.getString(1), rs.getString(2), rs.getString(3)} : null;
             }
         }
     }
@@ -716,55 +790,65 @@ public class DictionaryReader {
 
     /**
      * Находит таблицу или представление по имени так, как это делает компилятор PL/SQL в схеме
-     * {@code schema}: сначала объект самой схемы, затем её частный синоним, затем публичный
-     * синоним. Синоним раскрывается по цепочке, пока не дойдёт до таблицы.
+     * {@code schema}: сначала объект самой схемы (таблица, представление или её частный синоним),
+     * затем публичный синоним. Синоним раскрывается по цепочке, пока не дойдёт до таблицы.
      *
-     * <p>Каждый шаг — один запрос: три ветки {@code UNION ALL} упорядочены по приоритету, берётся
-     * первая строка.
+     * <p>Сначала спрашивается быстрое {@code ALL_OBJECTS}; к {@code ALL_SYNONYMS}, которое на XE
+     * отвечает около 0,6 с, запрос идёт, только если синоним там действительно есть. Обычный
+     * случай — {@code %ROWTYPE} таблицы своей схемы — обходится одним быстрым запросом.
      *
      * @param con            соединение, на котором читается словарь
      * @param schema         схема, в которой разрешается имя
      * @param name           имя без схемы
      * @param publicSynonyms искать ли публичные синонимы (только для имени, написанного без схемы)
      * @return {@code OWNER.TABLE} (имена в кавычках, если без них нельзя) или {@code null}, если
-     *         ничего не нашлось, синоним ведёт в
-     *         другую базу (dblink) или цепочка синонимов длиннее {@link #MAX_SYNONYM_HOPS}
+     *         ничего не нашлось, синоним ведёт в другую базу (dblink) или цепочка синонимов
+     *         длиннее {@link #MAX_SYNONYM_HOPS}
      * @throws SQLException при ошибке обращения к словарю
      */
     private static String resolveTable(Connection con, String schema, String name, boolean publicSynonyms)
             throws SQLException {
-        String sql = """
-                select 1, owner, object_name, cast(null as varchar2(128)) from all_objects
-                 where owner = ? and object_name = ? and object_type in ('TABLE', 'VIEW')
-                union all
-                select 2, table_owner, table_name, db_link from all_synonyms
-                 where owner = ? and synonym_name = ?
-                union all
-                select 3, table_owner, table_name, db_link from all_synonyms
-                 where owner = 'PUBLIC' and synonym_name = ? and ? = 'Y'
-                 order by 1""";
         for (int hop = 0; hop < MAX_SYNONYM_HOPS; hop++) {
-            try (PreparedStatement ps = con.prepareStatement(sql)) {
-                ps.setString(1, schema);
-                ps.setString(2, name);
-                ps.setString(3, schema);
-                ps.setString(4, name);
-                ps.setString(5, name);
-                ps.setString(6, publicSynonyms ? "Y" : "N");
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next() || rs.getString(4) != null) {
-                        return null;
-                    }
-                    if (rs.getInt(1) == 1) {
-                        return sqlName(schema, name);
-                    }
-                    schema = rs.getString(2);
-                    name = rs.getString(3);
-                    publicSynonyms = false; // у цели синонима схема указана всегда
-                }
+            String kind = objectKind(con, schema, name);
+            String[] target;
+            if ("TABLE".equals(kind) || "VIEW".equals(kind)) {
+                return sqlName(schema, name);
+            } else if ("SYNONYM".equals(kind)) {
+                target = synonymTarget(con, schema, name);
+            } else if (publicSynonyms && "SYNONYM".equals(objectKind(con, "PUBLIC", name))) {
+                target = synonymTarget(con, "PUBLIC", name);
+            } else {
+                return null;
             }
+            if (target == null || target[2] != null) {
+                return null;
+            }
+            schema = target[0];
+            name = target[1];
+            publicSynonyms = false; // у цели синонима схема указана всегда
         }
         return null;
+    }
+
+    /**
+     * Возвращает вид объекта схемы, которым может оказаться имя в {@code %ROWTYPE}.
+     *
+     * @param con    соединение, на котором читается словарь
+     * @param owner  схема ({@code PUBLIC} для публичных синонимов)
+     * @param name   имя
+     * @return {@code TABLE}, {@code VIEW}, {@code SYNONYM} или {@code null}, если такого нет
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private static String objectKind(Connection con, String owner, String name) throws SQLException {
+        try (PreparedStatement ps = con.prepareStatement("""
+                select min(object_type) from all_objects
+                 where owner = ? and object_name = ? and object_type in ('TABLE', 'VIEW', 'SYNONYM')""")) {
+            ps.setString(1, owner);
+            ps.setString(2, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
     }
 
     /**

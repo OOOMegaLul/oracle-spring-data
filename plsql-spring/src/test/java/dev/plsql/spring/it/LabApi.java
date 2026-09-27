@@ -602,4 +602,64 @@ public interface LabApi {
      * @return строки курсора
      */
     List<Brief2> empsPrefixed();
+    /**
+     * Адрес — вложенная запись {@code LAB_PKG.ADDR_T}.
+     *
+     * @param city     город
+     * @param street   улица
+     * @param verified проверен ли адрес ({@code BOOLEAN})
+     */
+    record Addr(String city, String street, Boolean verified) {
+    }
+
+    /**
+     * Человек — запись {@code LAB_PKG.PERSON_T} с вложенной записью {@code ADDR}.
+     *
+     * @param id   номер
+     * @param name имя
+     * @param addr адрес
+     */
+    record Person(Long id, String name, Addr addr) {
+    }
+
+    /**
+     * Карточка — запись {@code LAB_PKG.EMP_CARD_T}, поле которой — строка таблицы
+     * ({@code LAB_EMP%ROWTYPE}).
+     *
+     * @param emp  сотрудник
+     * @param note примечание
+     */
+    record EmpCard(Emp emp, String note) {
+    }
+
+    /**
+     * Вызывает функцию {@code LAB_PKG.MAKE_PERSON(P_ID) RETURN PERSON_T}.
+     *
+     * <p>Форма: запись внутри записи как результат функции.
+     *
+     * @param id номер
+     * @return человек с адресом
+     */
+    Person makePerson(long id);
+
+    /**
+     * Вызывает процедуру {@code LAB_PKG.PERSON_INOUT(P_P IN OUT PERSON_T)}: номер + 1, город в
+     * верхнем регистре, признак проверки наоборот.
+     *
+     * <p>Форма: запись внутри записи туда и обратно, с {@code BOOLEAN} во вложенной записи.
+     *
+     * @param p человек
+     * @return человек после процедуры
+     */
+    Person personInout(Person p);
+
+    /**
+     * Вызывает функцию {@code LAB_PKG.EMP_CARD(P_ID) RETURN EMP_CARD_T}.
+     *
+     * <p>Форма: поле записи — {@code %ROWTYPE} таблицы.
+     *
+     * @param id номер сотрудника
+     * @return карточка
+     */
+    EmpCard empCard(long id);
 }

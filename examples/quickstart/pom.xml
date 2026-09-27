@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Обычное приложение Spring Boot. Родитель включает флаг компилятора -parameters:
+       без него имена параметров методов не видны, и библиотека не сопоставит их с аргументами. -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.1</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.example</groupId>
+  <artifactId>hr-quickstart</artifactId>
+  <version>1.0</version>
+  <name>Oracle Spring Data: quickstart</name>
+
+  <properties>
+    <java.version>17</java.version>
+  </properties>
+
+  <!-- Библиотеку собирает JitPack из тега на GitHub. -->
+  <repositories>
+    <repository>
+      <id>jitpack.io</id>
+      <url>https://jitpack.io</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <!-- Пул соединений (HikariCP) и транзакции Spring. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <!-- Сама библиотека; драйвер Oracle (ojdbc10 + orai18n) она подтягивает сама. -->
+    <dependency>
+      <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
+      <artifactId>plsql-spring</artifactId>
+      <version>v0.3.0</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

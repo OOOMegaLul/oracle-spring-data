@@ -505,14 +505,37 @@ public class CallPlanner {
     /**
      * Проверяет, может ли поле записи пройти через переменную блока.
      *
-     * <p>Поддержаны скаляры, BOOLEAN и XMLTYPE; вложенные записи, коллекции, объектные типы и
-     * курсоры — нет.
+     * <p>Поддержаны скаляры, BOOLEAN, XMLTYPE и вложенные записи (в том числе {@code %ROWTYPE}),
+     * если их поля тоже поддержаны, на любую глубину: блок обращается к ним по пути
+     * {@code v1.ADDR.CITY}, а тип вложенной записи объявлять не нужно. Коллекции, объектные типы и
+     * курсоры в полях — нет.
      *
      * @param f поле записи
      * @return {@code true}, если поле поддержано
      */
     private static boolean fieldSupported(ArgumentInfo f) {
+        if (f.kind() == ArgKind.RECORD) {
+            return !f.children().isEmpty() && f.children().stream().allMatch(CallPlanner::fieldSupported);
+        }
         return f.kind().isScalar() || f.kind() == ArgKind.BOOLEAN || f.kind() == ArgKind.XMLTYPE;
+    }
+
+    /**
+     * Собирает неподдерживаемые поля записи, заходя во вложенные записи.
+     *
+     * @param rec  запись
+     * @param path путь до записи для сообщения: пусто у записи верхнего уровня, иначе
+     *             {@code ADDR.}
+     * @param out  список, куда добавляются строки вида {@code ADDR.GEO is PL/SQL TABLE}
+     */
+    private static void unsupportedFields(ArgumentInfo rec, String path, List<String> out) {
+        for (ArgumentInfo f : rec.children()) {
+            if (f.kind() == ArgKind.RECORD && !f.children().isEmpty()) {
+                unsupportedFields(f, path + f.name() + ".", out);
+            } else if (!fieldSupported(f)) {
+                out.add(path + f.name() + " is " + f.dataType());
+            }
+        }
     }
 
     /**
@@ -520,12 +543,15 @@ public class CallPlanner {
      *
      * @param rec запись, которой принадлежит поле
      * @param f   поле записи
-     * @throws PlanException если поле не скаляр, не BOOLEAN и не XMLTYPE
+     * @throws PlanException если поле (или поле вложенной записи) не скаляр, не BOOLEAN, не
+     *                       XMLTYPE и не запись из них
      */
     private static void checkField(ArgumentInfo rec, ArgumentInfo f) {
         if (!fieldSupported(f)) {
-            throw new PlanException("record " + rec.name() + " field " + f.name() + " is " + f.dataType()
-                    + "; only scalar, BOOLEAN and XMLTYPE fields are supported");
+            List<String> bad = new ArrayList<>();
+            unsupportedFields(rec, "", bad);
+            throw new PlanException("record " + rec.name() + " field " + String.join(", ", bad)
+                    + "; only scalar, BOOLEAN, XMLTYPE fields and records of them are supported");
         }
     }
 
@@ -586,11 +612,9 @@ public class CallPlanner {
                     if (a.declaredType() == null) {
                         issues.add(who + ": record type unknown");
                     }
-                    for (ArgumentInfo f : a.children()) {
-                        if (!fieldSupported(f)) {
-                            issues.add(who + ": record field " + f.name() + " is " + f.dataType());
-                        }
-                    }
+                    List<String> bad = new ArrayList<>();
+                    unsupportedFields(a, "", bad);
+                    bad.forEach(f -> issues.add(who + ": record field " + f));
                 }
                 case INDEX_TABLE -> {
                     ArgumentInfo el = a.children().isEmpty() ? null : a.children().get(0);
@@ -742,8 +766,9 @@ public class CallPlanner {
      *
      * <p>Для коллекции объектов SQL проверяется тип её элемента ({@code List<Obj>} — {@code Obj}).
      * {@code Object}, {@code Map} и коллекции без типа элемента ({@code List<?>}, {@code Object[]})
-     * не проверяются: что в них лежит, видно только при вызове. Вложенные объекты тоже не
-     * проверяются: тип их свойства здесь не известен.
+     * не проверяются: что в них лежит, видно только при вызове. Вложенные записи и объекты
+     * проверяются по типу свойства: пропавшее поле называется путём, например
+     * {@code ADDR.CITY}.
      *
      * @param a        аргумент PL/SQL
      * @param javaType тип Java, из которого возьмутся значения
@@ -765,8 +790,15 @@ public class CallPlanner {
         }
         List<String> missing = new ArrayList<>();
         for (ArgumentInfo f : a.children()) {
-            if (f.name() != null && !Values.hasProperty(raw, f.name())) {
+            if (f.name() == null) {
+                continue;
+            }
+            ResolvableType type = Values.propertyType(raw, f.name());
+            if (type == null) {
                 missing.add(f.name());
+            } else if (f.kind() == ArgKind.RECORD || f.kind() == ArgKind.OBJECT) {
+                // Вложенная запись или объект: те же правила для типа свойства.
+                missingProperties(f, type).forEach(m -> missing.add(f.name() + "." + m));
             }
         }
         return missing;

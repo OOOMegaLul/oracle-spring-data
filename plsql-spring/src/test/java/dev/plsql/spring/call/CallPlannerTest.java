@@ -394,6 +394,58 @@ class CallPlannerTest {
          * @return результат
          */
         BigDecimal objsAny(List<?> objs);
+
+        /**
+         * Адрес — вложенная запись.
+         *
+         * @param city город
+         * @param ok   проверен ли адрес ({@code BOOLEAN})
+         */
+        record Addr(String city, Boolean ok) {
+        }
+
+        /**
+         * Человек с вложенной записью-адресом.
+         *
+         * @param id   номер
+         * @param addr адрес
+         * @param name имя
+         */
+        record Person(Long id, Addr addr, String name) {
+        }
+
+        /**
+         * Запись с вложенной записью туда и обратно.
+         *
+         * @param p человек
+         * @return человек после процедуры
+         */
+        Person person(Person p);
+
+        /**
+         * Адрес без поля {@code OK}.
+         *
+         * @param city город
+         */
+        record ShortAddr(String city) {
+        }
+
+        /**
+         * Человек, у адреса которого не хватает поля.
+         *
+         * @param id   номер
+         * @param addr адрес
+         * @param name имя
+         */
+        record ShortPerson(Long id, ShortAddr addr, String name) {
+        }
+
+        /**
+         * Запись, у вложенной записи которой в Java не хватает поля.
+         *
+         * @param p человек
+         */
+        void shortPerson(ShortPerson p);
     }
 
     /**
@@ -880,5 +932,51 @@ class CallPlannerTest {
         Map<String, Supplier<Object>> m = new HashMap<>();
         m.put("NTENANT", null);
         assertThatThrownBy(() -> ArgumentDefaults.byName(m)).hasMessageContaining("NTENANT has no supplier");
+    }
+    /**
+     * Строит запись {@code PERSON_T} с вложенной записью {@code ADDR} ({@code CITY}, {@code OK}).
+     *
+     * @return описание аргумента {@code P_P IN OUT}
+     */
+    static ArgumentInfo personArg() {
+        return record("P_P", "IN/OUT", "PKG", "PERSON_T", field("ID", "NUMBER"),
+                record("ADDR", "IN/OUT", "PKG", "ADDR_T", field("CITY", "VARCHAR2"), field("OK", "PL/SQL BOOLEAN")),
+                field("NAME", "VARCHAR2"));
+    }
+
+    /**
+     * Проверяет запись внутри записи: поля вложенной записи идут по пути {@code v1.ADDR.CITY} в
+     * обе стороны (в том числе {@code BOOLEAN}), тип вложенной записи объявлять не нужно, а
+     * вложенная запись собирается раньше внешней. Значения на вход берутся из вложенного record.
+     */
+    @Test
+    void recordsInsideRecordsTravelByPath() {
+        CallPlan p = PLANNER.plan(m("person"), proc("PKG", "PERSON").add(personArg()).build());
+
+        assertThat(p.sql()).contains("v1 APP.PKG.PERSON_T;")
+                .doesNotContain("ADDR_T")
+                .contains("v1.ADDR.CITY := ?;")
+                .contains("v1.ADDR.OK := CASE ? WHEN 1 THEN TRUE WHEN 0 THEN FALSE END;")
+                .contains("? := v1.ADDR.CITY;")
+                .contains("? := CASE WHEN v1.ADDR.OK THEN 1 WHEN NOT v1.ADDR.OK THEN 0 END;");
+        assertThat(p.recordOuts()).containsExactly("P_P.ADDR", "P_P");
+        Object[] args = {new Api.Person(1L, new Api.Addr("Омск", true), "Ива")};
+        assertThat(p.binds()).filteredOn(b -> b.in() != null).extracting(b -> b.in().apply(args))
+                .containsExactly(1L, "Омск", true, "Ива");
+    }
+
+    /**
+     * Проверяет, что неподдерживаемое поле вложенной записи называется полным путём, а поле
+     * вложенной записи, для которого у вложенного record нет свойства, — ошибка при старте.
+     */
+    @Test
+    void nestedFieldsAreCheckedByPath() {
+        SubprogramInfo withTable = proc("PKG", "P").add(record("P_P", "IN", "PKG", "PERSON_T", field("ID", "NUMBER"),
+                record("ADDR", "IN", "PKG", "ADDR_T", field("CITY", "VARCHAR2"), field("TAGS", "PL/SQL TABLE")))).build();
+        assertThat(CallPlanner.supportIssues(withTable)).singleElement().asString()
+                .isEqualTo("P_P: record field ADDR.TAGS is PL/SQL TABLE");
+
+        assertThatThrownBy(() -> PLANNER.plan(m("shortPerson"), proc("PKG", "P").add(personArg()).build()))
+                .hasMessageContaining("has no property for [ADDR.OK] of P_P");
     }
 }

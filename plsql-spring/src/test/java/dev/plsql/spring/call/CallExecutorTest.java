@@ -472,4 +472,19 @@ class CallExecutorTest {
                 .hasMessageContaining("lower plsql.index-table-max-length to 1525");
         new CallExecutor(1_000).verify(out);
     }
+    /**
+     * Проверяет сборку вложенной записи: поля {@code P.ADDR.*} сначала складываются в карту
+     * {@code P.ADDR}, а она целиком ложится во внешнюю запись {@code P}.
+     */
+    @Test
+    void nestedRecordOutputsFoldIntoNestedMaps() {
+        Map<String, Object> outs = new java.util.LinkedHashMap<>();
+        outs.put("P.ID", 1);
+        outs.put("P.ADDR.CITY", "Омск");
+        outs.put("P.ADDR.OK", true);
+        outs.put("P.NAME", "Ива");
+        CallExecutor.foldRecords(outs, List.of("P.ADDR", "P"));
+        assertThat(outs).containsOnlyKeys("P");
+        assertThat(outs.get("P")).isEqualTo(Map.of("ID", 1, "ADDR", Map.of("CITY", "Омск", "OK", true), "NAME", "Ива"));
+    }
 }
