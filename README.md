@@ -216,6 +216,9 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
   по 100 — 1,1 с, по 500 — 0,3 с.
 - **`DBMS_OUTPUT`.** При `logging.level.dev.plsql.spring.support.DbmsOutput=DEBUG` строки
   `PUT_LINE` каждого вызова уходят в лог, и после ошибки тоже (+1,1 мс на вызов).
+- **Метрики.** С Spring Boot Actuator каждый вызов и запрос попадает в таймер `plsql.call` с
+  тегами `plsql.target`, `plsql.kind`, `error` (через Micrometer Observation, который приходит
+  вместе со Spring; с трассировкой — ещё и отрезки трассы).
 - **Настройки Boot** (`plsql.*`): `charset-policy` (`FAIL`/`IGNORE`), `database-charset`,
   `index-table-max-length`, `retry-discarded-state`, `query-timeout`, `fetch-size`. IDE подсказывает их в
   `application.properties` сама.

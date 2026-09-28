@@ -23,6 +23,7 @@ import dev.plsql.spring.support.CharsetGuard;
 import dev.plsql.spring.support.PlsqlApiInvocationHandler;
 import dev.plsql.spring.support.PlsqlExceptionTranslator;
 import dev.plsql.spring.support.PlsqlRuntime;
+import io.micrometer.observation.ObservationRegistry;
 
 /**
  * Создаёт реализации интерфейсов с аннотацией {@link PlsqlApi}. Пользователи Spring Boot
@@ -127,6 +128,8 @@ public final class PlsqlApiFactory {
         private int queryTimeout;
         /** Сколько строк курсора или запроса забирать за обращение к базе; {@code 0} — как у драйвера. */
         private int fetchSize = CallExecutor.DEFAULT_FETCH_SIZE;
+        /** Куда сообщать о вызовах; по умолчанию никуда. */
+        private ObservationRegistry observationRegistry = ObservationRegistry.NOOP;
         /** Источник соединений для чтения словаря и кодировки или {@code null} — выбрать самому. */
         private DataSource metadataDataSource;
 
@@ -300,6 +303,23 @@ public final class PlsqlApiFactory {
         }
 
         /**
+         * Задаёт, куда сообщать о каждом вызове процедуры и запросе {@code @SqlQuery}; по умолчанию
+         * никуда.
+         *
+         * <p>{@link ObservationRegistry} — реестр наблюдений Micrometer: Spring Boot Actuator
+         * превращает их в таймер {@code plsql.call} (сколько вызовов, сколько длились, сколько
+         * ошибок) и, если подключена трассировка, в отрезки трассы. Spring Boot передаёт свой
+         * реестр сам.
+         *
+         * @param registry реестр; не {@code null}
+         * @return этот же построитель
+         */
+        public Builder observationRegistry(ObservationRegistry registry) {
+            this.observationRegistry = Objects.requireNonNull(registry);
+            return this;
+        }
+
+        /**
          * Переводит срок в целые секунды для {@code Statement.setQueryTimeout}, округляя вверх.
          *
          * @param timeout срок; {@code null} — без ограничения
@@ -363,7 +383,7 @@ public final class PlsqlApiFactory {
                     : CharsetGuard.forDatabase(databaseCharset != null ? databaseCharset : readCharset(meta), charsetPolicy);
             return new PlsqlApiFactory(new PlsqlRuntime(dataSource, signatures, new CallPlanner(argumentDefaults),
                     new CallExecutor(indexTableMaxLength, guard, fetchSize), exceptionTranslator, guard,
-                    retryDiscardedState, queryTimeout, fetchSize));
+                    retryDiscardedState, queryTimeout, fetchSize, observationRegistry));
         }
 
         /**

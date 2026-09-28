@@ -28,6 +28,7 @@ import dev.plsql.spring.call.ArgumentDefaults;
 import dev.plsql.spring.meta.SignatureSource;
 import dev.plsql.spring.support.PlsqlApiFactoryBean;
 import dev.plsql.spring.support.PlsqlApiRegistrar;
+import io.micrometer.observation.ObservationRegistry;
 
 /**
  * Настраивает библиотеку в приложении Spring Boot без каких-либо аннотаций со стороны пользователя.
@@ -87,10 +88,12 @@ public class PlsqlAutoConfiguration {
     @ConditionalOnSingleCandidate(DataSource.class)
     PlsqlApiFactory plsqlApiFactory(DataSource dataSource, PlsqlProperties props,
                                     ObjectProvider<ArgumentDefaults> defaults,
-                                    ObjectProvider<SignatureSource> signatures) {
+                                    ObjectProvider<SignatureSource> signatures,
+                                    ObjectProvider<ObservationRegistry> observations) {
         PlsqlApiFactory.Builder b = props.applyTo(PlsqlApiFactory.builder(dataSource));
         defaults.ifAvailable(b::argumentDefaults);
         signatures.ifAvailable(b::signatureSource);
+        observations.ifAvailable(b::observationRegistry);
         return b.build();
     }
 

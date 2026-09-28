@@ -84,6 +84,12 @@
       <artifactId>logback-classic</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Таймеры из наблюдений: проверить, какую метрику увидит Actuator. -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-core</artifactId>
+      <scope>test</scope>
+    </dependency>
 
     <!-- Integration tests: a real Oracle (an existing one, or Testcontainers). -->
     <dependency>
