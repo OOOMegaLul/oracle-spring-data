@@ -877,4 +877,26 @@ class PlsqlApiInvocationHandlerTest {
         assertThat(ok.count()).isEqualTo(2);
         assertThat(failed.count()).isEqualTo(1);
     }
+
+    /**
+     * Проверяет тег запроса {@code @SqlQuery}: полное имя интерфейса и метода, чтобы одноимённые
+     * интерфейсы из разных пакетов не слились в одну метрику.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void queryTagHasTheFullInterfaceName() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.getUpdateCount()).thenReturn(1);
+        io.micrometer.core.instrument.simple.SimpleMeterRegistry meters = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        io.micrometer.observation.ObservationRegistry registry = io.micrometer.observation.ObservationRegistry.create();
+        registry.observationConfig().observationHandler(
+                new io.micrometer.core.instrument.observation.DefaultMeterObservationHandler(meters));
+
+        builder().observationRegistry(registry).build().create(Queries.class).touch(1);
+
+        assertThat(meters.get("plsql.call").tags("plsql.target", Queries.class.getName() + ".touch",
+                "plsql.kind", "query").timer().count()).isEqualTo(1);
+    }
 }

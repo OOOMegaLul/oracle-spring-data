@@ -93,7 +93,7 @@ public class PlsqlAutoConfiguration {
         PlsqlApiFactory.Builder b = props.applyTo(PlsqlApiFactory.builder(dataSource));
         defaults.ifAvailable(b::argumentDefaults);
         signatures.ifAvailable(b::signatureSource);
-        observations.ifAvailable(b::observationRegistry);
+        observations.ifUnique(b::observationRegistry); // метрики необязательны: два реестра — не причина падать
         return b.build();
     }
 
