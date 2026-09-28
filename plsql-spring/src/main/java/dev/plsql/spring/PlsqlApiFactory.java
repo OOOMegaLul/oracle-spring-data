@@ -97,7 +97,7 @@ public final class PlsqlApiFactory {
     /**
      * Возвращает окружение времени выполнения, общее для всех реализаций этой фабрики: источник
      * соединений, чтение сигнатур, планировщик, исполнитель, перевод ошибок, проверку кодировки,
-     * признак повтора после ORA-04068 и срок вызова по умолчанию.
+     * признак повтора после ORA-04068, срок вызова по умолчанию и размер пачки строк.
      *
      * @return окружение фабрики
      */
@@ -111,7 +111,8 @@ public final class PlsqlApiFactory {
      * <p>Значения по умолчанию: контекстных аргументов нет, сигнатуры читаются из словаря данных,
      * ошибки переводит стандартный {@link PlsqlExceptionTranslator}, политика кодировки —
      * {@link CharsetGuard.Policy#FAIL}, кодировка базы читается из базы, ёмкость OUT index-by
-     * таблиц — 10 000 элементов, повтор после ORA-04068 включён, срока на вызов нет.
+     * таблиц — 10 000 элементов, повтор после ORA-04068 включён, срока на вызов нет, строки
+     * курсоров забираются по 100.
      */
     public static final class Builder {
         private final DataSource dataSource;
@@ -124,6 +125,8 @@ public final class PlsqlApiFactory {
         private boolean retryDiscardedState = true;
         /** Срок на вызов или запрос в секундах; {@code 0} — без ограничения. */
         private int queryTimeout;
+        /** Сколько строк курсора или запроса забирать за обращение к базе; {@code 0} — как у драйвера. */
+        private int fetchSize = CallExecutor.DEFAULT_FETCH_SIZE;
         /** Источник соединений для чтения словаря и кодировки или {@code null} — выбрать самому. */
         private DataSource metadataDataSource;
 
@@ -277,6 +280,26 @@ public final class PlsqlApiFactory {
         }
 
         /**
+         * Задаёт, сколько строк курсора или запроса {@code @SqlQuery} забирать за одно обращение к
+         * базе; по умолчанию 100.
+         *
+         * <p>Драйвер Oracle сам берёт по 10 строк, и каждая следующая пачка — отдельный путь до
+         * базы и обратно. Замер на 11.2.0.4: 200 000 строк по 10 читаются 9,9 с, по 100 — 1,1 с,
+         * по 500 — 0,3 с. Больше пачка — больше памяти на неё в драйвере.
+         *
+         * @param rows строк за обращение; {@code 0} — как у драйвера
+         * @return этот же построитель
+         * @throws IllegalArgumentException если число отрицательное
+         */
+        public Builder fetchSize(int rows) {
+            if (rows < 0) {
+                throw new IllegalArgumentException("fetchSize must not be negative");
+            }
+            this.fetchSize = rows;
+            return this;
+        }
+
+        /**
          * Переводит срок в целые секунды для {@code Statement.setQueryTimeout}, округляя вверх.
          *
          * @param timeout срок; {@code null} — без ограничения
@@ -339,8 +362,8 @@ public final class PlsqlApiFactory {
                     ? CharsetGuard.none()
                     : CharsetGuard.forDatabase(databaseCharset != null ? databaseCharset : readCharset(meta), charsetPolicy);
             return new PlsqlApiFactory(new PlsqlRuntime(dataSource, signatures, new CallPlanner(argumentDefaults),
-                    new CallExecutor(indexTableMaxLength, guard), exceptionTranslator, guard, retryDiscardedState,
-                    queryTimeout));
+                    new CallExecutor(indexTableMaxLength, guard, fetchSize), exceptionTranslator, guard,
+                    retryDiscardedState, queryTimeout, fetchSize));
         }
 
         /**

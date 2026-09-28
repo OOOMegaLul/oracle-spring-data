@@ -66,6 +66,9 @@ class StreamsIT {
         Stream<Long> numbers(long count);
     }
 
+    /** Журнал теста: сюда пишется замер. */
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(StreamsIT.class);
+
     /** Пул из одного соединения. */
     static HikariDataSource ds;
     /** Реализация {@link Rows}. */
@@ -112,9 +115,11 @@ class StreamsIT {
      */
     @Test
     void queryStreams() {
+        long t0 = System.nanoTime();
         try (Stream<Long> s = rows.numbers(200_000)) {
             assertThat(s.mapToLong(Long::longValue).sum()).isEqualTo(200_000L * 200_001 / 2);
         }
+        log.info("200 000 rows streamed in {} ms", (System.nanoTime() - t0) / 1_000_000);
         try (Stream<Long> s = rows.numbers(1_000)) {
             assertThat(s.limit(3).toList()).isEqualTo(List.of(1L, 2L, 3L));
         }

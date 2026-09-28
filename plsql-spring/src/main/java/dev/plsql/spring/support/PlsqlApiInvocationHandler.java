@@ -811,18 +811,22 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     }
 
     /**
-     * Готовит оператор для запроса: текст, срок и значения параметров по порядку.
+     * Готовит оператор для запроса: текст, срок, размер пачки строк и значения параметров по
+     * порядку.
      *
      * @param sql     текст с {@code ?}
      * @param values  значения по порядку знаков {@code ?}
      * @param timeout срок в секундах; {@code 0} — без ограничения
      * @return создатель оператора для {@link JdbcTemplate}
      */
-    private static PreparedStatementCreator creator(String sql, Object[] values, int timeout) {
+    private PreparedStatementCreator creator(String sql, Object[] values, int timeout) {
         return c -> {
             PreparedStatement ps = c.prepareStatement(sql);
             if (timeout > 0) {
                 ps.setQueryTimeout(timeout);
+            }
+            if (rt.fetchSize() > 0) {
+                ps.setFetchSize(rt.fetchSize());
             }
             new ArgumentPreparedStatementSetter(values).setValues(ps);
             return ps;

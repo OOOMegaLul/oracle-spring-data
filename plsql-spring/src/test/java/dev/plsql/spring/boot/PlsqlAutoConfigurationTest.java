@@ -42,19 +42,23 @@ class PlsqlAutoConfigurationTest {
      * выключает проверку символов ({@code CharsetGuard.none()}), а
      * {@code retry-discarded-state=false} выключает повтор вызова после ORA-04068,
      * {@code query-timeout=1500ms} даёт срок две секунды (JDBC считает целыми секундами). Без
-     * свойства срока нет.
+     * свойства срока нет. {@code fetch-size=500} меняет размер пачки строк, по умолчанию он 100.
      */
     @Test
     void propertiesAreBound() {
         runner.withPropertyValues("plsql.charset-policy=IGNORE", "plsql.retry-discarded-state=false",
-                "plsql.query-timeout=1500ms").run(ctx -> {
+                "plsql.query-timeout=1500ms", "plsql.fetch-size=500").run(ctx -> {
             PlsqlApiFactory f = ctx.getBean(PlsqlApiFactory.class);
             assertThat(f.runtime().charsetGuard()).isSameAs(CharsetGuard.none());
             assertThat(f.runtime().retryDiscardedState()).isFalse();
             assertThat(f.runtime().queryTimeout()).isEqualTo(2);
+            assertThat(f.runtime().fetchSize()).isEqualTo(500);
         });
-        runner.withPropertyValues("plsql.charset-policy=IGNORE").run(ctx ->
-                assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().queryTimeout()).isZero());
+        runner.withPropertyValues("plsql.charset-policy=IGNORE").run(ctx -> {
+            PlsqlApiFactory f = ctx.getBean(PlsqlApiFactory.class);
+            assertThat(f.runtime().queryTimeout()).isZero();
+            assertThat(f.runtime().fetchSize()).isEqualTo(100);
+        });
     }
 
     /**

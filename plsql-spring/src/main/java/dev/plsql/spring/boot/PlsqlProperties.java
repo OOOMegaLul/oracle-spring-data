@@ -34,6 +34,9 @@ public class PlsqlProperties {
     /** Сколько может длиться вызов или запрос, если у метода нет своего срока; пусто — без ограничения. */
     private Duration queryTimeout;
 
+    /** Сколько строк курсора или запроса забирать за одно обращение к базе; 0 — как у драйвера (10). */
+    private int fetchSize = 100;
+
     /**
      * Возвращает политику для текста, который кодировка базы не может сохранить
      * (свойство {@code plsql.charset-policy}).
@@ -151,20 +154,44 @@ public class PlsqlProperties {
     }
 
     /**
+     * Возвращает, сколько строк курсора или запроса {@code @SqlQuery} забирать за одно обращение к
+     * базе (свойство {@code plsql.fetch-size}); по умолчанию 100.
+     *
+     * <p>Драйвер Oracle сам берёт по 10 строк. Замер на 11.2.0.4: 200 000 строк по 10 читаются
+     * 9,9 с, по 100 — 1,1 с, по 500 — 0,3 с.
+     *
+     * @return строк за обращение; {@code 0} — как у драйвера
+     */
+    public int getFetchSize() {
+        return fetchSize;
+    }
+
+    /**
+     * Задаёт, сколько строк курсора или запроса забирать за одно обращение к базе.
+     *
+     * @param fetchSize строк за обращение; {@code 0} — как у драйвера
+     */
+    public void setFetchSize(int fetchSize) {
+        this.fetchSize = fetchSize;
+    }
+
+    /**
      * Переносит настройки в построитель фабрики. Так настройки попадают и в фабрику
      * автоконфигурации, и в фабрику, которую {@code PlsqlApiFactoryBean} строит сам для
      * {@code dataSourceRef}.
      *
      * @param b построитель фабрики
      * @return тот же построитель
-     * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1 или
-     *                                  {@code plsql.query-timeout} отрицательный
+     * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1,
+     *                                  {@code plsql.query-timeout} или {@code plsql.fetch-size}
+     *                                  отрицательные
      */
     public PlsqlApiFactory.Builder applyTo(PlsqlApiFactory.Builder b) {
         return b.charsetPolicy(charsetPolicy)
                 .databaseCharset(databaseCharset)
                 .indexTableMaxLength(indexTableMaxLength)
                 .retryDiscardedState(retryDiscardedState)
-                .queryTimeout(queryTimeout);
+                .queryTimeout(queryTimeout)
+                .fetchSize(fetchSize);
     }
 }

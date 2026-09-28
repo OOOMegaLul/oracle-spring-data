@@ -43,12 +43,12 @@ public interface Hr {
 <dependency>
   <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
   <artifactId>plsql-spring</artifactId>
-  <version>v0.3.0</version>
+  <version>v0.4.0</version>
 </dependency>
 ```
 
 Gradle: `maven { url 'https://jitpack.io' }` и
-`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.3.0'`.
+`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.4.0'`.
 
 **Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
 у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
@@ -61,7 +61,10 @@ Gradle: `maven { url 'https://jitpack.io' }` и
 Java 17+, Spring Framework 6.2+/7, Spring Boot 3.5+/4 (необязательно). Драйвер ojdbc
 зафиксирован на ветке 19.x: драйверы 21 и 23 с сервером 11.2 официально не работают.
 `orai18n.jar` подтягивается сам. Без него ojdbc не входит в базу с однобайтовой
-кодировкой (CL8MSWIN1251 и т.п.) вообще: ORA-17056 уже на логине.
+кодировкой (CL8MSWIN1251 и т.п.) вообще: ORA-17056 уже на логине. Spring Boot назначает
+всем артефактам Oracle версию 23.x, поэтому в приложении на Boot добавьте
+`<oracle-database.version>19.32.0.0</oracle-database.version>` в `<properties>`: иначе
+`orai18n` придёт версии 23.x к драйверу 19.x.
 
 **ORA-01882 при подключении к 11.2.** ojdbc передаёт базе часовой пояс JVM по имени, а
 Oracle 11.2 не знает, например, `Etc/UTC` — пояс по умолчанию в Docker, Kubernetes и
@@ -106,7 +109,7 @@ Hr hr = factory.create(Hr.class);
 | Типы | тип параметра Java проверяется при старте: `LocalTime` в `DATE` или строка в `BLOB` — ошибка при старте, а не при вызове. У record или бина, который идёт в `RECORD` или объектный тип, должно быть свойство на каждое поле, иначе ошибка (или `NULL` с `nullForMissing = true`) |
 | Не переданные аргументы | с `DEFAULT` — пропускаются; контекстные (`NTENANT`...) — из бина `ArgumentDefaults`; остальные — ошибка при старте, либо `NULL` с `@Procedure(nullForMissing = true)` |
 | Перегрузки | выбирается та, чьи типы принимают типы параметров Java |
-| Результат | возврат функции; единственный OUT; несколько OUT → поля record, бина или `Map` (каждое поле record обязано совпасть с OUT-аргументом; одно число или строка для нескольких OUT — ошибка при старте); `Optional<T>`; `List`, `Set`; `void`. `NULL` в примитив (`long`, `boolean`...) — ошибка `EmptyResultDataAccessException`, как в Spring Data: для значения, которое может быть `NULL`, объявляйте `Long`, `Boolean` или `Optional`. OUT-аргументы, которые в результат не попадают (у функции или `void`-метода), читаются и отбрасываются |
+| Результат | возврат функции; единственный OUT; несколько OUT → поля record, бина или `Map` (каждое поле record обязано совпасть с OUT-аргументом; одно число или строка для нескольких OUT — ошибка при старте); `Optional<T>`; `List`, `Set`; `Stream<T>` для курсора (строки по одной; поток нужно закрыть); `void`. `NULL` в примитив (`long`, `boolean`...) — ошибка `EmptyResultDataAccessException`, как в Spring Data: для значения, которое может быть `NULL`, объявляйте `Long`, `Boolean` или `Optional`. OUT-аргументы, которые в результат не попадают (у функции или `void`-метода), читаются и отбрасываются |
 
 Вызов — анонимный блок с именованной нотацией, собранный один раз при старте:
 
@@ -128,7 +131,7 @@ END;
 | `BOOLEAN` | `boolean` | через переменную блока (на 11.2 JDBC не умеет); строка читается одинаково в обе стороны: `Y`/`N`, `TRUE`/`FALSE`, `1`/`0`, иное — ошибка, а не «ложь» |
 | `RECORD`, `%ROWTYPE` | record / бин / `Map` | поле за полем через переменную блока; поля: скаляры, `BOOLEAN`, `XMLTYPE` и вложенные записи на любую глубину (в Java — вложенный record); `%ROWTYPE` таблицы, синонима или курсора пакета |
 | `XMLTYPE` | `String`, `org.w3c.dom.Document` | через `CLOB` и переменную блока; `NULL` остаётся `NULL` (на 11.2 `XMLTYPE(NULL)` падает) |
-| `SYS_REFCURSOR` OUT / IN OUT / возврат | `List<record>` | колонки ложатся на компоненты по тем же правилам, что и аргументы: `BEGIN_DATE` → `beginDate`, `SNAME` → `name`, `@Arg("D_START")`; неоткрытый курсор — пустой список. Так же и строки `@SqlQuery` |
+| `SYS_REFCURSOR` OUT / IN OUT / возврат | `List<record>`, `Stream<record>` | колонки ложатся на компоненты по тем же правилам, что и аргументы: `BEGIN_DATE` → `beginDate`, `SNAME` → `name`, `@Arg("D_START")`; неоткрытый курсор — пустой список. Так же и строки `@SqlQuery` |
 | объектный тип SQL | record / бин | `java.sql.Struct`; атрибуты `CLOB`/`BLOB` читаются и освобождаются |
 | `TABLE OF` / `VARRAY` | `List`, массив (в том числе `long[]`) | `java.sql.Array` |
 | index-by таблица `NUMBER` / `VARCHAR2` | `List`, массив | `setPlsqlIndexTable`; длина строки до 32766 |
@@ -197,11 +200,31 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
   называется невалидным, а не «не найден»; невалидное или отсутствующее тело пакета даёт
   предупреждение. Словарь и кодировку фабрика читает мимо `SessionContextDataSource`: при
   старте поставщики пользователя не вызываются.
+- **Срок вызова.** `@Procedure(timeout = 30)`, `@SqlQuery(timeout = ...)` или общий
+  `plsql.query-timeout=30s`; внутри `@Transactional(timeout)` действует меньший из сроков.
+  Прерванный вызов — `QueryTimeoutException` (ORA-01013). Замер на 11.2.0.4: вызов на 5 с со
+  сроком 1 с прерван через 1,04 с. Если база за пробросом портов Docker Desktop, нужно
+  `oracle.net.disableOob=true`: «срочные» данные TCP, которыми драйвер прерывает вызов, там
+  теряются.
+- **Страницы.** `@SqlQuery` с параметром `Pageable` или `Sort` возвращает `Page`, `Slice` или
+  `List`; страница вырезается через `ROWNUM`, потому что 11g не знает `OFFSET ... FETCH`.
+  Имена в `Sort` проверяются, `?sort=` не подставит в SQL ничего, кроме имени колонки.
+- **`Stream`.** Курсор процедуры или `@SqlQuery` читается по строке; поток держит соединение,
+  пока его не закроют.
+- **Пачки строк.** Курсоры и `@SqlQuery` забирают строки по 100 за обращение к базе
+  (`plsql.fetch-size`), драйвер сам берёт по 10. Замер на 11.2.0.4: 200 000 строк по 10 — 9,9 с,
+  по 100 — 1,1 с, по 500 — 0,3 с.
+- **`DBMS_OUTPUT`.** При `logging.level.dev.plsql.spring.support.DbmsOutput=DEBUG` строки
+  `PUT_LINE` каждого вызова уходят в лог, и после ошибки тоже (+1,1 мс на вызов).
 - **Настройки Boot** (`plsql.*`): `charset-policy` (`FAIL`/`IGNORE`), `database-charset`,
-  `index-table-max-length`, `retry-discarded-state`.
+  `index-table-max-length`, `retry-discarded-state`, `query-timeout`, `fetch-size`. IDE подсказывает их в
+  `application.properties` сама.
 - **Лог.** `dev.plsql.spring=DEBUG` показывает сгенерированные блоки и время вызовов и
   запросов `@SqlQuery`. `PlsqlApiInvocationHandler.sqlOf(api, "method", типы...)` отдаёт блок
   метода в тестах.
+- **Spring Data на 11g.** Что работает у Spring Data JPA и JDBC рядом с библиотекой на Oracle
+  11g, а что нет (постраничный вывод, `IDENTITY`), проверено на 11.2.0.4 — в
+  [руководстве, раздел 19](docs/guide.md#19-рядом-со-spring-data-jpa-и-jdbc-на-oracle-11g).
 
 ## Сборка и тесты
 

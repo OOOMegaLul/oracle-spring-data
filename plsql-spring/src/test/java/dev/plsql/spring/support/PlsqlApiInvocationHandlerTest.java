@@ -637,6 +637,7 @@ class PlsqlApiInvocationHandlerTest {
         verify(cs, never()).setQueryTimeout(anyInt());
         t.update(1);
         verify(ps).setQueryTimeout(4);
+        verify(ps).setFetchSize(100); // строки запроса забираются по 100, а не по 10
 
         clearInvocations(cs);
         api.touch(1);
@@ -683,6 +684,7 @@ class PlsqlApiInvocationHandlerTest {
                 .hasMessageContaining("BadTimeout.touch: timeout = -5");
         assertThatThrownBy(() -> builder().queryTimeout(Duration.ofSeconds(-1)))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> builder().fetchSize(-1)).isInstanceOf(IllegalArgumentException.class);
     }
 
     /**

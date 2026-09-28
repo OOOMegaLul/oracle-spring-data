@@ -33,6 +33,8 @@ create or replace package body hr_api as
     insert into employees (id, full_name, hired)
     values (employees_seq.nextval, p_name, p_hired)
     returning id into p_id;
+    -- Отладочный вывод: при DEBUG библиотека переносит его в лог приложения.
+    dbms_output.put_line('hire: ' || p_name || ', id ' || p_id);
   end;
 
   function find_name(p_id number) return varchar2 is

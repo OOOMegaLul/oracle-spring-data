@@ -32,6 +32,9 @@ import dev.plsql.spring.meta.SignatureSource;
  *                            откатил, поэтому для данных это безопасно
  * @param queryTimeout        сколько секунд может длиться вызов или запрос, если на методе не
  *                            задан свой срок; {@code 0} — без ограничения
+ * @param fetchSize           сколько строк запроса {@code @SqlQuery} забирать за одно обращение к
+ *                            базе; {@code 0} — как у драйвера (10). Курсорам процедур тот же размер
+ *                            передан исполнителю при создании
  */
 public record PlsqlRuntime(
         DataSource dataSource,
@@ -41,5 +44,6 @@ public record PlsqlRuntime(
         PlsqlExceptionTranslator translator,
         CharsetGuard charsetGuard,
         boolean retryDiscardedState,
-        int queryTimeout) {
+        int queryTimeout,
+        int fetchSize) {
 }
