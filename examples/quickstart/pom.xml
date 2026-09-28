@@ -43,7 +43,7 @@
     <dependency>
       <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
       <artifactId>plsql-spring</artifactId>
-      <version>v0.3.0</version>
+      <version>v0.4.0</version>
     </dependency>
   </dependencies>
 
