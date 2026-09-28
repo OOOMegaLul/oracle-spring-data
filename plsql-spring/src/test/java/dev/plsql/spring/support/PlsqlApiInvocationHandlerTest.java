@@ -218,6 +218,18 @@ class PlsqlApiInvocationHandlerTest {
         int update(long id);
     }
 
+    /** Запрос, строки которого читаются потоком. */
+    @PlsqlApi(packageName = "PKG")
+    interface Streams {
+        /**
+         * Имена по одному.
+         *
+         * @return поток имён; его нужно закрыть
+         */
+        @SqlQuery("select name from t")
+        java.util.stream.Stream<String> names();
+    }
+
     /** Срок меньше {@code -1} — ошибка в аннотации. */
     @PlsqlApi(packageName = "PKG")
     interface BadTimeout {
@@ -717,5 +729,60 @@ class PlsqlApiInvocationHandlerTest {
         } finally {
             output.setLevel(Level.INFO);
         }
+    }
+
+    /**
+     * Проверяет поток {@code @SqlQuery}: соединение не возвращается в пул, пока поток открыт;
+     * строки читаются по одной; при закрытии потока закрываются результат и оператор, своя
+     * единица работы фиксируется, соединение уходит в пул.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void streamKeepsTheConnectionUntilClosed() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        java.sql.ResultSet rs = mock(java.sql.ResultSet.class);
+        java.sql.ResultSetMetaData md = mock(java.sql.ResultSetMetaData.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(rs.getMetaData()).thenReturn(md);
+        when(md.getColumnCount()).thenReturn(1);
+        when(rs.next()).thenReturn(true, true, false);
+        when(rs.getString(1)).thenReturn("a", "b");
+        when(con.getAutoCommit()).thenReturn(false);
+
+        java.util.stream.Stream<String> names = factory().create(Streams.class).names();
+        verify(con, never()).close();
+        assertThat(names.toList()).containsExactly("a", "b");
+        verify(con, never()).close();
+        names.close();
+
+        verify(rs).close();
+        verify(ps).close();
+        verify(con).commit();
+        verify(con).close();
+    }
+
+    /**
+     * Проверяет ошибку посреди чтения потока: она переводится в исключение Spring, а при закрытии
+     * своя единица работы откатывается, а не фиксируется.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void failedStreamRollsBack() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        java.sql.ResultSet rs = mock(java.sql.ResultSet.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(rs.next()).thenThrow(new SQLException("ORA-01555: snapshot too old", "72000", 1555));
+        when(con.getAutoCommit()).thenReturn(false);
+
+        try (java.util.stream.Stream<String> names = factory().create(Streams.class).names()) {
+            assertThatThrownBy(names::toList).isInstanceOf(org.springframework.dao.DataAccessException.class);
+        }
+        verify(con).rollback();
+        verify(con, never()).commit();
+        verify(con).close();
     }
 }

@@ -291,7 +291,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      *   <li>метод с {@code @SqlQuery} выполняет свой SQL;</li>
      *   <li>остальные методы вызывают процедуру по готовому плану.</li>
      * </ul>
-     * Время и запроса, и вызова пишется в лог на уровне DEBUG.
+     * Время и запроса, и вызова пишется в лог на уровне DEBUG. Метод, который возвращает
+     * {@code Stream}, получает открытый поток ({@code streamOfWork}): соединение возвращается в
+     * пул, когда поток закроют.
      * Запрос и вызов процедуры выполняются как единица работы ({@code unitOfWork}). Повтор после
      * ORA-04068 разрешён только для процедур и только если включён
      * {@link PlsqlRuntime#retryDiscardedState()}.
@@ -321,10 +323,17 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         String task = q != null ? describe(method) : plans.get(method).target().qualifiedName();
         int configured = timeouts.get(method);
         try {
+            if (q != null && q.stream()) {
+                return streamOfWork(task, q.sql(), false, con -> openQuery(con, q, args, timeout(configured)));
+            }
             if (q != null) {
                 return unitOfWork(task, q.sql(), false, con -> query(con, q, args, task, timeout(configured)));
             }
             CallPlan plan = plans.get(method);
+            if (plan.result().streams()) {
+                return streamOfWork(task, plan.sql(), rt.retryDiscardedState(),
+                        con -> rt.executor().open(con, plan, args, timeout(configured)));
+            }
             return unitOfWork(task, plan.sql(), rt.retryDiscardedState(),
                     con -> rt.executor().execute(con, plan, args, timeout(configured)));
         } catch (EmptyResultDataAccessException e) {
@@ -448,6 +457,103 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     }
 
     /**
+     * Открытие курсора на соединении: запрос {@code @SqlQuery} или вызов процедуры, чей результат
+     * читается потоком.
+     */
+    @FunctionalInterface
+    private interface Opener {
+        /**
+         * Выполняет запрос или вызов и отдаёт курсор открытым.
+         *
+         * @param con соединение единицы работы
+         * @return открытый курсор и его оператор
+         * @throws SQLException ошибка JDBC или базы
+         */
+        dev.plsql.spring.call.CallExecutor.OpenCursor open(Connection con) throws SQLException;
+    }
+
+    /**
+     * Выполняет запрос или вызов, результат которого — {@code Stream}: единица работы, как у
+     * {@link #unitOfWork}, но заканчивается она не здесь, а когда закроют поток.
+     *
+     * <p>Пока поток открыт, он держит курсор и соединение. При закрытии потока закрывается
+     * оператор, своя единица работы фиксируется (или откатывается, если чтение сорвалось),
+     * читается {@code DBMS_OUTPUT}, соединение возвращается в пул. Внутри транзакции Spring
+     * соединение остаётся у неё, и поток нужно дочитать до её конца. Ошибка до выдачи потока
+     * обрабатывается как в {@link #unitOfWork}, включая повтор после ORA-04068.
+     *
+     * @param task   название операции для сообщений об ошибке
+     * @param sql    текст блока или запроса, для сообщений об ошибке
+     * @param retry  повторять ли один раз после ORA-04068
+     * @param opener что выполнить
+     * @return поток строк; его нужно закрыть
+     */
+    private java.util.stream.Stream<Object> streamOfWork(String task, String sql, boolean retry, Opener opener) {
+        for (int attempt = 0; ; attempt++) {
+            Connection con = DataSourceUtils.getConnection(rt.dataSource());
+            boolean inTransaction = TransactionSynchronizationManager.isActualTransactionActive();
+            boolean own = false;
+            boolean output = false;
+            dev.plsql.spring.call.CallExecutor.OpenCursor cursor;
+            try {
+                output = DbmsOutput.wanted() && DbmsOutput.enable(con, task);
+                own = !inTransaction && !con.getAutoCommit();
+                cursor = opener.open(con);
+            } catch (SQLException e) {
+                rollbackQuietly(con, own);
+                finish(con, output, task);
+                if (retry && attempt == 0 && !inTransaction && PlsqlExceptionTranslator.isStateDiscarded(e)) {
+                    log.warn("{}: package state discarded (ORA-{}), calling again", task, e.getErrorCode());
+                    continue;
+                }
+                throw rt.translator().translate(task, sql, e);
+            } catch (RuntimeException | Error e) {
+                rollbackQuietly(con, own);
+                finish(con, output, task);
+                throw e;
+            }
+            boolean ownWork = own;
+            boolean readOutput = output;
+            return ResultStreams.of(cursor.rows(), cursor.element(), e -> rt.translator().translate(task, sql, e),
+                    failed -> {
+                        try {
+                            cursor.statement().close();
+                        } catch (SQLException e) {
+                            log.debug("{}: closing the statement failed", task, e);
+                        }
+                        if (failed) {
+                            rollbackQuietly(con, ownWork);
+                        } else if (ownWork) {
+                            try {
+                                con.commit();
+                            } catch (SQLException e) {
+                                throw rt.translator().translate(task, sql, e);
+                            } finally {
+                                finish(con, readOutput, task);
+                            }
+                            return;
+                        }
+                        finish(con, readOutput, task);
+                    });
+        }
+    }
+
+    /**
+     * Завершает работу с соединением: переносит {@code DBMS_OUTPUT} в журнал, если его читают, и
+     * возвращает соединение (вне транзакции Spring — в пул).
+     *
+     * @param con    соединение
+     * @param output читать ли {@code DBMS_OUTPUT}
+     * @param task   название операции для журнала
+     */
+    private void finish(Connection con, boolean output, String task) {
+        if (output) {
+            DbmsOutput.read(con, task);
+        }
+        DataSourceUtils.releaseConnection(con, rt.dataSource());
+    }
+
+    /**
      * Откатывает транзакцию, если её начал этот вызов, и не бросает исключений.
      *
      * <p>Ошибка отката только пишется в лог: наружу должна уйти исходная ошибка вызова, а не
@@ -487,10 +593,11 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @param noResult   метод объявлен как {@code void}: результат не нужен
      * @param paging     параметры {@code Pageable}/{@code Sort} и вид результата {@code Page}/{@code Slice}
      *                   или {@code null}, если метод не постраничный
+     * @param stream     метод возвращает {@code Stream}: строки читаются по одной, пока их берут
      */
     private record QueryPlan(String sql, ParsedSql parsed, String[] names, ResolvableType returnType,
                              boolean many, boolean optional, ResolvableType element, boolean noResult,
-                             QueryPaging.Spec paging) {
+                             QueryPaging.Spec paging, boolean stream) {
 
         /**
          * Разбирает SQL метода и определяет, как отдавать результат.
@@ -502,6 +609,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
          * которого у метода нет, исключение возникает здесь, при старте, а не при первом вызове.
          *
          * <p>По типу возврата: коллекция — все строки; {@code Optional} — одна строка или пусто;
+         * {@code Stream} — строки по одной, пока их берут;
          * иначе одна строка (или число изменённых строк для DML). Параметры {@code Pageable} и
          * {@code Sort} (Spring Data) в SQL не подставляются: по ним запрос оборачивается
          * постранично ({@link QueryPaging}), а результат может быть {@code Page} или {@code Slice}.
@@ -533,12 +641,13 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             ResolvableType rt = ResolvableType.forMethodReturnType(m);
             Class<?> raw = rt.resolve(Object.class);
             boolean pageOrSlice = paging != null && paging.result() != QueryPaging.Result.LIST;
+            boolean stream = raw == java.util.stream.Stream.class;
             boolean many = pageOrSlice || Collection.class.isAssignableFrom(raw);
             boolean optional = raw == Optional.class;
-            ResolvableType element = pageOrSlice ? rt.getGeneric(0)
+            ResolvableType element = pageOrSlice || stream ? rt.getGeneric(0)
                     : many ? rt.asCollection().getGeneric(0) : optional ? rt.getGeneric(0) : rt;
             boolean noResult = raw == void.class || raw == Void.class;
-            return new QueryPlan(sql, parsed, names, rt, many, optional, element, noResult, paging);
+            return new QueryPlan(sql, parsed, names, rt, many, optional, element, noResult, paging, stream);
         }
     }
 
@@ -582,19 +691,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      *         в кодировке базы
      */
     private Object query(Connection con, QueryPlan q, Object[] args, String task, int timeout) {
-        MapSqlParameterSource params = new MapSqlParameterSource();
-        for (int i = 0; i < q.names().length; i++) {
-            if (q.names()[i] == null) {
-                continue; // Pageable или Sort
-            }
-            Object v = args[i];
-            if (v instanceof CharSequence s) {
-                rt.charsetGuard().check(q.names()[i], s);
-            }
-            params.addValue(q.names()[i], v instanceof Enum<?> e ? e.name() : v);
-        }
-        String sql = NamedParameterUtils.substituteNamedParameters(q.parsed(), params);
-        Object[] values = NamedParameterUtils.buildValueArray(q.parsed(), params, null);
+        Bound bound = bind(q, args);
+        String sql = bound.sql();
+        Object[] values = bound.values();
         JdbcTemplate jdbc = new JdbcTemplate(new SingleConnectionDataSource(con, true));
         // Тот же перевод ошибок, что и у вызовов процедур: RAISE_APPLICATION_ERROR из триггера
         // здесь тоже бизнес-ошибка.
@@ -645,6 +744,70 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             }
             return q.optional() ? Optional.ofNullable(one) : Values.convert(one, q.element());
         });
+    }
+
+    /**
+     * Текст запроса с {@code ?} и значения параметров по порядку.
+     *
+     * @param sql    текст, в котором именованные параметры заменены на {@code ?}
+     * @param values значения по порядку знаков {@code ?}
+     */
+    private record Bound(String sql, Object[] values) {
+    }
+
+    /**
+     * Подставляет аргументы вызова в именованные параметры запроса.
+     *
+     * <p>Строки проверяет {@link CharsetGuard}: символ, которого нет в кодовой странице базы,
+     * останавливает вызов до отправки. {@code enum} передаётся своим именем. Параметры
+     * {@code Pageable} и {@code Sort} пропускаются: они меняют сам текст запроса.
+     *
+     * @param q    разобранный запрос
+     * @param args аргументы вызова в порядке параметров метода
+     * @return текст с {@code ?} и значения по порядку
+     * @throws CharsetGuard.UnrepresentableCharacterException если строку нельзя сохранить в
+     *         кодировке базы
+     */
+    private Bound bind(QueryPlan q, Object[] args) {
+        MapSqlParameterSource params = new MapSqlParameterSource();
+        for (int i = 0; i < q.names().length; i++) {
+            if (q.names()[i] == null) {
+                continue; // Pageable или Sort
+            }
+            Object v = args[i];
+            if (v instanceof CharSequence s) {
+                rt.charsetGuard().check(q.names()[i], s);
+            }
+            params.addValue(q.names()[i], v instanceof Enum<?> e ? e.name() : v);
+        }
+        return new Bound(NamedParameterUtils.substituteNamedParameters(q.parsed(), params),
+                NamedParameterUtils.buildValueArray(q.parsed(), params, null));
+    }
+
+    /**
+     * Выполняет запрос метода, который возвращает {@code Stream}, и отдаёт результат открытым.
+     *
+     * @param con     соединение единицы работы
+     * @param q       разобранный запрос
+     * @param args    аргументы вызова
+     * @param timeout срок в секундах; {@code 0} — без ограничения
+     * @return открытый результат и его оператор
+     * @throws SQLException ошибка JDBC или базы; оператор при этом уже закрыт
+     */
+    private dev.plsql.spring.call.CallExecutor.OpenCursor openQuery(Connection con, QueryPlan q, Object[] args, int timeout)
+            throws SQLException {
+        Bound bound = bind(q, args);
+        PreparedStatement ps = creator(bound.sql(), bound.values(), timeout).createPreparedStatement(con);
+        try {
+            return new dev.plsql.spring.call.CallExecutor.OpenCursor(ps.executeQuery(), ps, q.element());
+        } catch (SQLException | RuntimeException e) {
+            try {
+                ps.close();
+            } catch (SQLException c) {
+                e.addSuppressed(c);
+            }
+            throw e;
+        }
     }
 
     /**

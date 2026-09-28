@@ -120,26 +120,46 @@ public final class RowMappers {
      * @throws SQLException если драйвер не смог прочитать строку
      */
     static List<Object> mapAll(ResultSet rs, ResolvableType element, boolean hiddenLastColumn) throws SQLException {
-        Class<?> type = element.resolve(Map.class);
-        RowMapper<?> mapper = forType(type);
-        if (mapper instanceof ByName byName) {
-            mapper = byName.bound(rs.getMetaData(), hiddenLastColumn);
-        } else if (hiddenLastColumn && mapper == COLUMN_MAP) {
-            String hidden = JdbcUtils.lookupColumnName(rs.getMetaData(), rs.getMetaData().getColumnCount());
-            mapper = (r, n) -> {
-                Map<String, Object> row = COLUMN_MAP.mapRow(r, n);
-                row.remove(hidden);
-                return row;
-            };
-        } else if (hiddenLastColumn && mapper instanceof SingleColumnRowMapper<?>) {
-            mapper = new FirstColumn(type);
-        }
+        RowMapper<?> mapper = forResult(rs.getMetaData(), element, hiddenLastColumn);
         List<Object> rows = new ArrayList<>();
         int n = 0;
         while (rs.next()) {
             rows.add(mapper.mapRow(rs, n++));
         }
         return rows;
+    }
+
+    /**
+     * Возвращает преобразователь строк для результата с известными колонками.
+     *
+     * <p>Как {@link #forType}, но колонки для record и бина сопоставляются сразу, а последняя
+     * колонка может быть служебной (см. {@link #mapAll(ResultSet, ResolvableType, boolean)}).
+     *
+     * @param md               описание колонок результата
+     * @param element          тип одной строки; неизвестный тип даёт {@code Map}
+     * @param hiddenLastColumn не показывать последнюю колонку
+     * @return преобразователь строк этого результата
+     * @throws SQLException если драйвер не отдал описание колонок
+     */
+    static RowMapper<?> forResult(ResultSetMetaData md, ResolvableType element, boolean hiddenLastColumn)
+            throws SQLException {
+        Class<?> type = element.resolve(Map.class);
+        RowMapper<?> mapper = forType(type);
+        if (mapper instanceof ByName byName) {
+            return byName.bound(md, hiddenLastColumn);
+        }
+        if (hiddenLastColumn && mapper == COLUMN_MAP) {
+            String hidden = JdbcUtils.lookupColumnName(md, md.getColumnCount());
+            return (r, n) -> {
+                Map<String, Object> row = COLUMN_MAP.mapRow(r, n);
+                row.remove(hidden);
+                return row;
+            };
+        }
+        if (hiddenLastColumn && mapper instanceof SingleColumnRowMapper<?>) {
+            return new FirstColumn(type);
+        }
+        return mapper;
     }
 
     /**

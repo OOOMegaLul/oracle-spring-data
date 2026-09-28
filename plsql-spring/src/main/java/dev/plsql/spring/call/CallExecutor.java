@@ -142,6 +142,9 @@ public class CallExecutor {
      *                      сроку
      */
     public Object execute(Connection con, CallPlan plan, Object[] args, int timeoutSeconds) throws SQLException {
+        if (plan.result().streams()) {
+            return open(con, plan, args, timeoutSeconds);
+        }
         Object[] a = args == null ? new Object[0] : args;
         Map<String, Object> outs = new LinkedHashMap<>();
         List<Object> temporaries = new ArrayList<>();
@@ -185,6 +188,109 @@ public class CallExecutor {
         }
         foldRecords(outs, plan.recordOuts());
         return plan.result().assemble(outs);
+    }
+
+    /**
+     * Открытый курсор, строки которого ещё не прочитаны: результат метода, возвращающего
+     * {@code Stream}.
+     *
+     * <p>Вызывающий код читает {@code rows} по строке и потом обязан закрыть {@code statement}:
+     * пока он открыт, курсор держит ресурсы сессии, а соединение нельзя вернуть в пул.
+     *
+     * @param rows      строки курсора или {@code null}, если процедура его не открыла
+     * @param statement оператор, которому принадлежит курсор; закрыть после чтения
+     * @param element   тип одной строки
+     */
+    public record OpenCursor(ResultSet rows, java.sql.Statement statement, ResolvableType element) {
+    }
+
+    /**
+     * Выполняет план метода, который возвращает {@code Stream}, и отдаёт курсор-результат
+     * открытым.
+     *
+     * <p>Всё остальное — как у {@link #execute(Connection, CallPlan, Object[], int)}: значения
+     * проверяются до отправки, временные LOB освобождаются сразу после вызова, прочие выходы
+     * читаются (и освобождаются) и отбрасываются. Оператор при успехе не закрывается: его закроет
+     * тот, кто дочитает курсор. При ошибке он закрывается здесь.
+     *
+     * @param con            соединение, на котором выполняется вызов
+     * @param plan           план с результатом-{@code Stream}
+     * @param args           аргументы метода интерфейса
+     * @param timeoutSeconds предельное время в секундах; {@code 0} — без ограничения
+     * @return открытый курсор и его оператор
+     * @throws SQLException если драйвер или база сообщили об ошибке
+     */
+    public OpenCursor open(Connection con, CallPlan plan, Object[] args, int timeoutSeconds) throws SQLException {
+        Object[] a = args == null ? new Object[0] : args;
+        List<Object> temporaries = new ArrayList<>();
+        OracleConnection oc = con.unwrap(OracleConnection.class);
+        List<CallPlan.Bind> binds = plan.binds();
+        Object[] values = new Object[binds.size()];
+        for (int i = 0; i < binds.size(); i++) {
+            CallPlan.Bind b = binds.get(i);
+            if (b.in() != null) {
+                values[i] = b.in().apply(a);
+                precheck(b, values[i]);
+            }
+        }
+        CallableStatement cs = con.prepareCall(plan.sql());
+        Throwable failure = null;
+        try {
+            if (timeoutSeconds > 0) {
+                cs.setQueryTimeout(timeoutSeconds);
+            }
+            int cursor = -1;
+            for (int i = 0; i < binds.size(); i++) {
+                CallPlan.Bind b = binds.get(i);
+                if (b.in() != null) {
+                    bindIn(cs, oc, i + 1, b, values[i], temporaries);
+                }
+                if (b.outKey() != null) {
+                    registerOut(cs, i + 1, b);
+                    if (b.outKey().equals(plan.result().returnKey())) {
+                        cursor = i + 1;
+                    }
+                }
+            }
+            cs.execute();
+            for (int i = 0; i < binds.size(); i++) {
+                CallPlan.Bind b = binds.get(i);
+                if (b.outKey() != null && i + 1 != cursor) {
+                    readOut(cs, i + 1, b); // LOB освобождаются при чтении; значения не нужны
+                }
+            }
+            ResultSet rs = openedCursor(cs, cursor);
+            return new OpenCursor(rs, cs, plan.result().returnType().getGeneric(0));
+        } catch (SQLException | RuntimeException | Error e) {
+            failure = e;
+            try {
+                cs.close();
+            } catch (SQLException c) {
+                e.addSuppressed(c);
+            }
+            throw e;
+        } finally {
+            free(temporaries, failure);
+        }
+    }
+
+    /**
+     * Возвращает курсор OUT-позиции или {@code null}, если процедура его не открыла (ORA-24338).
+     *
+     * @param cs  выполненный вызов
+     * @param idx номер позиции курсора, с единицы
+     * @return строки курсора или {@code null}
+     * @throws SQLException если драйвер не смог отдать курсор
+     */
+    private static ResultSet openedCursor(CallableStatement cs, int idx) throws SQLException {
+        try {
+            return (ResultSet) cs.getObject(idx);
+        } catch (SQLException e) {
+            if (e.getErrorCode() == CURSOR_NOT_OPENED) {
+                return null;
+            }
+            throw e;
+        }
     }
 
     /**
@@ -777,15 +883,7 @@ public class CallExecutor {
      * @throws SQLException если драйвер не смог отдать курсор или прочитать строку
      */
     private static List<Object> readCursor(CallableStatement cs, int idx, ResolvableType target) throws SQLException {
-        ResultSet rs;
-        try {
-            rs = (ResultSet) cs.getObject(idx);
-        } catch (SQLException e) {
-            if (e.getErrorCode() == CURSOR_NOT_OPENED) {
-                return List.of();
-            }
-            throw e;
-        }
+        ResultSet rs = openedCursor(cs, idx);
         if (rs == null) {
             return List.of();
         }

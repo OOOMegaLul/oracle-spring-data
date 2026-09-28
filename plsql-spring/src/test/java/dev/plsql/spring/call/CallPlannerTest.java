@@ -164,6 +164,23 @@ class CallPlannerTest {
         List<Map<String, Object>> cursor(long minId);
 
         /**
+         * Строки курсора потоком: {@code PKG.CUR(P_MIN_ID, P_CUR OUT REF CURSOR)} или функция,
+         * которая возвращает курсор.
+         *
+         * @param minId идёт в {@code P_MIN_ID}
+         * @return поток строк
+         */
+        java.util.stream.Stream<Map<String, Object>> cursorStream(long minId);
+
+        /**
+         * Поток из функции, которая возвращает число, — ошибка.
+         *
+         * @param minId идёт в {@code P_MIN_ID}
+         * @return поток
+         */
+        java.util.stream.Stream<Long> numberStream(long minId);
+
+        /**
          * Перегруженная процедура {@code PKG.OVER(P_X, P_OUT OUT VARCHAR2)}, где {@code P_X} в одной
          * перегрузке {@code NUMBER}, в другой {@code VARCHAR2}; тип {@code long} выбирает первую.
          *
@@ -648,6 +665,22 @@ class CallPlannerTest {
         assertThat(p.sql()).contains("v1 SYS_REFCURSOR;").contains("P_CUR => v1").contains("? := v1;");
         assertThatThrownBy(() -> PLANNER.plan(m("cursor"), proc("PKG", "CUR").in("P_MIN_ID", "NUMBER").in("P_CUR", "REF CURSOR").build()))
                 .hasMessageContaining("IN REF CURSOR");
+    }
+
+    /**
+     * Проверяет {@code Stream}: он читает курсор — OUT-аргумент процедуры или результат функции;
+     * поток из функции, которая возвращает число, отвергается при старте.
+     */
+    @Test
+    void streamReadsACursor() {
+        CallPlan p = PLANNER.plan(m("cursorStream"),
+                proc("PKG", "CUR").in("P_MIN_ID", "NUMBER").out("P_CUR", "REF CURSOR").build());
+        assertThat(p.result().streams()).isTrue();
+        assertThat(PLANNER.plan(m("cursorStream"),
+                func("PKG", "CUR", "REF CURSOR").in("P_MIN_ID", "NUMBER").build()).result().streams()).isTrue();
+        assertThatThrownBy(() -> PLANNER.plan(m("numberStream"),
+                func("PKG", "NEXT", "NUMBER").in("P_MIN_ID", "NUMBER").build()))
+                .hasMessageContaining("returns Stream, but the function result is NUMBER");
     }
 
     /**

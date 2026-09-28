@@ -242,6 +242,19 @@ public class CallPlanner {
             }
         }
 
+        if (rawReturn == java.util.stream.Stream.class) {
+            String key = returnKey;
+            ArgumentInfo source = sp.isFunction() ? sp.returnValue()
+                    : outs.stream().filter(o -> o.name().equals(key)).findFirst().orElse(null);
+            if (source == null || source.kind() != ArgKind.REF_CURSOR) {
+                throw new PlanException("returns Stream, but " + (source == null ? "there is no single OUT argument"
+                        : (sp.isFunction() ? "the function result" : source.name()) + " is " + source.dataType())
+                        + "; a Stream reads a REF CURSOR row by row");
+            }
+        } else if (outTypes.values().stream().anyMatch(t -> t.resolve(Object.class) == java.util.stream.Stream.class)) {
+            throw new PlanException("a Stream can only be the whole result of the method, not a component");
+        }
+
         // Текст блока и привязки собираются по ходу обхода аргументов в порядке объявления.
         Block b = new Block();
         List<String> callArgs = new ArrayList<>();

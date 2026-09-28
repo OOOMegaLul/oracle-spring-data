@@ -77,6 +77,16 @@ public record CallPlan(
     public record Result(ResolvableType returnType, String returnKey, boolean outsToType) {
 
         /**
+         * Проверяет, возвращает ли метод {@code Stream}: тогда курсор под {@code returnKey}
+         * читается не сразу, а по строке, пока вызывающий код берёт их из потока.
+         *
+         * @return {@code true}, если тип результата — {@link java.util.stream.Stream}
+         */
+        public boolean streams() {
+            return returnType.resolve(Object.class) == java.util.stream.Stream.class;
+        }
+
+        /**
          * Собирает результат Java-метода из выходных значений вызова.
          *
          * <p>Для {@code void} возвращает {@code null}. Если {@code outsToType}, вся карта
