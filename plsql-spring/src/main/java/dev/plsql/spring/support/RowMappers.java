@@ -51,6 +51,23 @@ public final class RowMappers {
         }
     };
 
+    /**
+     * Преобразователи по именам колонок, по одному на класс строки: их планы сопоставления колонок
+     * (по списку колонок результата) так строятся один раз, а не при каждом запросе.
+     */
+    private static final ClassValue<ByName> BY_NAME = new ClassValue<>() {
+        /**
+         * Создаёт преобразователь для класса при первом обращении.
+         *
+         * @param type record или бин
+         * @return преобразователь по именам колонок
+         */
+        @Override
+        protected ByName computeValue(Class<?> type) {
+            return new ByName(type);
+        }
+    };
+
     /** Закрытый конструктор: класс — набор статических методов, экземпляры не создаются. */
     private RowMappers() {
     }
@@ -82,7 +99,7 @@ public final class RowMappers {
             return new SingleColumnRowMapper<>(type);
         }
         if (type.isRecord() || hasDefaultConstructor(type)) {
-            return new ByName(type);
+            return BY_NAME.get(type);
         }
         return DATA_CLASS.get(type);
     }

@@ -1,8 +1,10 @@
 package dev.plsql.spring.boot;
 
 import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.convert.DurationUnit;
 
 import dev.plsql.spring.PlsqlApiFactory;
 import dev.plsql.spring.support.CharsetGuard;
@@ -31,10 +33,16 @@ public class PlsqlProperties {
     /** Повторять вызов один раз после ORA-04068 (пакет перекомпилировали под живой сессией). */
     private boolean retryDiscardedState = true;
 
-    /** Сколько может длиться вызов или запрос, если у метода нет своего срока; пусто — без ограничения. */
+    /**
+     * Сколько может длиться вызов или запрос, если у метода нет своего срока; пусто — без ограничения.
+     * Число без единицы — секунды, как у @Procedure(timeout).
+     */
+    @DurationUnit(ChronoUnit.SECONDS)
     private Duration queryTimeout;
 
     /** Сколько строк курсора или запроса забирать за одно обращение к базе; 0 — как у драйвера (10). */
+    // Число, а не CallExecutor.DEFAULT_FETCH_SIZE: иначе описание для IDE теряет значение по
+    // умолчанию. Что они совпадают, проверяет PlsqlAutoConfigurationTest.
     private int fetchSize = 100;
 
     /**
@@ -131,7 +139,8 @@ public class PlsqlProperties {
 
     /**
      * Возвращает, сколько может длиться вызов процедуры или запрос {@code @SqlQuery}, если у метода
-     * нет своего срока (свойство {@code plsql.query-timeout}, например {@code 30s} или {@code 2m}).
+     * нет своего срока (свойство {@code plsql.query-timeout}, например {@code 30s} или {@code 2m}; число
+     * без единицы — секунды, как у {@code @Procedure(timeout)} и {@code @Transactional(timeout)}).
      *
      * <p>Когда срок выходит, драйвер прерывает вызов, и метод завершается
      * {@code QueryTimeoutException} (ORA-01013). По умолчанию срока нет. Внутри

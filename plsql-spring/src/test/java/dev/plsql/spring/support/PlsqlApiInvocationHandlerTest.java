@@ -228,6 +228,14 @@ class PlsqlApiInvocationHandlerTest {
          */
         @SqlQuery("select name from t")
         java.util.stream.Stream<String> names();
+
+        /**
+         * Имена множеством.
+         *
+         * @return множество имён
+         */
+        @SqlQuery("select name from t")
+        java.util.Set<String> nameSet();
     }
 
     /** Срок меньше {@code -1} — ошибка в аннотации. */
@@ -734,9 +742,9 @@ class PlsqlApiInvocationHandlerTest {
     }
 
     /**
-     * Проверяет поток {@code @SqlQuery}: соединение не возвращается в пул, пока поток открыт;
-     * строки читаются по одной; при закрытии потока закрываются результат и оператор, своя
-     * единица работы фиксируется, соединение уходит в пул.
+     * Проверяет поток {@code @SqlQuery}: соединение не возвращается в пул, пока поток открыт и не
+     * дочитан; строки читаются по одной; при закрытии недочитанного потока закрываются результат и
+     * оператор, своя единица работы фиксируется, соединение уходит в пул.
      *
      * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
      */
@@ -755,7 +763,8 @@ class PlsqlApiInvocationHandlerTest {
 
         java.util.stream.Stream<String> names = factory().create(Streams.class).names();
         verify(con, never()).close();
-        assertThat(names.toList()).containsExactly("a", "b");
+        java.util.Iterator<String> it = names.iterator();
+        assertThat(it.next()).isEqualTo("a");
         verify(con, never()).close();
         names.close();
 
@@ -786,5 +795,57 @@ class PlsqlApiInvocationHandlerTest {
         verify(con).rollback();
         verify(con, never()).commit();
         verify(con).close();
+    }
+
+    /**
+     * Проверяет {@code @SqlQuery} с результатом {@code Set}: строки превращаются в множество, а не
+     * отдаются списком (прокси тогда бросил бы {@code ClassCastException}).
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void querySetResultIsASet() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        java.sql.ResultSet rs = mock(java.sql.ResultSet.class);
+        java.sql.ResultSetMetaData md = mock(java.sql.ResultSetMetaData.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.execute()).thenReturn(true);
+        when(ps.getResultSet()).thenReturn(rs);
+        when(rs.getMetaData()).thenReturn(md);
+        when(md.getColumnCount()).thenReturn(1);
+        when(rs.next()).thenReturn(true, true, true, false);
+        when(rs.getString(1)).thenReturn("a", "b", "a");
+
+        assertThat(factory().create(Streams.class).nameSet()).containsExactlyInAnyOrder("a", "b");
+    }
+
+    /**
+     * Проверяет, что дочитанный до конца поток сам возвращает соединение, даже если его не закрыли
+     * ({@code toList()} без try-with-resources), а повторное закрытие ничего не ломает.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void exhaustedStreamReleasesTheConnection() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        java.sql.ResultSet rs = mock(java.sql.ResultSet.class);
+        java.sql.ResultSetMetaData md = mock(java.sql.ResultSetMetaData.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.executeQuery()).thenReturn(rs);
+        when(rs.getMetaData()).thenReturn(md);
+        when(md.getColumnCount()).thenReturn(1);
+        when(rs.next()).thenReturn(true, false);
+        when(rs.getString(1)).thenReturn("a");
+        when(con.getAutoCommit()).thenReturn(false);
+
+        java.util.stream.Stream<String> names = factory().create(Streams.class).names();
+        assertThat(names.toList()).containsExactly("a");
+        verify(ps).close();
+        verify(con).commit();
+        verify(con).close();
+
+        names.close();
+        verify(con, times(1)).close();
+        verify(con, times(1)).commit();
     }
 }

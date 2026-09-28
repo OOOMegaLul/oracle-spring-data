@@ -115,7 +115,7 @@ class QueryPagingTest {
      */
     @Test
     void sortCannotInjectSql() {
-        for (String bad : List.of("id; drop table t", "id\"", "a.b", "1id", "x".repeat(31), "id desc")) {
+        for (String bad : List.of("id; drop table t", "id\"", "a.b", "1id", "x".repeat(129), "id desc")) {
             assertThatThrownBy(() -> QueryPaging.orderBy(Sort.by(bad)))
                     .as(bad).isInstanceOf(InvalidDataAccessApiUsageException.class);
         }
@@ -144,9 +144,9 @@ class QueryPagingTest {
                 });
 
         assertThat(sqls.get(0)).isEqualTo("SELECT * FROM (SELECT q_.*, ROWNUM PLSQL_RN_ FROM (SELECT * FROM ("
-                + "select * from t where x = ?) q_ ORDER BY q_.\"X\" ASC) q_ WHERE ROWNUM <= ?) WHERE PLSQL_RN_ > ?");
+                + "select * from t where x = ?\n) q_ ORDER BY q_.\"X\" ASC\n) q_ WHERE ROWNUM <= ?) WHERE PLSQL_RN_ > ?");
         assertThat(binds.get(0)).containsExactly(7, 10L, 5L);
-        assertThat(sqls.get(1)).isEqualTo("SELECT COUNT(*) FROM (select * from t where x = ?)");
+        assertThat(sqls.get(1)).isEqualTo("SELECT COUNT(*) FROM (select * from t where x = ?\n)");
         assertThat(page.getTotalElements()).isEqualTo(23);
     }
 
@@ -195,5 +195,39 @@ class QueryPagingTest {
         assertThat(QueryPaging.run(new QueryPaging.Spec(0, -1, QueryPaging.Result.LIST),
                 "select 1 from dual", new Object[0], new Object[]{Pageable.unpaged()}, rows, (s, v) -> 0))
                 .isEqualTo(List.of("a", "b"));
+    }
+
+    /**
+     * Проверяет, что однострочный комментарий в конце запроса не съедает закрывающую скобку
+     * обёрток: перед каждой скобкой идёт перевод строки.
+     */
+    @Test
+    void trailingLineCommentDoesNotEatTheParenthesis() {
+        List<String> sqls = new ArrayList<>();
+        QueryPaging.run(new QueryPaging.Spec(0, -1, QueryPaging.Result.PAGE), "select x from t -- note",
+                new Object[0], new Object[]{PageRequest.of(0, 2, Sort.by("x"))},
+                (sql, values, hidden) -> {
+                    sqls.add(sql);
+                    return List.of("a", "b");
+                },
+                (sql, values) -> {
+                    sqls.add(sql);
+                    return 5;
+                });
+        assertThat(sqls).hasSize(2).allSatisfy(s -> assertThat(s).doesNotContain("-- note)"));
+        assertThat(sqls.get(0)).contains("-- note\n) q_ ORDER BY");
+        assertThat(sqls.get(1)).endsWith("-- note\n)");
+    }
+
+    /**
+     * Проверяет длину имени колонки: проверяется уже переведённое имя. Длинное имя свойства
+     * допустимо (Oracle 12.2+ знает имена до 128 символов), слишком длинное отвергается до базы.
+     */
+    @Test
+    void columnLengthIsCheckedAfterConversion() {
+        assertThat(QueryPaging.orderBy(Sort.by("employeeHireDateOfFirstContract")))
+                .isEqualTo("q_.\"EMPLOYEE_HIRE_DATE_OF_FIRST_CONTRACT\" ASC");
+        assertThatThrownBy(() -> QueryPaging.orderBy(Sort.by("a".repeat(129))))
+                .isInstanceOf(InvalidDataAccessApiUsageException.class);
     }
 }

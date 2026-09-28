@@ -24,7 +24,8 @@ import org.springframework.data.support.PageableExecutionUtils;
  *
  * <pre>
  * SELECT * FROM (
- *   SELECT q_.*, ROWNUM PLSQL_RN_ FROM (&lt;запрос&gt; ORDER BY ...) q_ WHERE ROWNUM &lt;= ?
+ *   SELECT q_.*, ROWNUM PLSQL_RN_ FROM (&lt;запрос&gt; ORDER BY ...
+ *   ) q_ WHERE ROWNUM &lt;= ?
  * ) WHERE PLSQL_RN_ &gt; ?
  * </pre>
  *
@@ -43,12 +44,18 @@ final class QueryPaging {
     static final String ROW_NUMBER = "PLSQL_RN_";
 
     /**
-     * Имя колонки, по которой разрешено сортировать: буква, затем буквы, цифры, {@code _ $ #}, до
-     * 30 символов, как у имени без кавычек в Oracle 11g. Имя из {@code Sort} часто приходит из
-     * адреса запроса ({@code ?sort=name}), поэтому всё остальное отвергается: так в текст SQL не
-     * попадёт ничего, кроме имени колонки.
+     * Имя свойства, по которому разрешено сортировать: буква, затем буквы, цифры, {@code _ $ #}.
+     * Имя из {@code Sort} часто приходит из адреса запроса ({@code ?sort=name}), поэтому всё
+     * остальное отвергается: так в текст SQL не попадёт ничего, кроме имени колонки.
      */
-    private static final Pattern COLUMN = Pattern.compile("[A-Za-z][A-Za-z0-9_$#]{0,29}");
+    private static final Pattern COLUMN = Pattern.compile("[A-Za-z][A-Za-z0-9_$#]*");
+
+    /**
+     * Самое длинное имя колонки, которое знает Oracle (12.2 и новее; в 11g — 30, и на слишком
+     * длинное имя база сама ответит ORA-00972). Проверяется имя уже после перевода
+     * {@code fullName} → {@code FULL_NAME}: перевод удлиняет его на подчёркивания.
+     */
+    private static final int MAX_COLUMN = 128;
 
     /** Во что превращается результат запроса. */
     enum Result {
@@ -183,7 +190,9 @@ final class QueryPaging {
         if (spec.sort() >= 0 && args[spec.sort()] != null) {
             sort = sort.and((Sort) args[spec.sort()]);
         }
-        String ordered = sort.isSorted() ? "SELECT * FROM (" + sql + ") q_ ORDER BY " + orderBy(sort) : sql;
+        // Перед каждой закрывающей скобкой — перевод строки: иначе однострочный комментарий
+        // в конце запроса ("... -- примечание") закомментировал бы и её.
+        String ordered = sort.isSorted() ? "SELECT * FROM (" + sql + "\n) q_ ORDER BY " + orderBy(sort) : sql;
         if (pageable.isUnpaged()) {
             List<Object> all = rows.fetch(ordered, values, false);
             return switch (spec.result()) {
@@ -196,7 +205,7 @@ final class QueryPaging {
         int size = pageable.getPageSize();
         long last = first + size + (spec.result() == Result.SLICE ? 1 : 0);
         String paged = "SELECT * FROM (SELECT q_.*, ROWNUM " + ROW_NUMBER + " FROM (" + ordered
-                + ") q_ WHERE ROWNUM <= ?) WHERE " + ROW_NUMBER + " > ?";
+                + "\n) q_ WHERE ROWNUM <= ?) WHERE " + ROW_NUMBER + " > ?";
         Object[] pagedValues = Arrays.copyOf(values, values.length + 2);
         pagedValues[values.length] = last;
         pagedValues[values.length + 1] = first;
@@ -208,7 +217,7 @@ final class QueryPaging {
                 yield new SliceImpl<>(more ? new ArrayList<>(content.subList(0, size)) : content, pageable, more);
             }
             case PAGE -> PageableExecutionUtils.getPage(content, pageable,
-                    () -> count.count("SELECT COUNT(*) FROM (" + sql + ")", values));
+                    () -> count.count("SELECT COUNT(*) FROM (" + sql + "\n)", values));
         };
     }
 
@@ -232,7 +241,12 @@ final class QueryPaging {
                 throw new InvalidDataAccessApiUsageException("cannot sort by '" + property
                         + "': only a column name of letters, digits and _ $ # is allowed");
             }
-            String column = "q_.\"" + PlsqlApiInvocationHandler.oracleName(property) + "\"";
+            String name = PlsqlApiInvocationHandler.oracleName(property);
+            if (name.length() > MAX_COLUMN) {
+                throw new InvalidDataAccessApiUsageException("cannot sort by '" + property + "': the column name "
+                        + name + " is longer than " + MAX_COLUMN + " characters");
+            }
+            String column = "q_.\"" + name + "\"";
             StringBuilder sb = new StringBuilder(o.isIgnoreCase() ? "UPPER(" + column + ")" : column);
             sb.append(o.isAscending() ? " ASC" : " DESC");
             switch (o.getNullHandling()) {

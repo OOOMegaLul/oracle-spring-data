@@ -62,6 +62,25 @@ class PlsqlAutoConfigurationTest {
     }
 
     /**
+     * Проверяет, что срок без единицы измерения — секунды, как у {@code @Procedure(timeout)} и
+     * {@code @Transactional(timeout)}: {@code plsql.query-timeout=30} — 30 секунд, а не 30 мс.
+     */
+    @Test
+    void bareQueryTimeoutIsSeconds() {
+        runner.withPropertyValues("plsql.charset-policy=IGNORE", "plsql.query-timeout=30").run(ctx ->
+                assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().queryTimeout()).isEqualTo(30));
+    }
+
+    /**
+     * Проверяет, что размер пачки строк по умолчанию в настройках Boot тот же, что у исполнителя:
+     * в {@code PlsqlProperties} он записан числом ради описания для IDE.
+     */
+    @Test
+    void defaultFetchSizeMatchesTheExecutor() {
+        assertThat(new PlsqlProperties().getFetchSize()).isEqualTo(dev.plsql.spring.call.CallExecutor.DEFAULT_FETCH_SIZE);
+    }
+
+    /**
      * Проверяет, что собственный бин {@link PlsqlApiFactory} приложения отменяет фабрику
      * автоконфигурации: в контексте ровно одна фабрика, и это {@code myFactory}. Собственная
      * фабрика собрана с политикой {@code IGNORE}, поэтому не запрашивает кодировку у мока.

@@ -30,6 +30,17 @@ import dev.plsql.spring.annotation.Arg;
 class RowMappersTest {
 
     /**
+     * Проверяет, что преобразователь record по именам колонок один на класс: иначе его план
+     * сопоставления колонок строился бы заново при каждом вызове.
+     */
+    @Test
+    void byNameMapperIsSharedPerClass() {
+        record Pair(long id, String name) {
+        }
+        assertThat(RowMappers.forType(Pair.class)).isSameAs(RowMappers.forType(Pair.class));
+    }
+
+    /**
      * Строка результата: {@code rn} ← {@code NRN} (типовой префикс), {@code name} ←
      * {@code SNAME}, {@code start} ← {@code D_START} через {@code @Arg}.
      *

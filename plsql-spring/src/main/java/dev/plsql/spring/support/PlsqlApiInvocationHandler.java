@@ -425,33 +425,23 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      */
     private Object unitOfWork(String task, String sql, boolean retry, Work work) {
         for (int attempt = 0; ; attempt++) {
-            Connection con = DataSourceUtils.getConnection(rt.dataSource());
-            boolean inTransaction = TransactionSynchronizationManager.isActualTransactionActive();
-            boolean own = false;
-            boolean output = false;
+            Unit u = new Unit();
             try {
-                output = DbmsOutput.wanted() && DbmsOutput.enable(con, task);
-                own = !inTransaction && !con.getAutoCommit();
-                Object result = work.run(con);
-                if (own) {
-                    con.commit();
-                }
+                u.begin(task);
+                Object result = work.run(u.con);
+                u.commit();
                 return result;
             } catch (SQLException e) {
-                rollbackQuietly(con, own);
-                if (retry && attempt == 0 && !inTransaction && PlsqlExceptionTranslator.isStateDiscarded(e)) {
-                    log.warn("{}: package state discarded (ORA-{}), calling again", task, e.getErrorCode());
+                u.rollbackQuietly();
+                if (u.retries(e, retry, attempt, task)) {
                     continue;
                 }
                 throw rt.translator().translate(task, sql, e);
             } catch (RuntimeException | Error e) {
-                rollbackQuietly(con, own);
+                u.rollbackQuietly();
                 throw e;
             } finally {
-                if (output) {
-                    DbmsOutput.read(con, task);
-                }
-                DataSourceUtils.releaseConnection(con, rt.dataSource());
+                u.finish(task);
             }
         }
     }
@@ -474,46 +464,40 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
 
     /**
      * Выполняет запрос или вызов, результат которого — {@code Stream}: единица работы, как у
-     * {@link #unitOfWork}, но заканчивается она не здесь, а когда закроют поток.
+     * {@link #unitOfWork}, но заканчивается она не здесь, а когда поток дочитан, сорвался на
+     * ошибке или закрыт — что случится раньше.
      *
-     * <p>Пока поток открыт, он держит курсор и соединение. При закрытии потока закрывается
-     * оператор, своя единица работы фиксируется (или откатывается, если чтение сорвалось),
-     * читается {@code DBMS_OUTPUT}, соединение возвращается в пул. Внутри транзакции Spring
-     * соединение остаётся у неё, и поток нужно дочитать до её конца. Ошибка до выдачи потока
-     * обрабатывается как в {@link #unitOfWork}, включая повтор после ORA-04068.
+     * <p>Пока поток открыт, он держит курсор и соединение. В конце закрывается оператор, своя
+     * единица работы фиксируется (или откатывается, если чтение сорвалось), читается
+     * {@code DBMS_OUTPUT}, соединение возвращается в пул. Внутри транзакции Spring соединение
+     * остаётся у неё, и поток нужно дочитать до её конца. Ошибка до выдачи потока обрабатывается
+     * как в {@link #unitOfWork}, включая повтор после ORA-04068.
      *
      * @param task   название операции для сообщений об ошибке
      * @param sql    текст блока или запроса, для сообщений об ошибке
      * @param retry  повторять ли один раз после ORA-04068
      * @param opener что выполнить
-     * @return поток строк; его нужно закрыть
+     * @return поток строк; брошенный недочитанным его нужно закрыть
      */
     private java.util.stream.Stream<Object> streamOfWork(String task, String sql, boolean retry, Opener opener) {
         for (int attempt = 0; ; attempt++) {
-            Connection con = DataSourceUtils.getConnection(rt.dataSource());
-            boolean inTransaction = TransactionSynchronizationManager.isActualTransactionActive();
-            boolean own = false;
-            boolean output = false;
+            Unit u = new Unit();
             dev.plsql.spring.call.CallExecutor.OpenCursor cursor;
             try {
-                output = DbmsOutput.wanted() && DbmsOutput.enable(con, task);
-                own = !inTransaction && !con.getAutoCommit();
-                cursor = opener.open(con);
+                u.begin(task);
+                cursor = opener.open(u.con);
             } catch (SQLException e) {
-                rollbackQuietly(con, own);
-                finish(con, output, task);
-                if (retry && attempt == 0 && !inTransaction && PlsqlExceptionTranslator.isStateDiscarded(e)) {
-                    log.warn("{}: package state discarded (ORA-{}), calling again", task, e.getErrorCode());
+                u.rollbackQuietly();
+                u.finish(task);
+                if (u.retries(e, retry, attempt, task)) {
                     continue;
                 }
                 throw rt.translator().translate(task, sql, e);
             } catch (RuntimeException | Error e) {
-                rollbackQuietly(con, own);
-                finish(con, output, task);
+                u.rollbackQuietly();
+                u.finish(task);
                 throw e;
             }
-            boolean ownWork = own;
-            boolean readOutput = output;
             return ResultStreams.of(cursor.rows(), cursor.element(), e -> rt.translator().translate(task, sql, e),
                     failed -> {
                         try {
@@ -521,55 +505,113 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                         } catch (SQLException e) {
                             log.debug("{}: closing the statement failed", task, e);
                         }
-                        if (failed) {
-                            rollbackQuietly(con, ownWork);
-                        } else if (ownWork) {
-                            try {
-                                con.commit();
-                            } catch (SQLException e) {
-                                throw rt.translator().translate(task, sql, e);
-                            } finally {
-                                finish(con, readOutput, task);
+                        try {
+                            if (failed) {
+                                u.rollbackQuietly();
+                            } else {
+                                u.commit();
                             }
-                            return;
+                        } catch (SQLException e) {
+                            throw rt.translator().translate(task, sql, e);
+                        } finally {
+                            u.finish(task);
                         }
-                        finish(con, readOutput, task);
                     });
         }
     }
 
     /**
-     * Завершает работу с соединением: переносит {@code DBMS_OUTPUT} в журнал, если его читают, и
-     * возвращает соединение (вне транзакции Spring — в пул).
-     *
-     * @param con    соединение
-     * @param output читать ли {@code DBMS_OUTPUT}
-     * @param task   название операции для журнала
+     * Одна единица работы: соединение и то, что с ним нужно сделать в конце. Общая часть
+     * {@link #unitOfWork} и {@link #streamOfWork}.
      */
-    private void finish(Connection con, boolean output, String task) {
-        if (output) {
-            DbmsOutput.read(con, task);
-        }
-        DataSourceUtils.releaseConnection(con, rt.dataSource());
-    }
+    private final class Unit {
 
-    /**
-     * Откатывает транзакцию, если её начал этот вызов, и не бросает исключений.
-     *
-     * <p>Ошибка отката только пишется в лог: наружу должна уйти исходная ошибка вызова, а не
-     * ошибка отката, которая бы её заслонила.
-     *
-     * @param con соединение
-     * @param own {@code true}, если единица работы принадлежит этому вызову; иначе ничего не делается
-     */
-    private static void rollbackQuietly(Connection con, boolean own) {
-        if (!own) {
-            return;
+        /** Соединение текущей транзакции Spring или только что взятое из пула. */
+        final Connection con;
+        /** Идёт ли транзакция Spring: тогда фиксирует и откатывает она, а повтора нет. */
+        final boolean inTransaction;
+        /** Единица работы своя: транзакции нет, а соединение с {@code autoCommit=false}. */
+        private boolean own;
+        /** Буфер {@code DBMS_OUTPUT} включён, и в конце его нужно прочитать. */
+        private boolean output;
+
+        /**
+         * Берёт соединение через {@link DataSourceUtils}: внутри транзакции Spring — её
+         * соединение, вне её — из пула.
+         */
+        Unit() {
+            this.con = DataSourceUtils.getConnection(rt.dataSource());
+            this.inTransaction = TransactionSynchronizationManager.isActualTransactionActive();
         }
-        try {
-            con.rollback();
-        } catch (SQLException e) {
-            log.warn("rollback failed", e);
+
+        /**
+         * Начинает работу: включает {@code DBMS_OUTPUT}, если его читают, и решает, своя ли это
+         * единица работы.
+         *
+         * @param task название операции для журнала
+         * @throws SQLException если драйвер не сообщил режим {@code autoCommit}
+         */
+        void begin(String task) throws SQLException {
+            output = DbmsOutput.wanted() && DbmsOutput.enable(con, task);
+            own = !inTransaction && !con.getAutoCommit();
+        }
+
+        /**
+         * Фиксирует свою единицу работы; внутри транзакции Spring ничего не делает.
+         *
+         * @throws SQLException если фиксация не удалась
+         */
+        void commit() throws SQLException {
+            if (own) {
+                con.commit();
+            }
+        }
+
+        /**
+         * Откатывает свою единицу работы и не бросает исключений: ошибка отката только пишется в
+         * лог, наружу должна уйти исходная ошибка вызова.
+         */
+        void rollbackQuietly() {
+            if (!own) {
+                return;
+            }
+            try {
+                con.rollback();
+            } catch (SQLException e) {
+                log.warn("rollback failed", e);
+            }
+        }
+
+        /**
+         * Решает, повторить ли работу после ошибки: только после сброса состояния пакета
+         * (ORA-04068 и родственные), только в первый раз, только если повтор включён и транзакции
+         * Spring нет. Повтор пишется в журнал.
+         *
+         * @param e       ошибка
+         * @param retry   включён ли повтор
+         * @param attempt номер попытки, с нуля
+         * @param task    название операции для журнала
+         * @return {@code true}, если работу нужно повторить на новом соединении
+         */
+        boolean retries(SQLException e, boolean retry, int attempt, String task) {
+            if (retry && attempt == 0 && !inTransaction && PlsqlExceptionTranslator.isStateDiscarded(e)) {
+                log.warn("{}: package state discarded (ORA-{}), calling again", task, e.getErrorCode());
+                return true;
+            }
+            return false;
+        }
+
+        /**
+         * Завершает работу: переносит {@code DBMS_OUTPUT} в журнал, если его читают, и возвращает
+         * соединение (вне транзакции Spring — в пул).
+         *
+         * @param task название операции для журнала
+         */
+        void finish(String task) {
+            if (output) {
+                DbmsOutput.read(con, task);
+            }
+            DataSourceUtils.releaseConnection(con, rt.dataSource());
         }
     }
 
@@ -705,11 +747,12 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             throw r; // свой переводчик может вернуть и не DataAccessException
         });
         if (q.paging() != null) {
-            return QueryPaging.run(q.paging(), sql, values, args,
+            Object result = QueryPaging.run(q.paging(), sql, values, args,
                     (s, v, hidden) -> jdbc.query(creator(s, v, timeout),
                             (ResultSetExtractor<List<Object>>) rs -> RowMappers.mapAll(rs, q.element(), hidden)),
                     (s, v) -> jdbc.query(creator(s, v, timeout),
                             (ResultSetExtractor<Long>) rs -> rs.next() ? rs.getLong(1) : 0L));
+            return result instanceof List<?> rows ? asReturn(rows, q.returnType()) : result;
         }
         return jdbc.execute(creator(sql, values, timeout), (PreparedStatementCallback<Object>) ps -> {
             if (!ps.execute()) {
@@ -731,7 +774,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 rows = RowMappers.mapAll(rs, q.element());
             }
             if (q.many()) {
-                return rows;
+                return asReturn(rows, q.returnType());
             }
             if (rows.size() > 1) {
                 throw new IncorrectResultSizeDataAccessException(1, rows.size());
@@ -744,6 +787,22 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             }
             return q.optional() ? Optional.ofNullable(one) : Values.convert(one, q.element());
         });
+    }
+
+    /**
+     * Отдаёт строки в том виде коллекции, который объявил метод.
+     *
+     * <p>Список подходит к {@code List}, {@code Collection} и {@code Iterable} как есть; для
+     * {@code Set} и прочих коллекций строки перекладываются в нужную (через {@link Values#convert}).
+     * Иначе прокси вернул бы список туда, где метод обещал множество, и вызов упал бы с
+     * {@code ClassCastException}.
+     *
+     * @param rows       прочитанные строки
+     * @param returnType тип результата метода
+     * @return строки в коллекции нужного вида
+     */
+    private static Object asReturn(List<?> rows, ResolvableType returnType) {
+        return returnType.resolve(Object.class).isInstance(rows) ? rows : Values.convert(rows, returnType);
     }
 
     /**

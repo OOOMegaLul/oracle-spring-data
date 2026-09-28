@@ -19,8 +19,9 @@ import org.springframework.jdbc.core.RowMapper;
  * вызывающий код их берёт.
  *
  * <p>Строки не копятся в памяти: в отличие от {@code List}, поток годится для выборок в миллионы
- * строк. Зато он держит курсор и соединение открытыми, пока его не закроют, поэтому поток нужно
- * закрывать, лучше всего через try-with-resources.
+ * строк. Зато он держит курсор и соединение открытыми, пока не дочитан до конца, не сорвался на
+ * ошибке или не закрыт. Поток, который бросили недочитанным ({@code findFirst}, {@code limit}),
+ * нужно закрыть, лучше всего через try-with-resources.
  */
 final class ResultStreams {
 
@@ -34,30 +35,23 @@ final class ResultStreams {
      * Создаёт поток строк.
      *
      * <p>Колонки сопоставляются с типом строки один раз, на первой строке. Ошибка JDBC при
-     * чтении превращается в исключение {@code translate}. При закрытии потока сначала закрывается
-     * {@code ResultSet}, затем вызывается {@code onClose} с признаком «чтение сорвалось»: по нему
-     * своя единица работы откатывается, а не фиксируется.
+     * чтении превращается в исключение {@code translate}. Ресурсы отпускаются один раз, как только
+     * строки кончились, чтение сорвалось или поток закрыли: сначала закрывается {@code ResultSet},
+     * затем вызывается {@code onClose} с признаком «чтение сорвалось» — по нему своя единица работы
+     * откатывается, а не фиксируется. Так дочитанный поток ({@code toList()}) возвращает соединение,
+     * даже если его забыли закрыть.
      *
      * @param rs        открытый результат или {@code null} (курсор не открыт — поток пуст)
      * @param element   тип одной строки
      * @param translate перевод ошибок JDBC в исключения Spring
-     * @param onClose   что сделать при закрытии потока; получает {@code true}, если чтение
-     *                  завершилось ошибкой
+     * @param onClose   что сделать в конце; получает {@code true}, если чтение завершилось
+     *                  ошибкой; вызывается один раз
      * @return поток строк; его нужно закрыть
      */
     static Stream<Object> of(ResultSet rs, ResolvableType element, Function<SQLException, RuntimeException> translate,
                              Consumer<Boolean> onClose) {
-        Rows rows = new Rows(rs, element, translate);
-        return StreamSupport.stream(rows, false).onClose(() -> {
-            if (rs != null) {
-                try {
-                    rs.close();
-                } catch (SQLException e) {
-                    log.debug("closing a result set failed", e);
-                }
-            }
-            onClose.accept(rows.failed);
-        });
+        Rows rows = new Rows(rs, element, translate, onClose);
+        return StreamSupport.stream(rows, false).onClose(rows::release);
     }
 
     /**
@@ -71,6 +65,10 @@ final class ResultStreams {
         private final ResolvableType element;
         /** Перевод ошибок JDBC. */
         private final Function<SQLException, RuntimeException> translate;
+        /** Что сделать в конце; получает признак «чтение сорвалось». */
+        private final Consumer<Boolean> onClose;
+        /** Ресурсы уже отпущены. */
+        private boolean released;
         /** Преобразователь строк; создаётся на первой строке, по её колонкам. */
         private RowMapper<?> mapper;
         /** Номер следующей строки, с нуля. */
@@ -84,12 +82,48 @@ final class ResultStreams {
          * @param rs        открытый результат или {@code null}
          * @param element   тип одной строки
          * @param translate перевод ошибок JDBC
+         * @param onClose   что сделать в конце
          */
-        Rows(ResultSet rs, ResolvableType element, Function<SQLException, RuntimeException> translate) {
+        Rows(ResultSet rs, ResolvableType element, Function<SQLException, RuntimeException> translate,
+             Consumer<Boolean> onClose) {
             super(Long.MAX_VALUE, Spliterator.ORDERED);
             this.rs = rs;
             this.element = element;
             this.translate = translate;
+            this.onClose = onClose;
+        }
+
+        /**
+         * Отпускает ресурсы один раз: закрывает {@code ResultSet} и вызывает {@code onClose}.
+         * Следующие вызовы ничего не делают.
+         */
+        void release() {
+            if (released) {
+                return;
+            }
+            released = true;
+            if (rs != null) {
+                try {
+                    rs.close();
+                } catch (SQLException e) {
+                    log.debug("closing a result set failed", e);
+                }
+            }
+            onClose.accept(failed);
+        }
+
+        /**
+         * Отпускает ресурсы после ошибки чтения; ошибка самого отпускания присоединяется к исходной.
+         *
+         * @param failure ошибка чтения, которая уйдёт наружу
+         */
+        private void releaseAfter(Throwable failure) {
+            failed = true;
+            try {
+                release();
+            } catch (RuntimeException e) {
+                failure.addSuppressed(e);
+            }
         }
 
         /**
@@ -100,11 +134,16 @@ final class ResultStreams {
          */
         @Override
         public boolean tryAdvance(Consumer<? super Object> action) {
+            if (released) {
+                return false;
+            }
             if (rs == null) {
+                release();
                 return false;
             }
             try {
                 if (!rs.next()) {
+                    release();
                     return false;
                 }
                 if (mapper == null) {
@@ -113,10 +152,11 @@ final class ResultStreams {
                 action.accept(mapper.mapRow(rs, n++));
                 return true;
             } catch (SQLException e) {
-                failed = true;
-                throw translate.apply(e);
+                RuntimeException t = translate.apply(e);
+                releaseAfter(t);
+                throw t;
             } catch (RuntimeException | Error e) {
-                failed = true;
+                releaseAfter(e);
                 throw e;
             }
         }

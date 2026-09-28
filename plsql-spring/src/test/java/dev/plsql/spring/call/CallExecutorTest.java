@@ -111,6 +111,14 @@ class CallExecutorTest {
          * @return атрибуты объекта
          */
         Map<String, Object> doc(long id);
+
+        /**
+         * Строки курсора потоком.
+         *
+         * @param minId наименьший номер
+         * @return поток строк
+         */
+        java.util.stream.Stream<Map<String, Object>> rows(long minId);
     }
 
     /**
@@ -486,5 +494,16 @@ class CallExecutorTest {
         CallExecutor.foldRecords(outs, List.of("P.ADDR", "P"));
         assertThat(outs).containsOnlyKeys("P");
         assertThat(outs.get("P")).isEqualTo(Map.of("ID", 1, "ADDR", Map.of("CITY", "Омск", "OK", true), "NAME", "Ива"));
+    }
+
+    /**
+     * Проверяет, что {@code execute} не отдаёт открытый курсор плана-{@code Stream}: такой план
+     * выполняет {@code open}, иначе оператор остался бы незакрытым у того, кто его не ждёт.
+     */
+    @Test
+    void executeRejectsStreamPlans() {
+        CallPlan p = planner.plan(m("rows"), proc(null, "ROWS").in("P_MIN_ID", "NUMBER").out("P_CUR", "REF CURSOR").build());
+        assertThatThrownBy(() -> new CallExecutor(100).execute(con, p, new Object[]{1L}))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("open");
     }
 }

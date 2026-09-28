@@ -47,7 +47,7 @@ class PagingIT {
          * @param pageable страница и сортировка
          * @return страница
          */
-        @SqlQuery("select level n, 'w' || level word from dual connect by level <= :count")
+        @SqlQuery("select level n, 'w' || level word from dual connect by level <= :count order by level")
         Page<Num> page(long count, Pageable pageable);
 
         /**
@@ -57,7 +57,7 @@ class PagingIT {
          * @param pageable страница
          * @return срез
          */
-        @SqlQuery("select level n, 'w' || level word from dual connect by level <= :count")
+        @SqlQuery("select level n, 'w' || level word from dual connect by level <= :count order by level")
         Slice<Num> slice(long count, Pageable pageable);
 
         /**
@@ -77,7 +77,7 @@ class PagingIT {
          * @param pageable страница
          * @return страница чисел
          */
-        @SqlQuery("select level from dual connect by level <= :count")
+        @SqlQuery("select level from dual connect by level <= :count order by level")
         Page<Long> plain(long count, Pageable pageable);
 
         /**
@@ -87,8 +87,29 @@ class PagingIT {
          * @param pageable страница
          * @return строки страницы
          */
-        @SqlQuery("select level n from dual connect by level <= :count")
+        @SqlQuery("select level n from dual connect by level <= :count order by level")
         List<Map<String, Object>> maps(long count, Pageable pageable);
+
+        /**
+         * Запрос, который кончается однострочным комментарием: обёртки страницы, сортировки и
+         * подсчёта не должны его ломать.
+         *
+         * @param count    сколько чисел
+         * @param pageable страница и сортировка
+         * @return страница
+         */
+        @SqlQuery("select level n, 'w' || level word from dual connect by level <= :count -- numbers")
+        Page<Num> commented(long count, Pageable pageable);
+
+        /**
+         * Числа множеством, в заданном порядке.
+         *
+         * @param count сколько чисел
+         * @param sort  сортировка
+         * @return множество чисел
+         */
+        @SqlQuery("select level from dual connect by level <= :count")
+        java.util.Set<Long> set(long count, Sort sort);
     }
 
     /** Пул к тестовой схеме. */
@@ -158,5 +179,21 @@ class PagingIT {
     void rowNumberColumnStaysHidden() {
         assertThat(numbers.plain(10, PageRequest.of(1, 3)).getContent()).containsExactly(4L, 5L, 6L);
         assertThat(numbers.maps(10, PageRequest.of(0, 2))).allSatisfy(m -> assertThat(m).containsOnlyKeys("N"));
+    }
+
+    /**
+     * Проверяет запрос с комментарием в конце: страница с сортировкой и подсчёт строк работают.
+     */
+    @Test
+    void trailingCommentIsHarmless() {
+        Page<Num> p = numbers.commented(12, PageRequest.of(1, 5, Sort.by(Sort.Direction.DESC, "n")));
+        assertThat(p.getContent()).extracting(Num::n).containsExactly(7L, 6L, 5L, 4L, 3L);
+        assertThat(p.getTotalElements()).isEqualTo(12);
+    }
+
+    /** Проверяет результат-множество у запроса с сортировкой. */
+    @Test
+    void setResult() {
+        assertThat(numbers.set(4, Sort.by("level"))).containsExactlyInAnyOrder(1L, 2L, 3L, 4L);
     }
 }

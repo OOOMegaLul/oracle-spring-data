@@ -43,12 +43,12 @@ public interface Hr {
 <dependency>
   <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
   <artifactId>plsql-spring</artifactId>
-  <version>v0.4.0</version>
+  <version>v0.4.1</version>
 </dependency>
 ```
 
 Gradle: `maven { url 'https://jitpack.io' }` и
-`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.4.0'`.
+`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.4.1'`.
 
 **Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
 у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
@@ -201,7 +201,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
   предупреждение. Словарь и кодировку фабрика читает мимо `SessionContextDataSource`: при
   старте поставщики пользователя не вызываются.
 - **Срок вызова.** `@Procedure(timeout = 30)`, `@SqlQuery(timeout = ...)` или общий
-  `plsql.query-timeout=30s`; внутри `@Transactional(timeout)` действует меньший из сроков.
+  `plsql.query-timeout=30s` (число без единицы — секунды); внутри `@Transactional(timeout)` действует меньший из сроков.
   Прерванный вызов — `QueryTimeoutException` (ORA-01013). Замер на 11.2.0.4: вызов на 5 с со
   сроком 1 с прерван через 1,04 с. Если база за пробросом портов Docker Desktop, нужно
   `oracle.net.disableOob=true`: «срочные» данные TCP, которыми драйвер прерывает вызов, там
@@ -210,7 +210,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
   `List`; страница вырезается через `ROWNUM`, потому что 11g не знает `OFFSET ... FETCH`.
   Имена в `Sort` проверяются, `?sort=` не подставит в SQL ничего, кроме имени колонки.
 - **`Stream`.** Курсор процедуры или `@SqlQuery` читается по строке; поток держит соединение,
-  пока его не закроют.
+  пока не дочитан до конца или не закрыт (брошенный недочитанным поток нужно закрыть).
 - **Пачки строк.** Курсоры и `@SqlQuery` забирают строки по 100 за обращение к базе
   (`plsql.fetch-size`), драйвер сам берёт по 10. Замер на 11.2.0.4: 200 000 строк по 10 — 9,9 с,
   по 100 — 1,1 с, по 500 — 0,3 с.
@@ -235,14 +235,14 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (154, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (162, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования.
 
 ```bash
 ./mvnw verify -Pit
 ```
 
-Интеграционные тесты (44) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
+Интеграционные тесты (47) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
 пересоздают при каждом запуске. Где взять базу:
 
 - по умолчанию одноразовый контейнер `gvenzl/oracle-xe:11-slim` (Testcontainers, нужен Docker);

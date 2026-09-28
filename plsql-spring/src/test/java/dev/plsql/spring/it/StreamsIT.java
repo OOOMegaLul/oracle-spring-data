@@ -128,6 +128,21 @@ class StreamsIT {
         }
     }
 
+    /**
+     * Проверяет, что дочитанный поток сам возвращает соединение, даже если его не закрыли: пул из
+     * одного соединения, три незакрытых {@code toList()} подряд и ещё один вызов.
+     */
+    @Test
+    void exhaustedStreamNeedsNoClose() {
+        for (int i = 0; i < 3; i++) {
+            assertThat(rows.emps(2).toList()).hasSize(2);
+            assertThat(rows.numbers(3).toList()).hasSize(3);
+        }
+        try (Stream<Long> s = rows.numbers(1)) {
+            assertThat(s.toList()).containsExactly(1L);
+        }
+    }
+
     /** Проверяет поток внутри транзакции Spring: соединение транзакции, чтение до её конца. */
     @Test
     void streamInsideATransaction() {

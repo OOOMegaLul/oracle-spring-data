@@ -162,40 +162,19 @@ public class CallExecutor {
      * @return значение, приведённое к типу результата метода, или {@code null} для {@code void}
      * @throws SQLException если драйвер или база сообщили об ошибке, в том числе о прерывании по
      *                      сроку
+     * @throws IllegalArgumentException если метод плана возвращает {@code Stream}: такой план
+     *                      выполняет {@link #open}
      */
     public Object execute(Connection con, CallPlan plan, Object[] args, int timeoutSeconds) throws SQLException {
         if (plan.result().streams()) {
-            return open(con, plan, args, timeoutSeconds);
+            throw new IllegalArgumentException(plan.target().qualifiedName()
+                    + ": the method returns a Stream; call open(), which leaves the cursor open for reading");
         }
-        Object[] a = args == null ? new Object[0] : args;
         Map<String, Object> outs = new LinkedHashMap<>();
         List<Object> temporaries = new ArrayList<>();
-        OracleConnection oc = con.unwrap(OracleConnection.class);
         Throwable failure = null;
-        List<CallPlan.Bind> binds = plan.binds();
-        // Значения вычисляются и текст проверяется до того, как что-либо уходит драйверу.
-        Object[] values = new Object[binds.size()];
-        for (int i = 0; i < binds.size(); i++) {
-            CallPlan.Bind b = binds.get(i);
-            if (b.in() != null) {
-                values[i] = b.in().apply(a);
-                precheck(b, values[i]);
-            }
-        }
-        try (CallableStatement cs = con.prepareCall(plan.sql())) {
-            if (timeoutSeconds > 0) {
-                cs.setQueryTimeout(timeoutSeconds);
-            }
-            for (int i = 0; i < binds.size(); i++) {
-                CallPlan.Bind b = binds.get(i);
-                if (b.in() != null) {
-                    bindIn(cs, oc, i + 1, b, values[i], temporaries);
-                }
-                if (b.outKey() != null) {
-                    registerOut(cs, i + 1, b);
-                }
-            }
-            cs.execute();
+        try (CallableStatement cs = run(con, plan, args, timeoutSeconds, temporaries)) {
+            List<CallPlan.Bind> binds = plan.binds();
             for (int i = 0; i < binds.size(); i++) {
                 CallPlan.Bind b = binds.get(i);
                 if (b.outKey() != null) {
@@ -241,10 +220,71 @@ public class CallExecutor {
      * @param timeoutSeconds предельное время в секундах; {@code 0} — без ограничения
      * @return открытый курсор и его оператор
      * @throws SQLException если драйвер или база сообщили об ошибке
+     * @throws IllegalArgumentException если метод плана не возвращает {@code Stream}
      */
     public OpenCursor open(Connection con, CallPlan plan, Object[] args, int timeoutSeconds) throws SQLException {
-        Object[] a = args == null ? new Object[0] : args;
+        if (!plan.result().streams()) {
+            throw new IllegalArgumentException(plan.target().qualifiedName()
+                    + ": the method does not return a Stream; call execute()");
+        }
         List<Object> temporaries = new ArrayList<>();
+        Throwable failure = null;
+        CallableStatement cs = null;
+        try {
+            cs = run(con, plan, args, timeoutSeconds, temporaries);
+            List<CallPlan.Bind> binds = plan.binds();
+            int cursor = -1;
+            for (int i = 0; i < binds.size(); i++) {
+                CallPlan.Bind b = binds.get(i);
+                if (b.outKey() == null) {
+                    continue;
+                }
+                if (b.outKey().equals(plan.result().returnKey())) {
+                    cursor = i + 1;
+                } else {
+                    readOut(cs, i + 1, b); // LOB освобождаются при чтении; значения не нужны
+                }
+            }
+            ResultSet rs = openedCursor(cs, cursor);
+            if (rs != null && fetchSize > 0) {
+                rs.setFetchSize(fetchSize);
+            }
+            return new OpenCursor(rs, cs, plan.result().returnType().getGeneric(0));
+        } catch (SQLException | RuntimeException | Error e) {
+            failure = e;
+            if (cs != null) {
+                try {
+                    cs.close();
+                } catch (SQLException c) {
+                    e.addSuppressed(c);
+                }
+            }
+            throw e;
+        } finally {
+            free(temporaries, failure);
+        }
+    }
+
+    /**
+     * Готовит и выполняет блок плана — общая часть {@link #execute(Connection, CallPlan, Object[], int)}
+     * и {@link #open}.
+     *
+     * <p>Значения вычисляются из аргументов метода, и текст проверяется на кодировку базы до того,
+     * как что-либо уходит драйверу. Затем блок готовится как {@link CallableStatement}, получает
+     * срок, у каждой позиции привязывается вход и регистрируется выход, блок выполняется. Если на
+     * любом шаге после подготовки случилась ошибка, оператор закрывается здесь же.
+     *
+     * @param con            соединение, на котором выполняется вызов
+     * @param plan           план вызова
+     * @param args           аргументы метода интерфейса; {@code null} для метода без параметров
+     * @param timeoutSeconds предельное время в секундах; {@code 0} — без ограничения
+     * @param temporaries    сюда складываются созданные временные LOB; освобождает их вызывающий
+     * @return выполненный оператор; выходы из него ещё не прочитаны
+     * @throws SQLException если драйвер или база сообщили об ошибке
+     */
+    private CallableStatement run(Connection con, CallPlan plan, Object[] args, int timeoutSeconds,
+                                  List<Object> temporaries) throws SQLException {
+        Object[] a = args == null ? new Object[0] : args;
         OracleConnection oc = con.unwrap(OracleConnection.class);
         List<CallPlan.Bind> binds = plan.binds();
         Object[] values = new Object[binds.size()];
@@ -256,12 +296,10 @@ public class CallExecutor {
             }
         }
         CallableStatement cs = con.prepareCall(plan.sql());
-        Throwable failure = null;
         try {
             if (timeoutSeconds > 0) {
                 cs.setQueryTimeout(timeoutSeconds);
             }
-            int cursor = -1;
             for (int i = 0; i < binds.size(); i++) {
                 CallPlan.Bind b = binds.get(i);
                 if (b.in() != null) {
@@ -269,33 +307,17 @@ public class CallExecutor {
                 }
                 if (b.outKey() != null) {
                     registerOut(cs, i + 1, b);
-                    if (b.outKey().equals(plan.result().returnKey())) {
-                        cursor = i + 1;
-                    }
                 }
             }
             cs.execute();
-            for (int i = 0; i < binds.size(); i++) {
-                CallPlan.Bind b = binds.get(i);
-                if (b.outKey() != null && i + 1 != cursor) {
-                    readOut(cs, i + 1, b); // LOB освобождаются при чтении; значения не нужны
-                }
-            }
-            ResultSet rs = openedCursor(cs, cursor);
-            if (rs != null && fetchSize > 0) {
-                rs.setFetchSize(fetchSize);
-            }
-            return new OpenCursor(rs, cs, plan.result().returnType().getGeneric(0));
+            return cs;
         } catch (SQLException | RuntimeException | Error e) {
-            failure = e;
             try {
                 cs.close();
             } catch (SQLException c) {
                 e.addSuppressed(c);
             }
             throw e;
-        } finally {
-            free(temporaries, failure);
         }
     }
 
