@@ -914,10 +914,10 @@ public class CallExecutor {
         if (rs == null) {
             return List.of();
         }
-        if (fetchSize > 0) {
-            rs.setFetchSize(fetchSize);
-        }
         try (rs) {
+            if (fetchSize > 0) {
+                rs.setFetchSize(fetchSize);
+            }
             return RowMappers.mapAll(rs, elementType(target));
         }
     }

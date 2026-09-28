@@ -812,7 +812,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
 
     /**
      * Готовит оператор для запроса: текст, срок, размер пачки строк и значения параметров по
-     * порядку.
+     * порядку. Если значение не удалось передать, оператор закрывается здесь же: иначе он остался
+     * бы открытым курсором в сессии.
      *
      * @param sql     текст с {@code ?}
      * @param values  значения по порядку знаков {@code ?}
@@ -822,14 +823,24 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     private PreparedStatementCreator creator(String sql, Object[] values, int timeout) {
         return c -> {
             PreparedStatement ps = c.prepareStatement(sql);
-            if (timeout > 0) {
-                ps.setQueryTimeout(timeout);
+            try {
+                if (timeout > 0) {
+                    ps.setQueryTimeout(timeout);
+                }
+                if (rt.fetchSize() > 0) {
+                    ps.setFetchSize(rt.fetchSize());
+                }
+                new ArgumentPreparedStatementSetter(values).setValues(ps);
+                return ps;
+            } catch (SQLException | RuntimeException e) {
+                // Оператор ещё никому не отдан: закрыть его, кроме нас, некому.
+                try {
+                    ps.close();
+                } catch (SQLException c2) {
+                    e.addSuppressed(c2);
+                }
+                throw e;
             }
-            if (rt.fetchSize() > 0) {
-                ps.setFetchSize(rt.fetchSize());
-            }
-            new ArgumentPreparedStatementSetter(values).setValues(ps);
-            return ps;
         };
     }
 
