@@ -674,7 +674,7 @@ Observation, который и так приходит вместе со Spring,
 
 | Тег | Значение |
 |---|---|
-| `plsql.target` | процедура (`HR_DEMO.HR_API.HIRE`) или метод запроса (`HrApi.find`) |
+| `plsql.target` | процедура (`HR_DEMO.HR_API.HIRE`) или метод запроса с полным именем интерфейса (`com.example.hr.HrApi.find`) |
 | `plsql.kind` | `call` — процедура, `query` — `@SqlQuery` |
 | `error` | `none` или имя исключения (`PlsqlBusinessException`, `QueryTimeoutException`...) |
 
@@ -685,7 +685,8 @@ Observation, который и так приходит вместе со Spring,
 У метода, который возвращает `Stream`, таймер меряет только открытие курсора: сколько строк и как
 долго потом читал ваш код, библиотеке не видно.
 
-Без Spring Boot реестр передаётся в построитель:
+Если в приложении два реестра наблюдений и ни один не помечен `@Primary`, библиотека не выбирает
+сама и метрик не пишет. Без Spring Boot реестр передаётся в построитель:
 `PlsqlApiFactory.builder(ds).observationRegistry(registry)`.
 
 ## 13. Несколько баз

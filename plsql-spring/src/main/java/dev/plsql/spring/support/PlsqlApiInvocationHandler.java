@@ -74,7 +74,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
 
     /**
      * Имя наблюдения Micrometer за вызовом: Spring Boot Actuator делает из него таймер
-     * {@code plsql.call} с тегами {@code plsql.target} (процедура или метод запроса),
+     * {@code plsql.call} с тегами {@code plsql.target} (процедура или метод запроса с полным именем
+     * интерфейса),
      * {@code plsql.kind} ({@code call} или {@code query}) и {@code error}.
      */
     public static final String OBSERVATION = "plsql.call";
@@ -331,7 +332,10 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         String task = q != null ? describe(method) : plans.get(method).target().qualifiedName();
         return io.micrometer.observation.Observation.createNotStarted(OBSERVATION, rt.observations())
                 .contextualName(task)
-                .lowCardinalityKeyValue("plsql.target", task)
+                // У запроса — полное имя интерфейса: одноимённые интерфейсы из разных пакетов
+                // (например, для двух баз) иначе слились бы в одну метрику.
+                .lowCardinalityKeyValue("plsql.target", q != null
+                        ? method.getDeclaringClass().getName() + "." + method.getName() : task)
                 .lowCardinalityKeyValue("plsql.kind", q != null ? "query" : "call")
                 .observe(() -> call(method, args, q, task));
     }

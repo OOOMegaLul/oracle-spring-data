@@ -82,7 +82,7 @@ class PlsqlAutoConfigurationTest {
 
     /**
      * Проверяет, что реестр наблюдений Micrometer из контекста (его создаёт Spring Boot Actuator)
-     * доходит до фабрики, а без него фабрика никуда не сообщает.
+     * доходит до фабрики, а без него (или когда их два) фабрика никуда не сообщает.
      */
     @Test
     void observationRegistryIsPickedUp() {
@@ -92,6 +92,13 @@ class PlsqlAutoConfigurationTest {
                 .run(ctx -> assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().observations()).isSameAs(registry));
         runner.withPropertyValues("plsql.charset-policy=IGNORE").run(ctx ->
                 assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().observations())
+                        .isSameAs(io.micrometer.observation.ObservationRegistry.NOOP));
+        // Два реестра без @Primary: метрики необязательны, поэтому старт не падает, а фабрика
+        // просто никуда не сообщает.
+        runner.withPropertyValues("plsql.charset-policy=IGNORE")
+                .withBean("first", io.micrometer.observation.ObservationRegistry.class, io.micrometer.observation.ObservationRegistry::create)
+                .withBean("second", io.micrometer.observation.ObservationRegistry.class, io.micrometer.observation.ObservationRegistry::create)
+                .run(ctx -> assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().observations())
                         .isSameAs(io.micrometer.observation.ObservationRegistry.NOOP));
     }
 
