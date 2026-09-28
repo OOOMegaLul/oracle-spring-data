@@ -62,6 +62,21 @@ class PlsqlAutoConfigurationTest {
     }
 
     /**
+     * Проверяет, что реестр наблюдений Micrometer из контекста (его создаёт Spring Boot Actuator)
+     * доходит до фабрики, а без него фабрика никуда не сообщает.
+     */
+    @Test
+    void observationRegistryIsPickedUp() {
+        io.micrometer.observation.ObservationRegistry registry = io.micrometer.observation.ObservationRegistry.create();
+        runner.withPropertyValues("plsql.charset-policy=IGNORE")
+                .withBean(io.micrometer.observation.ObservationRegistry.class, () -> registry)
+                .run(ctx -> assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().observations()).isSameAs(registry));
+        runner.withPropertyValues("plsql.charset-policy=IGNORE").run(ctx ->
+                assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().observations())
+                        .isSameAs(io.micrometer.observation.ObservationRegistry.NOOP));
+    }
+
+    /**
      * Проверяет, что собственный бин {@link PlsqlApiFactory} приложения отменяет фабрику
      * автоконфигурации: в контексте ровно одна фабрика, и это {@code myFactory}. Собственная
      * фабрика собрана с политикой {@code IGNORE}, поэтому не запрашивает кодировку у мока.

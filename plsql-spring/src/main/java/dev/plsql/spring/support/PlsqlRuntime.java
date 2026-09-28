@@ -35,6 +35,9 @@ import dev.plsql.spring.meta.SignatureSource;
  * @param fetchSize           сколько строк запроса {@code @SqlQuery} забирать за одно обращение к
  *                            базе; {@code 0} — как у драйвера (10). Курсорам процедур тот же размер
  *                            передан исполнителю при создании
+ * @param observations        куда сообщать о каждом вызове и запросе (Micrometer Observation: из
+ *                            него Spring Boot Actuator делает метрики и трассировку);
+ *                            {@code ObservationRegistry.NOOP} — никуда
  */
 public record PlsqlRuntime(
         DataSource dataSource,
@@ -45,5 +48,6 @@ public record PlsqlRuntime(
         CharsetGuard charsetGuard,
         boolean retryDiscardedState,
         int queryTimeout,
-        int fetchSize) {
+        int fetchSize,
+        io.micrometer.observation.ObservationRegistry observations) {
 }

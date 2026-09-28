@@ -257,6 +257,7 @@ public class PlsqlApiFactoryBean<T> implements FactoryBean<T>, BeanFactoryAware,
         }
         beanFactory.getBeanProvider(ArgumentDefaults.class).ifAvailable(b::argumentDefaults);
         beanFactory.getBeanProvider(SignatureSource.class).ifAvailable(b::signatureSource);
+        beanFactory.getBeanProvider(io.micrometer.observation.ObservationRegistry.class).ifAvailable(b::observationRegistry);
         return b.build();
     }
 

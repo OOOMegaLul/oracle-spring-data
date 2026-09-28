@@ -787,4 +787,33 @@ class PlsqlApiInvocationHandlerTest {
         verify(con, never()).commit();
         verify(con).close();
     }
+
+    /**
+     * Проверяет наблюдение Micrometer за вызовами: у каждого вызова — таймер {@code plsql.call} с
+     * тегами {@code plsql.target} (процедура), {@code plsql.kind} и {@code error}; неудачный вызов
+     * отмечен именем исключения. Реестр метрик тот же, что строит Spring Boot Actuator из
+     * наблюдений ({@code DefaultMeterObservationHandler}).
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void callsAreObservedAsATimer() throws SQLException {
+        io.micrometer.core.instrument.simple.SimpleMeterRegistry meters = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        io.micrometer.observation.ObservationRegistry registry = io.micrometer.observation.ObservationRegistry.create();
+        registry.observationConfig().observationHandler(
+                new io.micrometer.core.instrument.observation.DefaultMeterObservationHandler(meters));
+        Api observed = builder().observationRegistry(registry).build().create(Api.class);
+
+        observed.touch(1);
+        observed.touch(2);
+        when(cs.execute()).thenThrow(new SQLException("ORA-20001: Нельзя", "72000", 20001));
+        assertThatThrownBy(() -> observed.touch(3)).isInstanceOf(PlsqlBusinessException.class);
+
+        io.micrometer.core.instrument.Timer ok = meters.get("plsql.call")
+                .tags("plsql.target", "APP.PKG.TOUCH", "plsql.kind", "call", "error", "none").timer();
+        io.micrometer.core.instrument.Timer failed = meters.get("plsql.call")
+                .tags("plsql.target", "APP.PKG.TOUCH", "error", "PlsqlBusinessException").timer();
+        assertThat(ok.count()).isEqualTo(2);
+        assertThat(failed.count()).isEqualTo(1);
+    }
 }
