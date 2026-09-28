@@ -8,6 +8,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.sql.SQLException;
+import java.time.Duration;
 
 import javax.sql.DataSource;
 
@@ -57,6 +58,23 @@ class PlsqlApiFactoryTest {
         // моков, а не до вызова поставщика пользователя.
         assertThatThrownBy(() -> factory.create(Api.class))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("not found in the database");
+    }
+
+    /**
+     * Проверяет перевод срока в секунды JDBC: доли секунды округляются вверх, ноль и {@code null} —
+     * без ограничения, отрицательный и слишком большой срок отвергаются.
+     */
+    @Test
+    void timeoutIsRoundedUpToSeconds() {
+        assertThat(PlsqlApiFactory.Builder.seconds(null)).isZero();
+        assertThat(PlsqlApiFactory.Builder.seconds(Duration.ZERO)).isZero();
+        assertThat(PlsqlApiFactory.Builder.seconds(Duration.ofMillis(1))).isEqualTo(1);
+        assertThat(PlsqlApiFactory.Builder.seconds(Duration.ofMillis(1500))).isEqualTo(2);
+        assertThat(PlsqlApiFactory.Builder.seconds(Duration.ofMinutes(2))).isEqualTo(120);
+        assertThatThrownBy(() -> PlsqlApiFactory.Builder.seconds(Duration.ofMillis(-1)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> PlsqlApiFactory.Builder.seconds(Duration.ofDays(100_000)))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     /** Интерфейс для проверки чтения словаря; в словаре моков его процедуры нет. */

@@ -251,3 +251,38 @@ create or replace package body lab_pkg as
   end;
 end lab_pkg;
 /
+create table lab_mark (txt varchar2(100))
+/
+-- Long calls (timeouts) and DBMS_OUTPUT. The busy loop checks the clock, not DBMS_LOCK:
+-- PLSQL_IT has no grant on it, and DBMS_LOCK.SLEEP notices a cancel only when it wakes up.
+create or replace package lab_run as
+  procedure busy(p_seconds number, p_mark varchar2 default null);
+  function slow_value(p_seconds number) return number;
+  procedure say(p_text varchar2, p_fail number default 0);
+end lab_run;
+/
+create or replace package body lab_run as
+  procedure spin(p_seconds number) is
+    t pls_integer := dbms_utility.get_time;
+  begin
+    loop exit when dbms_utility.get_time - t >= p_seconds * 100; end loop;
+  end;
+  procedure busy(p_seconds number, p_mark varchar2 default null) is
+  begin
+    if p_mark is not null then insert into lab_mark values (p_mark); end if;
+    spin(p_seconds);
+  end;
+  function slow_value(p_seconds number) return number is
+  begin
+    spin(p_seconds);
+    return p_seconds;
+  end;
+  procedure say(p_text varchar2, p_fail number default 0) is
+  begin
+    dbms_output.put_line(p_text);
+    dbms_output.put_line(null);
+    dbms_output.put_line('end');
+    if p_fail = 1 then raise_application_error(-20043, 'failed after output'); end if;
+  end;
+end lab_run;
+/

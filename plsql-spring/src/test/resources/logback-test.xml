@@ -1,0 +1,14 @@
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+  <!-- Сгенерированные блоки PL/SQL и время вызовов видны в выводе тестов. -->
+  <logger name="dev.plsql.spring" level="DEBUG"/>
+  <!-- Чтение DBMS_OUTPUT стоит двух обращений к базе на вызов: тесты включают его сами. -->
+  <logger name="dev.plsql.spring.support.DbmsOutput" level="INFO"/>
+  <root level="INFO">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>

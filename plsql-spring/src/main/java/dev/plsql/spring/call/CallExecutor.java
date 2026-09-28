@@ -121,6 +121,27 @@ public class CallExecutor {
      * @throws IllegalStateException если вид позиции нельзя привязать или прочитать
      */
     public Object execute(Connection con, CallPlan plan, Object[] args) throws SQLException {
+        return execute(con, plan, args, 0);
+    }
+
+    /**
+     * Выполняет план вызова, как {@link #execute(Connection, CallPlan, Object[])}, но с предельным
+     * временем.
+     *
+     * <p>Срок передаётся драйверу через {@code Statement.setQueryTimeout}: когда он выходит, драйвер
+     * просит сервер прервать вызов, и тот завершается ошибкой ORA-01013
+     * ({@link java.sql.SQLTimeoutException}). Изменения данных прерванного вызова Oracle откатывает
+     * сам, соединение остаётся рабочим.
+     *
+     * @param con            соединение, на котором выполняется вызов
+     * @param plan           план вызова, собранный один раз при старте
+     * @param args           аргументы метода интерфейса; {@code null} для метода без параметров
+     * @param timeoutSeconds предельное время в секундах; {@code 0} — без ограничения
+     * @return значение, приведённое к типу результата метода, или {@code null} для {@code void}
+     * @throws SQLException если драйвер или база сообщили об ошибке, в том числе о прерывании по
+     *                      сроку
+     */
+    public Object execute(Connection con, CallPlan plan, Object[] args, int timeoutSeconds) throws SQLException {
         Object[] a = args == null ? new Object[0] : args;
         Map<String, Object> outs = new LinkedHashMap<>();
         List<Object> temporaries = new ArrayList<>();
@@ -137,6 +158,9 @@ public class CallExecutor {
             }
         }
         try (CallableStatement cs = con.prepareCall(plan.sql())) {
+            if (timeoutSeconds > 0) {
+                cs.setQueryTimeout(timeoutSeconds);
+            }
             for (int i = 0; i < binds.size(); i++) {
                 CallPlan.Bind b = binds.get(i);
                 if (b.in() != null) {

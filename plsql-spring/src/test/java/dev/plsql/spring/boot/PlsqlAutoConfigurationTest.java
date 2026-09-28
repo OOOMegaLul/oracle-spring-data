@@ -40,15 +40,21 @@ class PlsqlAutoConfigurationTest {
     /**
      * Проверяет, что свойства {@code plsql.*} доходят до фабрики: {@code charset-policy=IGNORE}
      * выключает проверку символов ({@code CharsetGuard.none()}), а
-     * {@code retry-discarded-state=false} выключает повтор вызова после ORA-04068.
+     * {@code retry-discarded-state=false} выключает повтор вызова после ORA-04068,
+     * {@code query-timeout=1500ms} даёт срок две секунды (JDBC считает целыми секундами). Без
+     * свойства срока нет.
      */
     @Test
     void propertiesAreBound() {
-        runner.withPropertyValues("plsql.charset-policy=IGNORE", "plsql.retry-discarded-state=false").run(ctx -> {
+        runner.withPropertyValues("plsql.charset-policy=IGNORE", "plsql.retry-discarded-state=false",
+                "plsql.query-timeout=1500ms").run(ctx -> {
             PlsqlApiFactory f = ctx.getBean(PlsqlApiFactory.class);
             assertThat(f.runtime().charsetGuard()).isSameAs(CharsetGuard.none());
             assertThat(f.runtime().retryDiscardedState()).isFalse();
+            assertThat(f.runtime().queryTimeout()).isEqualTo(2);
         });
+        runner.withPropertyValues("plsql.charset-policy=IGNORE").run(ctx ->
+                assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().queryTimeout()).isZero());
     }
 
     /**

@@ -4,6 +4,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.Objects;
 
 import javax.sql.DataSource;
@@ -95,8 +96,8 @@ public final class PlsqlApiFactory {
 
     /**
      * Возвращает окружение времени выполнения, общее для всех реализаций этой фабрики: источник
-     * соединений, чтение сигнатур, планировщик, исполнитель, перевод ошибок, проверку кодировки и
-     * признак повтора после ORA-04068.
+     * соединений, чтение сигнатур, планировщик, исполнитель, перевод ошибок, проверку кодировки,
+     * признак повтора после ORA-04068 и срок вызова по умолчанию.
      *
      * @return окружение фабрики
      */
@@ -110,7 +111,7 @@ public final class PlsqlApiFactory {
      * <p>Значения по умолчанию: контекстных аргументов нет, сигнатуры читаются из словаря данных,
      * ошибки переводит стандартный {@link PlsqlExceptionTranslator}, политика кодировки —
      * {@link CharsetGuard.Policy#FAIL}, кодировка базы читается из базы, ёмкость OUT index-by
-     * таблиц — 10 000 элементов, повтор после ORA-04068 включён.
+     * таблиц — 10 000 элементов, повтор после ORA-04068 включён, срока на вызов нет.
      */
     public static final class Builder {
         private final DataSource dataSource;
@@ -121,6 +122,8 @@ public final class PlsqlApiFactory {
         private String databaseCharset;
         private int indexTableMaxLength = 10_000;
         private boolean retryDiscardedState = true;
+        /** Срок на вызов или запрос в секундах; {@code 0} — без ограничения. */
+        private int queryTimeout;
         /** Источник соединений для чтения словаря и кодировки или {@code null} — выбрать самому. */
         private DataSource metadataDataSource;
 
@@ -254,6 +257,47 @@ public final class PlsqlApiFactory {
         }
 
         /**
+         * Задаёт, сколько может длиться вызов процедуры или запрос {@code @SqlQuery}, прежде чем
+         * драйвер его прервёт; по умолчанию срока нет.
+         *
+         * <p>Срок действует на методы, у которых нет своего ({@code @Procedure(timeout = ...)},
+         * {@code @SqlQuery(timeout = ...)}). Прерванный вызов завершается
+         * {@code QueryTimeoutException} (ORA-01013), его изменения данных откатываются. JDBC
+         * считает срок в целых секундах, поэтому доли секунды округляются вверх: {@code 1500ms}
+         * становится двумя секундами.
+         *
+         * @param timeout срок; {@code null} или ноль — без ограничения
+         * @return этот же построитель
+         * @throws IllegalArgumentException если срок отрицательный или больше
+         *                                  {@link Integer#MAX_VALUE} секунд
+         */
+        public Builder queryTimeout(Duration timeout) {
+            this.queryTimeout = seconds(timeout);
+            return this;
+        }
+
+        /**
+         * Переводит срок в целые секунды для {@code Statement.setQueryTimeout}, округляя вверх.
+         *
+         * @param timeout срок; {@code null} — без ограничения
+         * @return число секунд; {@code 0} — без ограничения
+         * @throws IllegalArgumentException если срок отрицательный или слишком большой
+         */
+        static int seconds(Duration timeout) {
+            if (timeout == null || timeout.isZero()) {
+                return 0;
+            }
+            if (timeout.isNegative()) {
+                throw new IllegalArgumentException("queryTimeout must not be negative: " + timeout);
+            }
+            long s = timeout.getSeconds() + (timeout.getNano() > 0 ? 1 : 0);
+            if (s > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("queryTimeout is too long: " + timeout);
+            }
+            return (int) s;
+        }
+
+        /**
          * Задаёт источник соединений, через который читаются словарь и кодировка базы при сборке.
          *
          * <p>По умолчанию это {@code dataSource}, а если он — {@link SessionContextDataSource}, то
@@ -295,7 +339,8 @@ public final class PlsqlApiFactory {
                     ? CharsetGuard.none()
                     : CharsetGuard.forDatabase(databaseCharset != null ? databaseCharset : readCharset(meta), charsetPolicy);
             return new PlsqlApiFactory(new PlsqlRuntime(dataSource, signatures, new CallPlanner(argumentDefaults),
-                    new CallExecutor(indexTableMaxLength, guard), exceptionTranslator, guard, retryDiscardedState));
+                    new CallExecutor(indexTableMaxLength, guard), exceptionTranslator, guard, retryDiscardedState,
+                    queryTimeout));
         }
 
         /**

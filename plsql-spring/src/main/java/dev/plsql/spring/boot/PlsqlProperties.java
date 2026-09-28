@@ -1,5 +1,7 @@
 package dev.plsql.spring.boot;
 
+import java.time.Duration;
+
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import dev.plsql.spring.PlsqlApiFactory;
@@ -28,6 +30,9 @@ public class PlsqlProperties {
 
     /** Повторять вызов один раз после ORA-04068 (пакет перекомпилировали под живой сессией). */
     private boolean retryDiscardedState = true;
+
+    /** Сколько может длиться вызов или запрос, если у метода нет своего срока; пусто — без ограничения. */
+    private Duration queryTimeout;
 
     /**
      * Возвращает политику для текста, который кодировка базы не может сохранить
@@ -122,18 +127,44 @@ public class PlsqlProperties {
     }
 
     /**
+     * Возвращает, сколько может длиться вызов процедуры или запрос {@code @SqlQuery}, если у метода
+     * нет своего срока (свойство {@code plsql.query-timeout}, например {@code 30s} или {@code 2m}).
+     *
+     * <p>Когда срок выходит, драйвер прерывает вызов, и метод завершается
+     * {@code QueryTimeoutException} (ORA-01013). По умолчанию срока нет. Внутри
+     * {@code @Transactional(timeout = ...)} действует меньшее из двух: этот срок или время, которое
+     * осталось у транзакции.
+     *
+     * @return срок или {@code null}, если его нет
+     */
+    public Duration getQueryTimeout() {
+        return queryTimeout;
+    }
+
+    /**
+     * Задаёт, сколько может длиться вызов процедуры или запрос, если у метода нет своего срока.
+     *
+     * @param queryTimeout срок; {@code null} или ноль — без ограничения
+     */
+    public void setQueryTimeout(Duration queryTimeout) {
+        this.queryTimeout = queryTimeout;
+    }
+
+    /**
      * Переносит настройки в построитель фабрики. Так настройки попадают и в фабрику
      * автоконфигурации, и в фабрику, которую {@code PlsqlApiFactoryBean} строит сам для
      * {@code dataSourceRef}.
      *
      * @param b построитель фабрики
      * @return тот же построитель
-     * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1
+     * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1 или
+     *                                  {@code plsql.query-timeout} отрицательный
      */
     public PlsqlApiFactory.Builder applyTo(PlsqlApiFactory.Builder b) {
         return b.charsetPolicy(charsetPolicy)
                 .databaseCharset(databaseCharset)
                 .indexTableMaxLength(indexTableMaxLength)
-                .retryDiscardedState(retryDiscardedState);
+                .retryDiscardedState(retryDiscardedState)
+                .queryTimeout(queryTimeout);
     }
 }

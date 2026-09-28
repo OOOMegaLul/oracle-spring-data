@@ -30,6 +30,8 @@ import dev.plsql.spring.meta.SignatureSource;
  * @param retryDiscardedState повторять вызов один раз после ORA-04068 (пакет перекомпилировали
  *                            под живой сессией); изменения данных неудачного вызова Oracle уже
  *                            откатил, поэтому для данных это безопасно
+ * @param queryTimeout        сколько секунд может длиться вызов или запрос, если на методе не
+ *                            задан свой срок; {@code 0} — без ограничения
  */
 public record PlsqlRuntime(
         DataSource dataSource,
@@ -38,5 +40,6 @@ public record PlsqlRuntime(
         CallExecutor executor,
         PlsqlExceptionTranslator translator,
         CharsetGuard charsetGuard,
-        boolean retryDiscardedState) {
+        boolean retryDiscardedState,
+        int queryTimeout) {
 }

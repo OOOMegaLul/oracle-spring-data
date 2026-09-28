@@ -17,6 +17,9 @@ import java.lang.annotation.Target;
  * {@code beginDate}; одна колонка — в простой тип, прочее — в {@code Map}.
  *
  * <p>Типы результата: {@code List<T>}, {@code Optional<T>}, {@code T} или скалярное значение.
+ * С параметром {@code Pageable} или {@code Sort} из Spring Data запрос выполняется постранично
+ * или с сортировкой (через {@code ROWNUM}: Oracle 11g не знает {@code OFFSET ... FETCH}), а
+ * результат может быть ещё {@code Page<T>} или {@code Slice<T>}.
  * Если метод ждёт одну строку, а запрос вернул несколько, при вызове бросается
  * {@code IncorrectResultSizeDataAccessException}. Возвращает ли оператор строки или число
  * изменённых строк (для UPDATE и т.п.), решает JDBC при выполнении, а не догадка по первому
@@ -37,4 +40,15 @@ public @interface SqlQuery {
      * @return текст запроса
      */
     String value();
+
+    /**
+     * Возвращает, сколько секунд запрос может выполняться, прежде чем драйвер его прервёт.
+     *
+     * <p>Работает так же, как {@link Procedure#timeout()}: {@code -1} (по умолчанию) — как у
+     * фабрики, {@code 0} — без ограничения, внутри {@code @Transactional(timeout = ...)} действует
+     * меньшее из двух сроков.
+     *
+     * @return предельное время запроса в секундах, {@code 0} или {@code -1}
+     */
+    int timeout() default -1;
 }

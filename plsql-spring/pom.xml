@@ -38,6 +38,14 @@
       <artifactId>slf4j-api</artifactId>
     </dependency>
 
+    <!-- Pageable, Page, Slice, Sort для @SqlQuery: необязательная часть, есть в любом
+         приложении со Spring Data. -->
+    <dependency>
+      <groupId>org.springframework.data</groupId>
+      <artifactId>spring-data-commons</artifactId>
+      <optional>true</optional>
+    </dependency>
+
     <!-- Автоконфигурация Boot: необязательная часть. -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -89,6 +97,26 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <!-- Описание свойств plsql.* (META-INF/spring-configuration-metadata.json): по нему
+               IntelliJ и VS Code подсказывают имена, значения и пояснения в application.properties. -->
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-configuration-processor</artifactId>
+              <version>${spring-boot.version}</version>
+            </path>
+          </annotationProcessorPaths>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
 
   <profiles>
     <!-- mvn verify -Prelease : jar + исходники + javadoc для GitHub Releases. -->

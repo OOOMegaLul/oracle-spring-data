@@ -10,11 +10,13 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import org.springframework.beans.BeanUtils;
 import org.springframework.core.ResolvableType;
+import org.springframework.dao.TypeMismatchDataAccessException;
 import org.springframework.jdbc.core.ColumnMapRowMapper;
 import org.springframework.jdbc.core.DataClassRowMapper;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.SingleColumnRowMapper;
 import org.springframework.jdbc.support.JdbcUtils;
+import org.springframework.util.ClassUtils;
 
 /**
  * Превращает строки результата запроса в объекты Java: record и бины — по имени колонки, по тем
@@ -99,9 +101,38 @@ public final class RowMappers {
      * @throws SQLException если драйвер не смог прочитать строку
      */
     public static List<Object> mapAll(ResultSet rs, ResolvableType element) throws SQLException {
-        RowMapper<?> mapper = forType(element.resolve(Map.class));
+        return mapAll(rs, element, false);
+    }
+
+    /**
+     * Читает все строки, как {@link #mapAll(ResultSet, ResolvableType)}, но может не показывать
+     * последнюю колонку результата.
+     *
+     * <p>Последняя колонка прячется у постраничного запроса: это служебный номер строки, который
+     * добавила обёртка с {@code ROWNUM}. В карту {@code Map} она не попадает, простой тип берётся из
+     * первой колонки, а record, бин и класс с конструктором её не замечают: у них нет свойства с
+     * таким именем.
+     *
+     * @param rs              открытый результат запроса
+     * @param element         тип одной строки
+     * @param hiddenLastColumn не показывать последнюю колонку
+     * @return список объектов в порядке строк
+     * @throws SQLException если драйвер не смог прочитать строку
+     */
+    static List<Object> mapAll(ResultSet rs, ResolvableType element, boolean hiddenLastColumn) throws SQLException {
+        Class<?> type = element.resolve(Map.class);
+        RowMapper<?> mapper = forType(type);
         if (mapper instanceof ByName byName) {
-            mapper = byName.bound(rs.getMetaData());
+            mapper = byName.bound(rs.getMetaData(), hiddenLastColumn);
+        } else if (hiddenLastColumn && mapper == COLUMN_MAP) {
+            String hidden = JdbcUtils.lookupColumnName(rs.getMetaData(), rs.getMetaData().getColumnCount());
+            mapper = (r, n) -> {
+                Map<String, Object> row = COLUMN_MAP.mapRow(r, n);
+                row.remove(hidden);
+                return row;
+            };
+        } else if (hiddenLastColumn && mapper instanceof SingleColumnRowMapper<?>) {
+            mapper = new FirstColumn(type);
         }
         List<Object> rows = new ArrayList<>();
         int n = 0;
@@ -172,9 +203,23 @@ public final class RowMappers {
          * @throws SQLException если драйвер не отдал описание колонок
          */
         RowMapper<Object> bound(ResultSetMetaData md) throws SQLException {
+            return bound(md, false);
+        }
+
+        /**
+         * Возвращает преобразователь для результата с этими колонками, не замечая последнюю,
+         * если она служебная.
+         *
+         * @param md               описание колонок результата
+         * @param hiddenLastColumn последняя колонка — служебный номер строки
+         * @return преобразователь, который не смотрит на колонки заново
+         * @throws SQLException если драйвер не отдал описание колонок
+         */
+        RowMapper<Object> bound(ResultSetMetaData md, boolean hiddenLastColumn) throws SQLException {
             List<String> labels = new ArrayList<>(md.getColumnCount());
             for (int i = 1; i <= md.getColumnCount(); i++) {
-                labels.add(JdbcUtils.lookupColumnName(md, i));
+                // Пустое имя не совпадёт ни с одним свойством: колонка останется непрочитанной.
+                labels.add(hiddenLastColumn && i == md.getColumnCount() ? "" : JdbcUtils.lookupColumnName(md, i));
             }
             Values.Binder binder = plans.computeIfAbsent(labels, l -> Values.Binder.of(type, l));
             Class<?>[] wanted = new Class<?>[labels.size()];
@@ -192,6 +237,47 @@ public final class RowMappers {
                 }
                 return binder.build(values);
             };
+        }
+    }
+
+    /**
+     * Значение первой колонки строки, когда колонок больше одной: как {@link SingleColumnRowMapper},
+     * но без проверки, что колонка одна (вторая — служебный номер строки).
+     */
+    private static final class FirstColumn extends SingleColumnRowMapper<Object> {
+
+        /** Тип значения, примитивы заменены обёртками. */
+        private final Class<?> type;
+
+        /**
+         * Создаёт преобразователь для типа значения.
+         *
+         * @param type тип значения; примитив заменяется обёрткой
+         */
+        FirstColumn(Class<?> type) {
+            this.type = ClassUtils.resolvePrimitiveIfNecessary(type);
+        }
+
+        /**
+         * Читает первую колонку и приводит её к типу, как это делает {@link SingleColumnRowMapper}.
+         *
+         * @param rs     результат запроса, стоящий на строке
+         * @param rowNum номер строки, с нуля
+         * @return значение первой колонки
+         * @throws SQLException если драйвер не смог прочитать значение
+         */
+        @Override
+        public Object mapRow(ResultSet rs, int rowNum) throws SQLException {
+            Object v = getColumnValue(rs, 1, type);
+            if (v != null && !type.isInstance(v)) {
+                try {
+                    return convertValueToRequiredType(v, type);
+                } catch (IllegalArgumentException e) {
+                    throw new TypeMismatchDataAccessException("Type mismatch affecting row number " + rowNum
+                            + " and column type '" + rs.getMetaData().getColumnTypeName(1) + "': " + e.getMessage());
+                }
+            }
+            return v;
         }
     }
 }

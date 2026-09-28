@@ -19,12 +19,15 @@
 8. [Ошибки](#8-ошибки)
 9. [Транзакции](#9-транзакции)
 10. [Пул соединений и состояние сессии](#10-пул-соединений-и-состояние-сессии)
-11. [Несколько баз](#11-несколько-баз)
-12. [Без Spring Boot и без Spring](#12-без-spring-boot-и-без-spring)
-13. [Настройки](#13-настройки)
-14. [Тесты своего кода](#14-тесты-своего-кода)
-15. [Ошибки при старте: что они значат](#15-ошибки-при-старте-что-они-значат)
-16. [Чего библиотека не умеет](#16-чего-библиотека-не-умеет)
+11. [Долгие вызовы: срок](#11-долгие-вызовы-срок)
+12. [Отладочный вывод: `DBMS_OUTPUT`](#12-отладочный-вывод-dbms_output)
+13. [Несколько баз](#13-несколько-баз)
+14. [Без Spring Boot и без Spring](#14-без-spring-boot-и-без-spring)
+15. [Настройки](#15-настройки)
+16. [Тесты своего кода](#16-тесты-своего-кода)
+17. [Ошибки при старте: что они значат](#17-ошибки-при-старте-что-они-значат)
+18. [Чего библиотека не умеет](#18-чего-библиотека-не-умеет)
+19. [Рядом со Spring Data JPA и JDBC на Oracle 11g](#19-рядом-со-spring-data-jpa-и-jdbc-на-oracle-11g)
 
 ---
 
@@ -57,6 +60,11 @@ public interface HrApi {
 В `pom.xml` приложения Spring Boot:
 
 ```xml
+<properties>
+  <!-- Все артефакты Oracle — версии 19.x (см. ниже). -->
+  <oracle-database.version>19.32.0.0</oracle-database.version>
+</properties>
+
 <repositories>
   <repository>
     <id>jitpack.io</id>
@@ -79,6 +87,13 @@ public interface HrApi {
 
 Драйвер Oracle (`ojdbc10` и `orai18n`) библиотека подтягивает сама. Нужны Java 17+ и
 Spring Boot 3.5+ или 4.
+
+Зачем `oracle-database.version`: Spring Boot назначает всем артефактам Oracle версию 23.x, а
+Oracle 11.2 официально поддерживает только драйвер 19.x. Без этой строки `orai18n` приходит
+версии 23.x к драйверу 19.x из библиотеки. Свой драйвер (`ojdbc11`) добавлять не нужно, даже
+для JPA: `ojdbc10` из библиотеки обслуживает всё приложение. Без родителя
+`spring-boot-starter-parent` свойство не действует — укажите версию `orai18n` в
+`<dependencyManagement>` явно.
 
 > **Важно: флаг `-parameters`.** Библиотека сопоставляет параметры методов с аргументами
 > процедур по именам. Имена параметров видны, только если код скомпилирован с флагом
@@ -374,6 +389,48 @@ int fireAllHiredBefore(LocalDate before);    // число изменённых 
 - Результат: список, `Optional`, одна строка (ошибка, если строк больше одной), или число
   изменённых строк для `insert`/`update`/`delete` (`int`, `long`, `boolean`).
 
+### Страницы и сортировка
+
+Как в Spring Data: параметр `Pageable` или `Sort`, результат `Page`, `Slice` или `List`.
+
+```java
+@SqlQuery("select id, full_name, hired from employees where active = 1")
+Page<Employee> active(Pageable pageable);
+
+@SqlQuery("select id, full_name, hired from employees where hired >= :from")
+Slice<Employee> hiredSince(LocalDate from, Pageable pageable);
+
+@SqlQuery("select id, full_name, hired from employees")
+List<Employee> all(Sort sort);
+```
+
+```java
+Page<Employee> p = hr.active(PageRequest.of(1, 20, Sort.by("fullName")));
+p.getContent();        // строки 21..40 по имени
+p.getTotalElements();  // сколько всего
+```
+
+Oracle 11g не знает `OFFSET ... FETCH`, на котором спотыкаются Hibernate и Spring Data JDBC
+(раздел 19), поэтому библиотека вырезает страницу через `ROWNUM`:
+
+```sql
+SELECT * FROM (
+  SELECT q_.*, ROWNUM PLSQL_RN_ FROM (<ваш запрос> ORDER BY ...) q_ WHERE ROWNUM <= ?
+) WHERE PLSQL_RN_ > ?
+```
+
+- Служебная колонка `PLSQL_RN_` в результат не попадает.
+- `Page` узнаёт общее число строк отдельным запросом `SELECT COUNT(*) FROM (<ваш запрос>)`, и
+  только когда без него не обойтись: на последней странице число известно и так. `Slice` вместо
+  подсчёта берёт одну лишнюю строку — так он узнаёт, есть ли следующая страница.
+- Имена в `Sort` — колонки запроса; `fullName` превращается в `FULL_NAME`, как имя метода в имя
+  процедуры. Разрешены только буквы, цифры и `_ $ #`: имя часто приходит из адреса запроса
+  (`?sort=...`), и ничего другого в текст SQL не попадёт.
+- Колонки запроса должны называться по-разному. Если в соединении таблиц две колонки `ID`,
+  дайте им псевдонимы (`a.id emp_id, b.id dept_id`), иначе Oracle ответит ORA-00918.
+- `Pageable` и `Sort` живут в Spring Data Commons. Он есть в любом приложении со
+  `spring-boot-starter-data-*`, а без Spring Data подключите `spring-data-commons`.
+
 ## 8. Ошибки
 
 | Что случилось в базе | Что получит Java |
@@ -382,6 +439,7 @@ int fireAllHiredBefore(LocalDate before);    // число изменённых 
 | нарушение уникальности (ORA-00001) | `DuplicateKeyException` |
 | прочие ошибки Oracle | стандартные исключения Spring (`DataIntegrityViolationException`, `BadSqlGrammarException`...) |
 | `NULL` в примитивный результат | `EmptyResultDataAccessException` |
+| вызов не уложился в срок (ORA-01013) | `QueryTimeoutException` (раздел 11) |
 
 Все они — `DataAccessException`, то есть `RuntimeException`: в `@Transactional` откатывают
 транзакцию.
@@ -492,7 +550,74 @@ CURRENT_SCHEMA`, роли), задавайте в самом пуле — у Hik
 `spring.datasource.hikari.connection-init-sql`. Словарь при старте библиотека читает мимо
 `SessionContextDataSource`: при старте пользователя ещё нет.
 
-## 11. Несколько баз
+## 11. Долгие вызовы: срок
+
+Процедура может зависнуть: ждёт блокировку строки, которую держит другой сеанс, или крутит
+тяжёлый запрос. Без срока поток приложения ждёт вместе с ней, пока не кончатся потоки веб-сервера.
+Срок говорит драйверу: «если через N секунд вызов не закончился — прерви его».
+
+```java
+@Procedure(timeout = 30)                  // этот вызов — не дольше 30 секунд
+void recalcSalaries(long deptId);
+
+@SqlQuery(value = "select ... from big_report where ...", timeout = 60)
+List<ReportRow> report(LocalDate from);
+```
+
+Срок сразу для всех методов, у которых нет своего:
+
+```properties
+plsql.query-timeout=30s
+```
+
+- `timeout = -1` (так по умолчанию) — как в `plsql.query-timeout`; `timeout = 0` — без
+  ограничения, даже если общий срок задан.
+- Внутри `@Transactional(timeout = 10)` действует меньшее из двух: срок метода или время, которое
+  осталось у транзакции. Так же делает `JdbcTemplate`.
+- Прерванный вызов бросает `QueryTimeoutException` (в базе это ORA-01013). Что процедура успела
+  изменить, Oracle откатывает сам; соединение остаётся рабочим.
+
+Замер на Oracle 11.2.0.4: вызов, который крутился бы 5 секунд, со сроком 1 секунда прервался
+через 1,04 с (тест `LongCallsIT`).
+
+**Если срок не срабатывает.** Чтобы прервать вызов, драйвер посылает серверу «срочные» данные
+TCP (out-of-band). Некоторые сетевые прослойки их теряют: например, проброс портов Docker Desktop
+на Windows — вызов тогда доходит до конца, хотя срок давно вышел. Помогает одна настройка
+драйвера, после неё прерывание идёт обычными данными:
+
+```properties
+spring.datasource.hikari.data-source-properties.oracle.net.disableOob=true
+```
+
+Проверено: с ней вызов прерывается через 2,0 с при сроке 2 с и с Windows через Docker Desktop, и
+из соседнего контейнера. Одно исключение: `DBMS_LOCK.SLEEP` замечает прерывание только когда
+просыпается.
+
+## 12. Отладочный вывод: `DBMS_OUTPUT`
+
+Старый PL/SQL часто отлаживают через `dbms_output.put_line('...')`: SQL Developer показывает эти
+строки после вызова. Через JDBC их никто не читает, и они пропадают. Библиотека может переносить
+их в лог приложения:
+
+```properties
+logging.level.dev.plsql.spring.support.DbmsOutput=DEBUG
+```
+
+После каждого вызова — и после неудачного тоже, ведь вывод перед ошибкой нужнее всего — в лог
+пишется одно сообщение:
+
+```text
+DEBUG dev.plsql.spring.support.DbmsOutput - HR_DEMO.HR_API.HIRE DBMS_OUTPUT:
+проверяю имя
+вставляю строку
+```
+
+Это два лишних обращения к базе на каждый вызов (замер: +1,1 мс на вызов), поэтому без DEBUG
+вывод не читается совсем. Уровень `DEBUG` для всего `dev.plsql.spring` его тоже включает.
+Читается до 10 000 строк за вызов. После чтения буфер выключается: соединение уходит обратно в
+пул таким, каким было.
+
+## 13. Несколько баз
 
 Интерфейсы каждой базы — в своём пакете, и на каждую базу — своя конфигурация:
 
@@ -507,7 +632,7 @@ class ReportsConfig {
 фабрика (например, поверх `SessionContextDataSource`), она найдётся сама; если таких фабрик две
 — укажите её явно: `factoryRef = "reportsFactory"`.
 
-## 12. Без Spring Boot и без Spring
+## 14. Без Spring Boot и без Spring
 
 **Spring без Boot:** `@EnablePlsqlApis(basePackages = "com.example.hr")` на конфигурации и
 бин `DataSource` с именем `dataSource`.
@@ -521,7 +646,7 @@ PlsqlApiFactory factory = PlsqlApiFactory.builder(dataSource)
 HrApi hr = factory.create(HrApi.class);   // здесь же проверка против словаря
 ```
 
-## 13. Настройки
+## 15. Настройки
 
 `application.properties`, все необязательны:
 
@@ -531,10 +656,16 @@ HrApi hr = factory.create(HrApi.class);   // здесь же проверка п
 | `plsql.database-charset` | читается из базы | кодировка базы, например `CL8MSWIN1251`: не нужно лишнее обращение при старте |
 | `plsql.index-table-max-length` | `10000` | сколько элементов может вернуть выходная index-by таблица |
 | `plsql.retry-discarded-state` | `true` | повторять ли вызов вне транзакции после ORA-04068 |
+| `plsql.query-timeout` | нет | срок вызова или запроса, например `30s` или `2m` (раздел 11) |
 
-Лог: `logging.level.dev.plsql.spring=DEBUG` — сгенерированные блоки и время каждого вызова.
+IntelliJ IDEA и VS Code подсказывают эти настройки в `application.properties` сами: имена,
+значения по умолчанию и пояснения берутся из описания, которое лежит в jar библиотеки.
 
-## 14. Тесты своего кода
+Лог:
+- `logging.level.dev.plsql.spring=DEBUG` — сгенерированные блоки и время каждого вызова;
+- `logging.level.dev.plsql.spring.support.DbmsOutput=DEBUG` — вывод `DBMS_OUTPUT` (раздел 12).
+
+## 16. Тесты своего кода
 
 **Юнит-тесты.** `HrApi` — обычный интерфейс, его можно подменить Mockito:
 
@@ -553,7 +684,7 @@ verify(hr).fire(42L);
 **Посмотреть блок метода:**
 `PlsqlApiInvocationHandler.sqlOf(hr, "hire")` вернёт текст анонимного блока.
 
-## 15. Ошибки при старте: что они значат
+## 17. Ошибки при старте: что они значат
 
 Все расхождения выводятся одним исключением, по строке на метод:
 
@@ -577,11 +708,11 @@ com.example.hr.HrApi does not match the database:
 | `returns long but the procedure has 2 OUT arguments` | несколько `OUT` не влезут в одно число: верните record или `Map` |
 | `matches 2 overloads equally` | две перегрузки подходят одинаково: `@Arg` или другие типы параметров |
 | `would reserve about N MB per call` | выходная index-by таблица слишком велика: уменьшите `plsql.index-table-max-length` |
-| `not callable: ...` | форма аргумента, которую библиотека не поддерживает (раздел 16) |
+| `not callable: ...` | форма аргумента, которую библиотека не поддерживает (раздел 18) |
 | `ORA-01882` при подключении | нет `oracle.jdbc.timezoneAsRegion=false` (раздел 2.2) |
 | `ORA-17056` при подключении | нет `orai18n.jar` (подтягивается сам, если не исключён вручную) |
 
-## 16. Чего библиотека не умеет
+## 18. Чего библиотека не умеет
 
 Такие подпрограммы останавливают старт с понятной причиной (`not callable: ...`):
 
@@ -590,9 +721,77 @@ com.example.hr.HrApi does not match the database:
 - **index-by таблицы записей и дат** (`TABLE OF rec_t INDEX BY ...`): драйвер Oracle 11 их не
   передаёт.
 - **Курсор на вход** (`p_cur IN SYS_REFCURSOR`): открытый курсор из Java не передать.
+- **Страницы (`Pageable`) у процедур**: страница вырезается только у `@SqlQuery`. Курсор, который
+  открыла процедура, приходит целиком.
 - **`XMLTYPE` и `ANYDATA` внутри объектного типа SQL.**
 - **Вызов через database link** (синоним на процедуру в другой базе).
 - **`%ROWTYPE` в пакете, зашифрованном `wrap`**: имя таблицы не прочитать из исходника.
 
 Для таких процедур можно написать маленькую процедуру-обёртку в PL/SQL, которая принимает
 простые типы, или вызвать их через `JdbcTemplate` вручную.
+
+## 19. Рядом со Spring Data JPA и JDBC на Oracle 11g
+
+Библиотека закрывает процедуры. Таблицы многие читают через Spring Data JPA или JDBC, и на
+Oracle 11g у них есть подводные камни. Проверено на Oracle 11.2.0.4 со Spring Boot 4.1.1
+(Hibernate 7.4.5, Spring Data 2026.0.1):
+
+| Что | Работает? |
+|---|---|
+| Драйвер 23.x, который ставит Boot | подключается и работает, но Oracle официально поддерживает с 11.2 только 19.x (раздел 2.1) |
+| JPA: сохранить, `findAll()`, `count()`, ключи из последовательности | да |
+| JPA: `Pageable`, `findFirst3By...`, `findTop10By...` | **нет**: ORA-00933 |
+| JPA: `@GeneratedValue(strategy = IDENTITY)` | **нет**: при старте только предупреждение, падает первая вставка |
+| Spring Data JDBC: `findAll()`, `Sort`, `count()`, ключи через `@Sequence` | да |
+| Spring Data JDBC: `Pageable`, `findFirst3By...` | **нет**: ORA-00933 |
+
+**Почему ORA-00933.** Постраничный вывод Hibernate и Spring Data JDBC пишут так:
+`... offset ? rows fetch first ? rows only`. Это синтаксис Oracle 12c; 11g его не знает. Hibernate
+при старте об этом предупреждает:
+
+```text
+HHH000511: The 11.2.0 version for [org.hibernate.dialect.OracleDialect] is no longer supported,
+hence certain features may not work properly.The minimum supported version is 19.0.0.
+```
+
+**Как починить JPA.** Диалект для старых версий Oracle лежит в отдельном модуле Hibernate:
+
+```xml
+<dependency>
+  <groupId>org.hibernate.orm</groupId>
+  <artifactId>hibernate-community-dialects</artifactId>
+</dependency>
+```
+
+```properties
+spring.jpa.database-platform=org.hibernate.community.dialect.OracleLegacyDialect
+```
+
+С ним предупреждение пропадает, а постраничный вывод идёт через `ROWNUM` и `ROW_NUMBER()`:
+`Pageable`, `findFirst...` и сортировка работают (проверено и с драйвером 19.32). Нужны обе части:
+модуль без свойства ничего не меняет, Hibernate всё равно берёт `OracleDialect`. Модуль
+поддерживают участники сообщества, а не основная команда Hibernate.
+
+**IDENTITY.** Столбцов `GENERATED ... AS IDENTITY` в 11g нет. Используйте последовательность:
+`@GeneratedValue(strategy = GenerationType.SEQUENCE)`.
+
+**Spring Data JDBC** своего диалекта для старого Oracle не имеет: `spring.data.jdbc.dialect`
+предлагает для Oracle только `ORACLE`. Страницы в нём на 11g не работают. Для постраничных
+запросов остаются JPA с `OracleLegacyDialect` или `@SqlQuery` этой библиотеки (раздел 7).
+
+Ещё две ловушки, найденные при проверке:
+
+- **Spring Data JDBC 4.0.1 и новее: новая строка с заданным ключом молча не сохраняется.**
+  `repo.save(new Person(2000L, "..."))` без `@Version` считает объект уже существующим и делает
+  `UPDATE`. Тот меняет 0 строк, и исключения нет: строки в таблице так и не появится (в 4.0.0 было
+  исключение, с 4.0.1 результат `UPDATE` отбрасывается). От Oracle это не зависит. Для новых строк
+  с готовым ключом — `JdbcAggregateTemplate.insert(...)`, `@Version` или `Persistable.isNew()`.
+- **Пакетный `UPDATE` на 11.2 не сообщает число строк.** `executeBatch()` (и
+  `JdbcTemplate.batchUpdate`) возвращает `-2` («выполнено, сколько — неизвестно») и для изменённой,
+  и для ненайденной строки. Так ведут себя оба драйвера, 19.32 и 23.26. Если важно знать, что
+  строка нашлась, выполняйте такие `UPDATE` по одному.
+
+**Процедуры** Spring Data JPA вызывает через `@Procedure` обычным JDBC. На 11g это значит: без
+`BOOLEAN`, записей и index-by таблиц и без сверки со словарём при старте. Для них и нужна эта
+библиотека. JPA и библиотека работают в одной транзакции, если у них общий `DataSource`
+(раздел 9).

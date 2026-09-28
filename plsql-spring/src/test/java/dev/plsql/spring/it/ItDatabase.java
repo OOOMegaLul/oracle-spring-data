@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -149,6 +150,18 @@ public final class ItDatabase {
      * @return новый пул; его нужно закрыть после тестов
      */
     public static HikariDataSource pool(int size, boolean autoCommit) {
+        return pool(size, autoCommit, Map.of());
+    }
+
+    /**
+     * Создаёт пул, как {@link #pool(int, boolean)}, с дополнительными свойствами соединения ojdbc.
+     *
+     * @param size       максимальное число соединений в пуле
+     * @param autoCommit режим autoCommit, в котором пул отдаёт соединения
+     * @param properties свойства драйвера, например {@code oracle.net.disableOob}
+     * @return новый пул; его нужно закрыть после тестов
+     */
+    public static HikariDataSource pool(int size, boolean autoCommit, Map<String, String> properties) {
         HikariConfig c = new HikariConfig();
         c.setJdbcUrl(url());
         c.setUsername(USER);
@@ -157,6 +170,7 @@ public final class ItDatabase {
         c.setMinimumIdle(1);
         c.setAutoCommit(autoCommit);
         c.addDataSourceProperty("oracle.jdbc.implicitStatementCacheSize", "50");
+        properties.forEach(c::addDataSourceProperty);
         return new HikariDataSource(c);
     }
 

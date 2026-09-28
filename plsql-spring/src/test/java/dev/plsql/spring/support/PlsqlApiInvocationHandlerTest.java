@@ -4,27 +4,43 @@ import static dev.plsql.spring.test.Signatures.func;
 import static dev.plsql.spring.test.Signatures.proc;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.math.BigDecimal;
 import java.sql.CallableStatement;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.sql.SQLTimeoutException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 
 import javax.sql.DataSource;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import dev.plsql.spring.PlsqlApiFactory;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
 import dev.plsql.spring.annotation.PlsqlApi;
+import dev.plsql.spring.annotation.Procedure;
+import dev.plsql.spring.annotation.SqlQuery;
 import dev.plsql.spring.test.Signatures;
 import oracle.jdbc.OracleConnection;
 
@@ -75,7 +91,7 @@ class PlsqlApiInvocationHandlerTest {
          * @param id значение параметра {@code :id}
          * @return число изменённых строк
          */
-        @dev.plsql.spring.annotation.SqlQuery("/* audit */ update t set x = 1 where id = :id")
+        @SqlQuery("/* audit */ update t set x = 1 where id = :id")
         int touch(long id);
 
         /**
@@ -84,7 +100,7 @@ class PlsqlApiInvocationHandlerTest {
          * @param id значение параметра {@code :id}
          * @return имя или пустой {@code Optional}, если строки нет
          */
-        @dev.plsql.spring.annotation.SqlQuery("select name from t where id = :id")
+        @SqlQuery("select name from t where id = :id")
         java.util.Optional<String> name(long id);
     }
 
@@ -116,7 +132,7 @@ class PlsqlApiInvocationHandlerTest {
          *
          * @return строки; число изменённых строк в них не превратить
          */
-        @dev.plsql.spring.annotation.SqlQuery("update t set x = 1")
+        @SqlQuery("update t set x = 1")
         java.util.List<java.util.Map<String, Object>> update();
     }
 
@@ -128,8 +144,8 @@ class PlsqlApiInvocationHandlerTest {
          *
          * @return результат
          */
-        @dev.plsql.spring.annotation.SqlQuery("select 1 from dual")
-        @dev.plsql.spring.annotation.Procedure("NEXT")
+        @SqlQuery("select 1 from dual")
+        @Procedure("NEXT")
         long both();
     }
 
@@ -142,7 +158,7 @@ class PlsqlApiInvocationHandlerTest {
          * @param other параметр, о котором SQL ничего не знает
          * @return результат запроса; до вызова дело не доходит
          */
-        @dev.plsql.spring.annotation.SqlQuery("select 1 from dual where x = :missing")
+        @SqlQuery("select 1 from dual where x = :missing")
         int q(long other);
     }
 
@@ -164,6 +180,54 @@ class PlsqlApiInvocationHandlerTest {
          * @return результат функции; до вызова дело не доходит
          */
         long next(String wrongName);
+    }
+
+    /** Сроки вызова: свой у метода, срок фабрики и явное «без ограничения». */
+    @PlsqlApi(packageName = "PKG")
+    interface Timed {
+        /**
+         * {@code PKG.TOUCH} со сроком 7 секунд.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         */
+        @Procedure(value = "TOUCH", timeout = 7)
+        void limited(long tenant);
+
+        /**
+         * {@code PKG.TOUCH} со сроком фабрики.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         */
+        void touch(long tenant);
+
+        /**
+         * {@code PKG.TOUCH} без ограничения, даже если у фабрики срок есть.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         */
+        @Procedure(value = "TOUCH", timeout = 0)
+        void unlimited(long tenant);
+
+        /**
+         * Запрос со сроком 4 секунды.
+         *
+         * @param id значение параметра {@code :id}
+         * @return число изменённых строк
+         */
+        @SqlQuery(value = "update t set x = 1 where id = :id", timeout = 4)
+        int update(long id);
+    }
+
+    /** Срок меньше {@code -1} — ошибка в аннотации. */
+    @PlsqlApi(packageName = "PKG")
+    interface BadTimeout {
+        /**
+         * {@code PKG.TOUCH} с отрицательным сроком.
+         *
+         * @param tenant идёт в {@code NTENANT}
+         */
+        @Procedure(value = "TOUCH", timeout = -5)
+        void touch(long tenant);
     }
 
     DataSource ds;
@@ -198,12 +262,20 @@ class PlsqlApiInvocationHandlerTest {
      * @return новая фабрика
      */
     PlsqlApiFactory factory() {
+        return builder().build();
+    }
+
+    /**
+     * Построитель той же фабрики, что {@link #factory()}, — для тестов, которым нужны свои настройки.
+     *
+     * @return построитель с сигнатурами {@code PKG.NEXT} и {@code PKG.TOUCH}
+     */
+    PlsqlApiFactory.Builder builder() {
         return PlsqlApiFactory.builder(ds)
                 .signatureSource(Signatures.source(
                         func("PKG", "NEXT", "NUMBER").in("NTENANT", "NUMBER").build(),
                         proc("PKG", "TOUCH").in("NTENANT", "NUMBER").build()))
-                .databaseCharset("AL32UTF8")
-                .build();
+                .databaseCharset("AL32UTF8");
     }
 
     /**
@@ -528,5 +600,122 @@ class PlsqlApiInvocationHandlerTest {
         assertThat(PlsqlApiInvocationHandler.oracleName("parseXML2Json")).isEqualTo("PARSE_XML2_JSON");
         assertThat(PlsqlApiInvocationHandler.oracleName("version2Of")).isEqualTo("VERSION2_OF");
         assertThat(PlsqlApiInvocationHandler.oracleName("noop")).isEqualTo("NOOP");
+    }
+
+    /**
+     * Проверяет, что срок доходит до драйвера: срок метода (7), срок фабрики (30) для метода без
+     * своего, никакого вызова {@code setQueryTimeout} для {@code timeout = 0}, срок
+     * {@code @SqlQuery} (4). Без срока у фабрики и метода драйверу ничего не передаётся.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void timeoutsReachTheDriver() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.getUpdateCount()).thenReturn(1);
+        Timed t = builder().queryTimeout(Duration.ofSeconds(30)).build().create(Timed.class);
+
+        t.limited(1);
+        verify(cs).setQueryTimeout(7);
+        t.touch(1);
+        verify(cs).setQueryTimeout(30);
+        clearInvocations(cs);
+        t.unlimited(1);
+        verify(cs, never()).setQueryTimeout(anyInt());
+        t.update(1);
+        verify(ps).setQueryTimeout(4);
+
+        clearInvocations(cs);
+        api.touch(1);
+        verify(cs, never()).setQueryTimeout(anyInt());
+    }
+
+    /**
+     * Проверяет срок транзакции: внутри {@code TransactionTemplate} с таймаутом 5 секунд драйвер
+     * получает остаток срока транзакции (4–5 секунд) и для метода без срока, и для метода со сроком
+     * 7; метод со сроком меньше остатка сохраняет свой.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void transactionDeadlineLimitsTheCall() throws SQLException {
+        when(con.getAutoCommit()).thenReturn(false);
+        Timed t = builder().build().create(Timed.class);
+        Timed shortOne = builder().queryTimeout(Duration.ofSeconds(2)).build().create(Timed.class);
+        TransactionTemplate tx = new TransactionTemplate(new DataSourceTransactionManager(ds));
+        tx.setTimeout(5);
+        List<Integer> seen = new ArrayList<>();
+        doAnswer(inv -> seen.add(inv.getArgument(0))).when(cs).setQueryTimeout(anyInt());
+
+        tx.executeWithoutResult(s -> {
+            t.touch(1);
+            t.limited(1);
+            shortOne.touch(1);
+        });
+
+        assertThat(seen).hasSize(3);
+        assertThat(seen.get(0)).isBetween(4, 5);
+        assertThat(seen.get(1)).isBetween(4, 5);
+        assertThat(seen.get(2)).isEqualTo(2);
+    }
+
+    /**
+     * Проверяет, что срок меньше {@code -1} в аннотации останавливает создание реализации с
+     * понятным сообщением, а отрицательный срок фабрики отвергает построитель.
+     */
+    @Test
+    void negativeTimeoutsAreRejected() {
+        assertThatThrownBy(() -> factory().create(BadTimeout.class))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("BadTimeout.touch: timeout = -5");
+        assertThatThrownBy(() -> builder().queryTimeout(Duration.ofSeconds(-1)))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /**
+     * Проверяет, что прерывание по сроку (ORA-01013, драйвер бросает {@code SQLTimeoutException})
+     * становится {@code QueryTimeoutException} Spring.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void cancelledCallBecomesQueryTimeout() throws SQLException {
+        when(cs.execute()).thenThrow(new SQLTimeoutException(
+                "ORA-01013: user requested cancel of current operation", "72000", 1013));
+        assertThatThrownBy(() -> api.touch(1)).isInstanceOf(QueryTimeoutException.class);
+    }
+
+    /**
+     * Проверяет {@code DBMS_OUTPUT}: при DEBUG у журнала {@code DbmsOutput} буфер включается до
+     * вызова и читается после него, и после неудачного вызова тоже; при INFO лишних обращений к
+     * базе нет.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void dbmsOutputIsReadOnlyWhenItsLogIsOn() throws SQLException {
+        Logger output = (Logger) LoggerFactory.getLogger(DbmsOutput.class);
+        try {
+            output.setLevel(Level.DEBUG);
+            api.touch(1);
+            verify(con).prepareCall(contains("DBMS_OUTPUT.ENABLE"));
+            verify(con).prepareCall(contains("DBMS_OUTPUT.GET_LINES"));
+
+            // Включение буфера, сам вызов (падает), чтение.
+            when(cs.execute()).thenReturn(false)
+                    .thenThrow(new SQLException("ORA-20001: Нельзя", "72000", 20001))
+                    .thenReturn(false);
+            assertThatThrownBy(() -> api.touch(1)).isInstanceOf(PlsqlBusinessException.class);
+            verify(con, times(2)).prepareCall(contains("DBMS_OUTPUT.GET_LINES"));
+
+            output.setLevel(Level.INFO);
+            reset(cs);
+            clearInvocations(con);
+            api.touch(1);
+            verify(con, never()).prepareCall(contains("DBMS_OUTPUT"));
+        } finally {
+            output.setLevel(Level.INFO);
+        }
     }
 }

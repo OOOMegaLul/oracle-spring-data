@@ -28,9 +28,11 @@ import org.springframework.jdbc.core.ArgumentPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.PreparedStatementCallback;
 import org.springframework.jdbc.core.PreparedStatementCreator;
+import org.springframework.jdbc.core.ResultSetExtractor;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterUtils;
 import org.springframework.jdbc.core.namedparam.ParsedSql;
+import org.springframework.jdbc.datasource.ConnectionHolder;
 import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.jdbc.datasource.SingleConnectionDataSource;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -70,6 +72,13 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
 
     private static final Logger log = LoggerFactory.getLogger(PlsqlApiInvocationHandler.class);
 
+    /**
+     * Есть ли в приложении Spring Data Commons ({@code Pageable}, {@code Page}...): необязательная
+     * зависимость, без неё {@link QueryPaging} не трогается.
+     */
+    private static final boolean SPRING_DATA = ClassUtils.isPresent("org.springframework.data.domain.Pageable",
+            PlsqlApiInvocationHandler.class.getClassLoader());
+
     /** Интерфейс, который реализует прокси; нужен для {@code toString}. */
     private final Class<?> api;
     /** Окружение времени выполнения: источник соединений, исполнитель вызовов, перевод ошибок. */
@@ -78,6 +87,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     private final Map<Method, CallPlan> plans;
     /** Разобранные {@code @SqlQuery}, по методам интерфейса. */
     private final Map<Method, QueryPlan> queries;
+    /** Срок вызова в секундах по методам интерфейса ({@code 0} — без ограничения). */
+    private final Map<Method, Integer> timeouts;
 
     /**
      * Создаёт обработчик с уже готовыми планами. Вызывается только из {@link #create}, после
@@ -86,14 +97,16 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @param api     интерфейс, который реализует прокси
      * @param rt      окружение времени выполнения: источник соединений, исполнитель, перевод ошибок
      * @param plans   планы вызова процедур, по методам интерфейса
-     * @param queries разобранные {@code @SqlQuery}, по методам интерфейса
+     * @param queries  разобранные {@code @SqlQuery}, по методам интерфейса
+     * @param timeouts срок вызова в секундах, по методам интерфейса
      */
     private PlsqlApiInvocationHandler(Class<?> api, PlsqlRuntime rt, Map<Method, CallPlan> plans,
-                                      Map<Method, QueryPlan> queries) {
+                                      Map<Method, QueryPlan> queries, Map<Method, Integer> timeouts) {
         this.api = api;
         this.rt = rt;
         this.plans = plans;
         this.queries = queries;
+        this.timeouts = timeouts;
     }
 
     /**
@@ -137,6 +150,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         String pkg = ann == null || ann.packageName().isEmpty() ? null : ann.packageName();
         Map<Method, CallPlan> plans = new LinkedHashMap<>();
         Map<Method, QueryPlan> queries = new LinkedHashMap<>();
+        Map<Method, Integer> timeouts = new LinkedHashMap<>();
         List<String> problems = new ArrayList<>();
 
         List<Method> calls = new ArrayList<>();
@@ -145,6 +159,13 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 continue;
             }
             SqlQuery q = m.getAnnotation(SqlQuery.class);
+            Procedure p = m.getAnnotation(Procedure.class);
+            int timeout = q != null ? q.timeout() : p != null ? p.timeout() : -1;
+            if (timeout < -1) {
+                problems.add(describe(m) + ": timeout = " + timeout + "; use seconds, 0 for no limit or -1 for the factory default");
+                continue;
+            }
+            timeouts.put(m, timeout == -1 ? rt.queryTimeout() : timeout);
             if (q != null) {
                 if (m.isAnnotationPresent(Procedure.class)) {
                     problems.add(describe(m) + ": has both @SqlQuery and @Procedure; keep one");
@@ -190,7 +211,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             plans.forEach((m, p) -> log.debug("{}:\n{}", describe(m), p.sql()));
         }
         return (T) Proxy.newProxyInstance(api.getClassLoader(), new Class<?>[]{api},
-                new PlsqlApiInvocationHandler(api, rt, plans, queries));
+                new PlsqlApiInvocationHandler(api, rt, plans, queries, timeouts));
     }
 
     /**
@@ -298,12 +319,14 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         long t0 = System.nanoTime();
         QueryPlan q = queries.get(method);
         String task = q != null ? describe(method) : plans.get(method).target().qualifiedName();
+        int configured = timeouts.get(method);
         try {
             if (q != null) {
-                return unitOfWork(task, q.sql(), false, con -> query(con, q, args, task));
+                return unitOfWork(task, q.sql(), false, con -> query(con, q, args, task, timeout(configured)));
             }
             CallPlan plan = plans.get(method);
-            return unitOfWork(task, plan.sql(), rt.retryDiscardedState(), con -> rt.executor().execute(con, plan, args));
+            return unitOfWork(task, plan.sql(), rt.retryDiscardedState(),
+                    con -> rt.executor().execute(con, plan, args, timeout(configured)));
         } catch (EmptyResultDataAccessException e) {
             // NULL в примитивный результат: называем метод, иначе по сообщению не понять, где это.
             throw new EmptyResultDataAccessException(describe(method) + ": " + e.getMessage(), e.getExpectedSize(), e);
@@ -312,6 +335,28 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 log.debug("{} {} ms", task, (System.nanoTime() - t0) / 1_000_000);
             }
         }
+    }
+
+    /**
+     * Возвращает срок для одного вызова: срок метода, урезанный до времени, которое осталось у
+     * текущей транзакции Spring.
+     *
+     * <p>{@code @Transactional(timeout = 10)} задаёт срок всей транзакции. Как и
+     * {@code JdbcTemplate}, прокси передаёт драйверу остаток этого срока, чтобы долгий вызов не
+     * пережил транзакцию; если у метода свой срок меньше, действует он. Если срок транзакции уже
+     * вышел, Spring бросает {@code TransactionTimedOutException} до вызова.
+     *
+     * @param configured срок метода в секундах; {@code 0} — без ограничения
+     * @return срок в секундах для {@code setQueryTimeout}; {@code 0} — без ограничения
+     * @throws org.springframework.transaction.TransactionTimedOutException если срок транзакции
+     *         уже вышел
+     */
+    private int timeout(int configured) {
+        if (TransactionSynchronizationManager.getResource(rt.dataSource()) instanceof ConnectionHolder h && h.hasTimeout()) {
+            int left = h.getTimeToLiveInSeconds();
+            return configured > 0 ? Math.min(configured, left) : left;
+        }
+        return configured;
     }
 
     /**
@@ -359,6 +404,10 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * Исключения времени выполнения и ошибки JVM пробрасываются как есть, после отката своей
      * единицы работы.
      *
+     * <p>Если у журнала {@code dev.plsql.spring.support.DbmsOutput} включён DEBUG, перед работой
+     * включается буфер {@code DBMS_OUTPUT}, а после неё (и после неудачи тоже: отладочный вывод
+     * перед ошибкой нужнее всего) его строки переносятся в этот журнал (см. {@link DbmsOutput}).
+     *
      * @param task  название операции для сообщений об ошибке
      * @param sql   текст блока или запроса, для сообщений об ошибке
      * @param retry повторять ли один раз после ORA-04068
@@ -370,7 +419,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             Connection con = DataSourceUtils.getConnection(rt.dataSource());
             boolean inTransaction = TransactionSynchronizationManager.isActualTransactionActive();
             boolean own = false;
+            boolean output = false;
             try {
+                output = DbmsOutput.wanted() && DbmsOutput.enable(con, task);
                 own = !inTransaction && !con.getAutoCommit();
                 Object result = work.run(con);
                 if (own) {
@@ -388,6 +439,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 rollbackQuietly(con, own);
                 throw e;
             } finally {
+                if (output) {
+                    DbmsOutput.read(con, task);
+                }
                 DataSourceUtils.releaseConnection(con, rt.dataSource());
             }
         }
@@ -431,9 +485,12 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      *                   или сам тип возврата; строки превращаются в него через
      *                   {@link RowMappers#mapAll}
      * @param noResult   метод объявлен как {@code void}: результат не нужен
+     * @param paging     параметры {@code Pageable}/{@code Sort} и вид результата {@code Page}/{@code Slice}
+     *                   или {@code null}, если метод не постраничный
      */
     private record QueryPlan(String sql, ParsedSql parsed, String[] names, ResolvableType returnType,
-                             boolean many, boolean optional, ResolvableType element, boolean noResult) {
+                             boolean many, boolean optional, ResolvableType element, boolean noResult,
+                             QueryPaging.Spec paging) {
 
         /**
          * Разбирает SQL метода и определяет, как отдавать результат.
@@ -445,20 +502,28 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
          * которого у метода нет, исключение возникает здесь, при старте, а не при первом вызове.
          *
          * <p>По типу возврата: коллекция — все строки; {@code Optional} — одна строка или пусто;
-         * иначе одна строка (или число изменённых строк для DML).
+         * иначе одна строка (или число изменённых строк для DML). Параметры {@code Pageable} и
+         * {@code Sort} (Spring Data) в SQL не подставляются: по ним запрос оборачивается
+         * постранично ({@link QueryPaging}), а результат может быть {@code Page} или {@code Slice}.
          *
          * @param m   метод интерфейса с {@code @SqlQuery}
          * @param sql текст из аннотации
          * @return готовый план запроса
          * @throws org.springframework.dao.InvalidDataAccessApiUsageException если в SQL есть
          *         параметр, которого нет у метода
+         * @throws IllegalStateException если {@code Pageable}, {@code Sort}, {@code Page} или
+         *         {@code Slice} использованы неправильно (см. {@link QueryPaging#of})
          */
         static QueryPlan of(Method m, String sql) {
             ParsedSql parsed = NamedParameterUtils.parseSqlStatement(sql);
+            QueryPaging.Spec paging = SPRING_DATA ? QueryPaging.of(m) : null;
             Parameter[] ps = m.getParameters();
             String[] names = new String[ps.length];
             MapSqlParameterSource probe = new MapSqlParameterSource();
             for (int i = 0; i < ps.length; i++) {
+                if (SPRING_DATA && QueryPaging.isPagingParameter(ps[i].getType())) {
+                    continue; // Pageable и Sort меняют текст запроса, а не подставляются в него
+                }
                 Arg a = ps[i].getAnnotation(Arg.class);
                 names[i] = a != null ? a.value() : ps[i].getName();
                 probe.addValue(names[i], null);
@@ -467,11 +532,13 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             NamedParameterUtils.buildValueArray(parsed, probe, null);
             ResolvableType rt = ResolvableType.forMethodReturnType(m);
             Class<?> raw = rt.resolve(Object.class);
-            boolean many = Collection.class.isAssignableFrom(raw);
+            boolean pageOrSlice = paging != null && paging.result() != QueryPaging.Result.LIST;
+            boolean many = pageOrSlice || Collection.class.isAssignableFrom(raw);
             boolean optional = raw == Optional.class;
-            ResolvableType element = many ? rt.asCollection().getGeneric(0) : optional ? rt.getGeneric(0) : rt;
+            ResolvableType element = pageOrSlice ? rt.getGeneric(0)
+                    : many ? rt.asCollection().getGeneric(0) : optional ? rt.getGeneric(0) : rt;
             boolean noResult = raw == void.class || raw == Void.class;
-            return new QueryPlan(sql, parsed, names, rt, many, optional, element, noResult);
+            return new QueryPlan(sql, parsed, names, rt, many, optional, element, noResult, paging);
         }
     }
 
@@ -503,7 +570,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @param con  соединение текущей единицы работы
      * @param q    разобранный запрос
      * @param args аргументы вызова в порядке параметров метода
-     * @param task название метода для сообщений об ошибках
+     * @param task    название метода для сообщений об ошибках
+     * @param timeout срок запроса в секундах; {@code 0} — без ограничения
      * @return результат, приведённый к типу возврата метода
      * @throws IncorrectResultSizeDataAccessException если метод ждёт одну строку, а пришло несколько
      * @throws InvalidDataAccessApiUsageException если оператор вернул число изменённых строк, а
@@ -513,9 +581,12 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @throws CharsetGuard.UnrepresentableCharacterException если строковый аргумент нельзя сохранить
      *         в кодировке базы
      */
-    private Object query(Connection con, QueryPlan q, Object[] args, String task) {
+    private Object query(Connection con, QueryPlan q, Object[] args, String task, int timeout) {
         MapSqlParameterSource params = new MapSqlParameterSource();
         for (int i = 0; i < q.names().length; i++) {
+            if (q.names()[i] == null) {
+                continue; // Pageable или Sort
+            }
             Object v = args[i];
             if (v instanceof CharSequence s) {
                 rt.charsetGuard().check(q.names()[i], s);
@@ -534,12 +605,14 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             }
             throw r; // свой переводчик может вернуть и не DataAccessException
         });
-        PreparedStatementCreator creator = c -> {
-            PreparedStatement ps = c.prepareStatement(sql);
-            new ArgumentPreparedStatementSetter(values).setValues(ps);
-            return ps;
-        };
-        return jdbc.execute(creator, (PreparedStatementCallback<Object>) ps -> {
+        if (q.paging() != null) {
+            return QueryPaging.run(q.paging(), sql, values, args,
+                    (s, v, hidden) -> jdbc.query(creator(s, v, timeout),
+                            (ResultSetExtractor<List<Object>>) rs -> RowMappers.mapAll(rs, q.element(), hidden)),
+                    (s, v) -> jdbc.query(creator(s, v, timeout),
+                            (ResultSetExtractor<Long>) rs -> rs.next() ? rs.getLong(1) : 0L));
+        }
+        return jdbc.execute(creator(sql, values, timeout), (PreparedStatementCallback<Object>) ps -> {
             if (!ps.execute()) {
                 if (q.noResult()) {
                     return null;
@@ -572,6 +645,25 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             }
             return q.optional() ? Optional.ofNullable(one) : Values.convert(one, q.element());
         });
+    }
+
+    /**
+     * Готовит оператор для запроса: текст, срок и значения параметров по порядку.
+     *
+     * @param sql     текст с {@code ?}
+     * @param values  значения по порядку знаков {@code ?}
+     * @param timeout срок в секундах; {@code 0} — без ограничения
+     * @return создатель оператора для {@link JdbcTemplate}
+     */
+    private static PreparedStatementCreator creator(String sql, Object[] values, int timeout) {
+        return c -> {
+            PreparedStatement ps = c.prepareStatement(sql);
+            if (timeout > 0) {
+                ps.setQueryTimeout(timeout);
+            }
+            new ArgumentPreparedStatementSetter(values).setValues(ps);
+            return ps;
+        };
     }
 
     /**
