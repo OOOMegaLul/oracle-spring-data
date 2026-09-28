@@ -73,6 +73,13 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     private static final Logger log = LoggerFactory.getLogger(PlsqlApiInvocationHandler.class);
 
     /**
+     * Имя наблюдения Micrometer за вызовом: Spring Boot Actuator делает из него таймер
+     * {@code plsql.call} с тегами {@code plsql.target} (процедура или метод запроса),
+     * {@code plsql.kind} ({@code call} или {@code query}) и {@code error}.
+     */
+    public static final String OBSERVATION = "plsql.call";
+
+    /**
      * Есть ли в приложении Spring Data Commons ({@code Pageable}, {@code Page}...): необязательная
      * зависимость, без неё {@link QueryPaging} не трогается.
      */
@@ -291,7 +298,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      *   <li>метод с {@code @SqlQuery} выполняет свой SQL;</li>
      *   <li>остальные методы вызывают процедуру по готовому плану.</li>
      * </ul>
-     * Время и запроса, и вызова пишется в лог на уровне DEBUG. Метод, который возвращает
+     * Время и запроса, и вызова пишется в лог на уровне DEBUG, а каждое обращение к базе
+     * наблюдается через Micrometer ({@link #OBSERVATION}): у Spring Boot Actuator это таймер
+     * {@code plsql.call}. Метод, который возвращает
      * {@code Stream}, получает открытый поток ({@code streamOfWork}): соединение возвращается в
      * пул, когда поток закроют.
      * Запрос и вызов процедуры выполняются как единица работы ({@code unitOfWork}). Повтор после
@@ -318,9 +327,27 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         if (method.isDefault()) {
             return InvocationHandler.invokeDefault(proxy, method, args);
         }
-        long t0 = System.nanoTime();
         QueryPlan q = queries.get(method);
         String task = q != null ? describe(method) : plans.get(method).target().qualifiedName();
+        return io.micrometer.observation.Observation.createNotStarted(OBSERVATION, rt.observations())
+                .contextualName(task)
+                .lowCardinalityKeyValue("plsql.target", task)
+                .lowCardinalityKeyValue("plsql.kind", q != null ? "query" : "call")
+                .observe(() -> call(method, args, q, task));
+    }
+
+    /**
+     * Выполняет запрос или вызов процедуры метода: всё, что делает {@link #invoke} для метода,
+     * который ходит в базу.
+     *
+     * @param method метод интерфейса
+     * @param args   аргументы вызова
+     * @param q      разобранный {@code @SqlQuery} или {@code null} для процедуры
+     * @param task   название операции для сообщений и журнала
+     * @return результат метода
+     */
+    private Object call(Method method, Object[] args, QueryPlan q, String task) {
+        long t0 = System.nanoTime();
         int configured = timeouts.get(method);
         try {
             if (q != null && q.stream()) {
