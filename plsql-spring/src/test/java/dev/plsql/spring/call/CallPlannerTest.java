@@ -181,6 +181,33 @@ class CallPlannerTest {
         java.util.stream.Stream<Long> numberStream(long minId);
 
         /**
+         * Пакетный вызов {@code PKG.ADD(NTENANT, SNAME, NRN OUT)}: tenant общий, имена по одному.
+         *
+         * @param tenant идёт в {@code NTENANT} каждого вызова
+         * @param rows   строки пакета
+         * @return число вызовов
+         */
+        @Procedure(value = "ADD", batch = true)
+        int addAll(long tenant, List<Row> rows);
+
+        /**
+         * Пакет без параметра-списка — ошибка.
+         *
+         * @param tenant единственный параметр
+         */
+        @Procedure(value = "ADD", batch = true)
+        void addNothing(long tenant);
+
+        /**
+         * Пакет с результатом-строкой — ошибка.
+         *
+         * @param rows строки пакета
+         * @return недопустимый результат
+         */
+        @Procedure(value = "ADD", batch = true)
+        String addReturningText(List<Row> rows);
+
+        /**
          * Перегруженная процедура {@code PKG.OVER(P_X, P_OUT OUT VARCHAR2)}, где {@code P_X} в одной
          * перегрузке {@code NUMBER}, в другой {@code VARCHAR2}; тип {@code long} выбирает первую.
          *
@@ -665,6 +692,40 @@ class CallPlannerTest {
         assertThat(p.sql()).contains("v1 SYS_REFCURSOR;").contains("P_CUR => v1").contains("? := v1;");
         assertThatThrownBy(() -> PLANNER.plan(m("cursor"), proc("PKG", "CUR").in("P_MIN_ID", "NUMBER").in("P_CUR", "REF CURSOR").build()))
                 .hasMessageContaining("IN REF CURSOR");
+    }
+
+    /**
+     * Строка пакета: её свойство {@code name} идёт в {@code SNAME}.
+     *
+     * @param name имя
+     */
+    record Row(String name) {
+    }
+
+    /**
+     * Проверяет пакетный план: {@code OUT}-аргумент уходит в переменную блока и не привязывается,
+     * входы читаются из элемента списка и общего параметра, номер параметра-списка запомнен.
+     * Отвергаются: функция, {@code IN OUT}, метод без списка и результат, кроме числа вызовов.
+     */
+    @Test
+    void batchPlansDiscardOutsAndRejectWhatCannotBeBatched() {
+        CallPlan p = PLANNER.plan(m("addAll"), proc("PKG", "ADD").in("NTENANT", "NUMBER").in("SNAME", "VARCHAR2")
+                .out("NRN", "NUMBER").build());
+        assertThat(p.batch()).isTrue();
+        assertThat(p.batchParameter()).isEqualTo(1);
+        assertThat(p.sql()).contains("v1 NUMBER;").contains("NRN => v1");
+        assertThat(p.binds()).hasSize(2).allSatisfy(b -> assertThat(b.outKey()).isNull());
+        assertThat(p.binds().get(0).in().apply(new Object[]{1001L, new Row("x")})).isEqualTo(1001L);
+        assertThat(p.binds().get(1).in().apply(new Object[]{1001L, new Row("x")})).isEqualTo("x");
+
+        assertThatThrownBy(() -> PLANNER.plan(m("addAll"), func("PKG", "ADD", "NUMBER").in("NTENANT", "NUMBER")
+                .in("SNAME", "VARCHAR2").build())).hasMessageContaining("batch calls need a procedure");
+        assertThatThrownBy(() -> PLANNER.plan(m("addAll"), proc("PKG", "ADD").in("NTENANT", "NUMBER")
+                .inOut("SNAME", "VARCHAR2").build())).hasMessageContaining("SNAME is IN OUT");
+        assertThatThrownBy(() -> PLANNER.plan(m("addNothing"), proc("PKG", "ADD").in("NTENANT", "NUMBER").build()))
+                .hasMessageContaining("needs a list or array parameter");
+        assertThatThrownBy(() -> PLANNER.plan(m("addReturningText"), proc("PKG", "ADD").in("SNAME", "VARCHAR2").build()))
+                .hasMessageContaining("returns void or the number of calls");
     }
 
     /**

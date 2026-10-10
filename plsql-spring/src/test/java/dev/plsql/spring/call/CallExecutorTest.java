@@ -119,6 +119,14 @@ class CallExecutorTest {
          * @return поток строк
          */
         java.util.stream.Stream<Map<String, Object>> rows(long minId);
+
+        /**
+         * Пакет по именам.
+         *
+         * @param names имена, по одному на вызов
+         */
+        @dev.plsql.spring.annotation.Procedure(value = "ADD", batch = true)
+        void addAll(@dev.plsql.spring.annotation.Arg("SNAME") List<String> names);
     }
 
     /**
@@ -505,5 +513,28 @@ class CallExecutorTest {
         CallPlan p = planner.plan(m("rows"), proc(null, "ROWS").in("P_MIN_ID", "NUMBER").out("P_CUR", "REF CURSOR").build());
         assertThatThrownBy(() -> new CallExecutor(100).execute(con, p, new Object[]{1L}))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("open");
+    }
+
+    /**
+     * Проверяет пакет: по {@code addBatch} на элемент, отправка пачками ({@code executeBatch} на
+     * каждые 2 элемента и на остаток), одно подготовленное заранее значение на элемент, число
+     * вызовов в ответе; не-пакетный план отвергается.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void batchSendsCallsInChunks() throws SQLException {
+        CallPlan p = planner.plan(m("addAll"), proc(null, "ADD").in("SNAME", "VARCHAR2").build());
+        long calls = new CallExecutor(100).executeBatch(con, p, new Object[]{List.of("a", "b", "c", "d", "e")}, 0, 2);
+
+        assertThat(calls).isEqualTo(5);
+        verify(cs, org.mockito.Mockito.times(5)).addBatch();
+        verify(cs, org.mockito.Mockito.times(3)).executeBatch();
+        verify(cs).setString(1, "e");
+        verify(cs).close();
+        CallPlan plain = planner.plan(m("insert"), proc(null, "P_INSERT").in("NTENANT", "NUMBER").in("SNAME", "VARCHAR2")
+                .out("NRN", "NUMBER").build());
+        assertThatThrownBy(() -> new CallExecutor(100).executeBatch(con, plain, new Object[]{1L, "x"}, 0, 2))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 }

@@ -29,13 +29,39 @@ import dev.plsql.spring.meta.SubprogramInfo;
  * @param recordOuts OUT-аргументы типа RECORD, чьи поля возвращаются отдельными привязками
  *                   ({@code ARG.FIELD}) и затем собираются обратно в одну карту
  * @param result     как выходные значения превращаются в результат метода
+ * @param batchParameter номер параметра метода, по элементам которого процедура вызывается
+ *                   пакетом ({@code @Procedure(batch = true)}), или {@code -1} для обычного вызова
  */
 public record CallPlan(
         SubprogramInfo target,
         String sql,
         List<Bind> binds,
         List<String> recordOuts,
-        Result result) {
+        Result result,
+        int batchParameter) {
+
+    /**
+     * Создаёт план обычного, не пакетного вызова.
+     *
+     * @param target     подпрограмма Oracle
+     * @param sql        анонимный блок PL/SQL
+     * @param binds      привязки в порядке знаков {@code ?}
+     * @param recordOuts OUT-аргументы типа RECORD
+     * @param result     как выходные значения превращаются в результат метода
+     */
+    public CallPlan(SubprogramInfo target, String sql, List<Bind> binds, List<String> recordOuts, Result result) {
+        this(target, sql, binds, recordOuts, result, -1);
+    }
+
+    /**
+     * Проверяет, пакетный ли это вызов.
+     *
+     * @return {@code true}, если процедура вызывается по разу на элемент параметра
+     *         {@link #batchParameter()}
+     */
+    public boolean batch() {
+        return batchParameter >= 0;
+    }
 
     /**
      * Описывает один плейсхолдер {@code ?}: что в него передать и что из него прочитать.

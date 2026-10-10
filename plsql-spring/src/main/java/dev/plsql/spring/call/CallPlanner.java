@@ -9,6 +9,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -200,13 +201,17 @@ public class CallPlanner {
         if (!unsupported.isEmpty()) {
             throw new PlanException("not callable: " + String.join("; ", unsupported));
         }
-        Map<ArgumentInfo, Function<Object[], Object>> supplied = matchParameters(method, sp);
         Procedure procAnn = method.getAnnotation(Procedure.class);
         boolean nullForMissing = procAnn != null && procAnn.nullForMissing();
+        int batchParameter = procAnn != null && procAnn.batch() ? batchParameter(method) : -1;
+        Map<ArgumentInfo, Function<Object[], Object>> supplied = matchParameters(method, sp, batchParameter);
 
         ResolvableType returnType = ResolvableType.forMethodReturnType(method);
         Class<?> rawReturn = returnType.resolve(Object.class);
         boolean voidReturn = rawReturn == void.class || rawReturn == Void.class;
+        if (batchParameter >= 0) {
+            return planBatch(method, sp, supplied, returnType, batchParameter, nullForMissing);
+        }
 
         // Какие выходные значения есть и в какой Java-тип пойдёт каждое.
         List<ArgumentInfo> outs = sp.arguments().stream().filter(ArgumentInfo::isOut).toList();
@@ -472,6 +477,30 @@ public class CallPlanner {
     }
 
     /**
+     * Возвращает тип переменной блока, в которую пакетный вызов складывает ненужный
+     * {@code OUT}-аргумент: скаляр — самым широким типом своего вида, SQL-тип — своим именем,
+     * остальное — как у {@link #localType}.
+     *
+     * @param a выходной аргумент
+     * @return тип для секции {@code DECLARE}
+     * @throws PlanException если тип аргумента не поддерживается
+     */
+    private static String discardType(ArgumentInfo a) {
+        String t = a.dataType() == null ? "" : a.dataType().toUpperCase(Locale.ROOT);
+        return switch (a.kind()) {
+            case NUMBER -> "NUMBER";
+            case STRING -> t.startsWith("N") ? "NVARCHAR2(16383)" : "VARCHAR2(32767)";
+            case DATE -> "DATE";
+            case TIMESTAMP -> t.startsWith("TIMESTAMP") ? t : "TIMESTAMP";
+            case CLOB -> t.startsWith("N") ? "NCLOB" : "CLOB";
+            case BLOB -> "BLOB";
+            case RAW -> "RAW(32767)";
+            case SQL_COLLECTION, OBJECT -> a.sqlTypeName();
+            default -> localType(a);
+        };
+    }
+
+    /**
      * Возвращает тип PL/SQL, которым объявляется локальная переменная блока для этого
      * аргумента.
      *
@@ -676,6 +705,106 @@ public class CallPlanner {
     // ------------------------------------------------------------------ сторона Java
 
     /**
+     * Строит план пакетного вызова ({@code @Procedure(batch = true)}): процедура вызывается по
+     * разу на элемент параметра {@code batchParameter}, и JDBC отправляет вызовы пачками.
+     *
+     * <p>Выходные значения пакетом не прочитать, поэтому {@code OUT}-аргументы уходят во
+     * внутренние переменные блока и отбрасываются. Отвергаются: функция (её результат — выход),
+     * {@code IN OUT}-аргументы, курсоры и index-by таблицы, а также результат метода, кроме
+     * {@code void} и числа вызовов ({@code int}, {@code long}).
+     *
+     * @param method         метод интерфейса
+     * @param sp             сигнатура процедуры
+     * @param supplied       источники входных значений, уже сопоставленные с аргументами
+     * @param returnType     тип результата метода
+     * @param batchParameter номер параметра-списка
+     * @param nullForMissing разрешено ли передавать {@code NULL} в недостающие аргументы
+     * @return план пакетного вызова
+     * @throws PlanException если процедуру нельзя вызывать пакетом
+     */
+    private CallPlan planBatch(Method method, SubprogramInfo sp, Map<ArgumentInfo, Function<Object[], Object>> supplied,
+                               ResolvableType returnType, int batchParameter, boolean nullForMissing) {
+        if (sp.isFunction()) {
+            throw new PlanException("batch calls need a procedure: a function returns a value per call, and"
+                    + " JDBC cannot read values back from a batch");
+        }
+        Class<?> raw = ClassUtils.resolvePrimitiveIfNecessary(returnType.resolve(Object.class));
+        if (raw != void.class && raw != Void.class && raw != Integer.class && raw != Long.class) {
+            throw new PlanException("a batch method returns void or the number of calls (int, long), not "
+                    + returnType.resolve(Object.class).getSimpleName());
+        }
+        Block b = new Block();
+        List<String> callArgs = new ArrayList<>();
+        for (ArgumentInfo a : sp.arguments()) {
+            if (a.kind() == ArgKind.REF_CURSOR || a.kind() == ArgKind.INDEX_TABLE) {
+                throw new PlanException("argument " + a.name() + " is " + a.dataType() + ", which cannot be batched");
+            }
+            if (a.isOut() && a.isIn()) {
+                throw new PlanException("argument " + a.name() + " is IN OUT, which cannot be batched:"
+                        + " JDBC cannot read values back from a batch");
+            }
+            if (a.isOut()) {
+                // Выход пакетом не прочитать: он уходит в переменную блока и отбрасывается.
+                callArgs.add(a.name() + " => " + b.variable(discardType(a)));
+                continue;
+            }
+            Function<Object[], Object> in = supplied.get(a);
+            if (in == null) {
+                Supplier<Object> d = defaults.lookup(sp, a);
+                if (d != null) {
+                    in = new FromDefaults(d);
+                } else if (a.defaulted()) {
+                    continue; // пусть сработает DEFAULT из PL/SQL
+                } else if (nullForMissing) {
+                    in = args -> null;
+                } else {
+                    throw new PlanException("required argument " + a.name() + " (" + a.dataType()
+                            + ") is not supplied; add a property or an ArgumentDefaults entry");
+                }
+            }
+            callArgs.add(a.name() + " => " + argument(b, a, in, null, null));
+        }
+        String call = sp.qualifiedName() + (callArgs.isEmpty() ? "" : "(" + String.join(", ", callArgs) + ")");
+        return new CallPlan(sp, b.render(call + ";"), b.binds(), b.recordOuts(),
+                new CallPlan.Result(returnType, null, false), batchParameter);
+    }
+
+    /**
+     * Находит параметр-список пакетного метода: единственный параметр-коллекцию или массив.
+     *
+     * @param method метод с {@code @Procedure(batch = true)}
+     * @return номер параметра
+     * @throws PlanException если такого параметра нет или их несколько
+     */
+    static int batchParameter(Method method) {
+        int found = -1;
+        Class<?>[] types = method.getParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            if (Iterable.class.isAssignableFrom(types[i]) || types[i].isArray()) {
+                if (found >= 0) {
+                    throw new PlanException("a batch method needs exactly one list or array parameter, it has several");
+                }
+                found = i;
+            }
+        }
+        if (found < 0) {
+            throw new PlanException("a batch method needs a list or array parameter with one element per call");
+        }
+        return found;
+    }
+
+    /**
+     * Возвращает тип элемента списка или массива.
+     *
+     * @param t тип параметра: коллекция, {@code Iterable} или массив
+     * @return тип элемента; {@code Object}, если он не указан
+     */
+    private static ResolvableType elementOf(ResolvableType t) {
+        ResolvableType el = t.isArray() ? t.getComponentType() : t.as(Iterable.class).getGeneric(0);
+        return el == ResolvableType.NONE ? ResolvableType.forClass(Object.class) : el;
+    }
+
+    /**
      * Сопоставляет параметры Java-метода с аргументами подпрограммы.
      *
      * <p>Для каждого параметра:
@@ -702,7 +831,8 @@ public class CallPlanner {
      *                       передаётся в тип аргумента или если у record/бина нет свойства для
      *                       поля записи или атрибута объекта (см. {@link #checkJavaType})
      */
-    private Map<ArgumentInfo, Function<Object[], Object>> matchParameters(Method method, SubprogramInfo sp) {
+    private Map<ArgumentInfo, Function<Object[], Object>> matchParameters(Method method, SubprogramInfo sp,
+                                                                          int batchParameter) {
         Procedure procAnn = method.getAnnotation(Procedure.class);
         boolean nullForMissing = procAnn != null && procAnn.nullForMissing();
         Parameter[] params = method.getParameters();
@@ -711,17 +841,22 @@ public class CallPlanner {
             Parameter p = params[i];
             Arg ann = p.getAnnotation(Arg.class);
             final int k = i;
+            // У пакетного параметра сопоставляется тип элемента: при вызове на его место встаёт
+            // очередной элемент списка.
+            ResolvableType javaType = i == batchParameter ? elementOf(ResolvableType.forMethodParameter(method, i))
+                    : ResolvableType.forMethodParameter(method, i);
+            Class<?> type = javaType.resolve(Object.class);
             ArgumentInfo a = ann != null ? byName(sp, ann.value()) : find(p.getName(), sp);
-            if (a == null && ann == null && isParameterObject(p.getType())) {
+            if (a == null && ann == null && isParameterObject(type)) {
                 // Record или бин, чьи свойства и есть аргументы, как у объекта формы.
-                for (PropertyName prop : propertyNames(p.getType())) {
+                for (PropertyName prop : propertyNames(type)) {
                     ArgumentInfo pa = prop.explicit() != null ? byName(sp, prop.explicit()) : find(prop.name(), sp);
                     if (pa == null) {
-                        throw new PlanException("property '" + prop.name() + "' of " + p.getType().getSimpleName()
+                        throw new PlanException("property '" + prop.name() + "' of " + type.getSimpleName()
                                 + " has no matching argument; arguments are " + names(sp.arguments()));
                     }
                     String argName = pa.name();
-                    String label = "property '" + prop.name() + "' of " + p.getType().getSimpleName();
+                    String label = "property '" + prop.name() + "' of " + type.getSimpleName();
                     checkJavaType(pa, prop.type(), label, nullForMissing);
                     put(supplied, pa, args -> Values.property(args[k], argName), label);
                 }
@@ -733,7 +868,7 @@ public class CallPlanner {
                         + (p.getName().matches("arg\\d+") ? " (compile with -parameters)" : ""));
             }
             String label = "parameter '" + p.getName() + "'";
-            checkJavaType(a, ResolvableType.forMethodParameter(method, i), label, nullForMissing);
+            checkJavaType(a, javaType, label, nullForMissing);
             put(supplied, a, args -> args[k], label);
         }
         return supplied;

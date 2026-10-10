@@ -100,6 +100,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     private final Map<Method, QueryPlan> queries;
     /** Срок вызова в секундах по методам интерфейса ({@code 0} — без ограничения). */
     private final Map<Method, Integer> timeouts;
+    /** Размер пачки пакетных методов ({@code @Procedure(batch = true)}). */
+    private final Map<Method, Integer> batchSizes;
 
     /**
      * Создаёт обработчик с уже готовыми планами. Вызывается только из {@link #create}, после
@@ -109,15 +111,18 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @param rt      окружение времени выполнения: источник соединений, исполнитель, перевод ошибок
      * @param plans   планы вызова процедур, по методам интерфейса
      * @param queries  разобранные {@code @SqlQuery}, по методам интерфейса
-     * @param timeouts срок вызова в секундах, по методам интерфейса
+     * @param timeouts   срок вызова в секундах, по методам интерфейса
+     * @param batchSizes размер пачки пакетных методов
      */
     private PlsqlApiInvocationHandler(Class<?> api, PlsqlRuntime rt, Map<Method, CallPlan> plans,
-                                      Map<Method, QueryPlan> queries, Map<Method, Integer> timeouts) {
+                                      Map<Method, QueryPlan> queries, Map<Method, Integer> timeouts,
+                                      Map<Method, Integer> batchSizes) {
         this.api = api;
         this.rt = rt;
         this.plans = plans;
         this.queries = queries;
         this.timeouts = timeouts;
+        this.batchSizes = batchSizes;
     }
 
     /**
@@ -162,6 +167,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
         Map<Method, CallPlan> plans = new LinkedHashMap<>();
         Map<Method, QueryPlan> queries = new LinkedHashMap<>();
         Map<Method, Integer> timeouts = new LinkedHashMap<>();
+        Map<Method, Integer> batchSizes = new LinkedHashMap<>();
         List<String> problems = new ArrayList<>();
 
         List<Method> calls = new ArrayList<>();
@@ -177,6 +183,13 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 continue;
             }
             timeouts.put(m, timeout == -1 ? rt.queryTimeout() : timeout);
+            if (p != null && p.batch()) {
+                if (p.batchSize() < 1) {
+                    problems.add(describe(m) + ": batchSize = " + p.batchSize() + "; use 1 or more");
+                    continue;
+                }
+                batchSizes.put(m, p.batchSize());
+            }
             if (q != null) {
                 if (m.isAnnotationPresent(Procedure.class)) {
                     problems.add(describe(m) + ": has both @SqlQuery and @Procedure; keep one");
@@ -222,7 +235,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             plans.forEach((m, p) -> log.debug("{}:\n{}", describe(m), p.sql()));
         }
         return (T) Proxy.newProxyInstance(api.getClassLoader(), new Class<?>[]{api},
-                new PlsqlApiInvocationHandler(api, rt, plans, queries, timeouts));
+                new PlsqlApiInvocationHandler(api, rt, plans, queries, timeouts, batchSizes));
     }
 
     /**
@@ -364,6 +377,14 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                 return unitOfWork(task, q.sql(), false, con -> query(con, q, args, task, timeout(configured)));
             }
             CallPlan plan = plans.get(method);
+            if (plan.batch()) {
+                // Без повтора после ORA-04068: при autoCommit=true часть пачек уже зафиксирована,
+                // и повтор задвоил бы их.
+                Object calls = unitOfWork(task, plan.sql(), false, con -> rt.executor()
+                        .executeBatch(con, plan, args, timeout(configured), batchSizes.get(method)));
+                Class<?> raw = plan.result().returnType().resolve(Object.class);
+                return raw == void.class || raw == Void.class ? null : Values.convert(calls, plan.result().returnType());
+            }
             if (plan.result().streams()) {
                 return streamOfWork(task, plan.sql(), rt.retryDiscardedState(),
                         con -> rt.executor().open(con, plan, args, timeout(configured)));

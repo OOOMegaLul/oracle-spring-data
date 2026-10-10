@@ -266,6 +266,82 @@ public class CallExecutor {
     }
 
     /**
+     * Выполняет пакетный план ({@code @Procedure(batch = true)}): вызывает процедуру по разу на
+     * каждый элемент параметра-списка и отправляет вызовы базе пачками по {@code batchSize}.
+     *
+     * <p>Для каждого элемента значения вычисляются из аргументов метода, где на месте списка стоит
+     * этот элемент, и текст проверяется на кодировку базы до того, как вызов попадёт в пачку.
+     * Временные LOB освобождаются после отправки своей пачки. Выходов у пакетного плана нет.
+     *
+     * @param con            соединение, на котором выполняется вызов
+     * @param plan           пакетный план
+     * @param args           аргументы метода интерфейса
+     * @param timeoutSeconds предельное время одной пачки в секундах; {@code 0} — без ограничения
+     * @param batchSize      сколько вызовов отправлять за одно обращение к базе, не меньше 1
+     * @return число выполненных вызовов (элементов списка)
+     * @throws SQLException если драйвер или база сообщили об ошибке; ошибка вызова в пачке
+     *                      приходит как {@link java.sql.BatchUpdateException}
+     * @throws IllegalArgumentException если план не пакетный
+     */
+    public long executeBatch(Connection con, CallPlan plan, Object[] args, int timeoutSeconds, int batchSize)
+            throws SQLException {
+        if (!plan.batch()) {
+            throw new IllegalArgumentException(plan.target().qualifiedName() + ": the plan is not a batch; call execute()");
+        }
+        int k = plan.batchParameter();
+        Object[] a = args.clone();
+        Object source = a[k];
+        Iterable<?> elements = source == null ? List.of()
+                : source instanceof Iterable<?> it ? it : Arrays.asList(ObjectUtils.toObjectArray(source));
+        OracleConnection oc = con.unwrap(OracleConnection.class);
+        List<CallPlan.Bind> binds = plan.binds();
+        List<Object> temporaries = new ArrayList<>();
+        Throwable failure = null;
+        long calls = 0;
+        int pending = 0;
+        try (CallableStatement cs = con.prepareCall(plan.sql())) {
+            if (timeoutSeconds > 0) {
+                cs.setQueryTimeout(timeoutSeconds);
+            }
+            Object[] values = new Object[binds.size()];
+            for (Object element : elements) {
+                a[k] = element;
+                // Значения элемента вычисляются и проверяются до того, как вызов попадёт в пачку.
+                for (int i = 0; i < binds.size(); i++) {
+                    CallPlan.Bind b = binds.get(i);
+                    values[i] = b.in() == null ? null : b.in().apply(a);
+                    if (b.in() != null) {
+                        precheck(b, values[i]);
+                    }
+                }
+                for (int i = 0; i < binds.size(); i++) {
+                    CallPlan.Bind b = binds.get(i);
+                    if (b.in() != null) {
+                        bindIn(cs, oc, i + 1, b, values[i], temporaries);
+                    }
+                }
+                cs.addBatch();
+                calls++;
+                if (++pending == batchSize) {
+                    cs.executeBatch();
+                    pending = 0;
+                    free(temporaries, null);
+                    temporaries.clear();
+                }
+            }
+            if (pending > 0) {
+                cs.executeBatch();
+            }
+        } catch (SQLException | RuntimeException | Error e) {
+            failure = e;
+            throw e;
+        } finally {
+            free(temporaries, failure);
+        }
+        return calls;
+    }
+
+    /**
      * Готовит и выполняет блок плана — общая часть {@link #execute(Connection, CallPlan, Object[], int)}
      * и {@link #open}.
      *

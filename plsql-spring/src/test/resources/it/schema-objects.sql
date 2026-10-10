@@ -259,6 +259,7 @@ create or replace package lab_run as
   procedure busy(p_seconds number, p_mark varchar2 default null);
   function slow_value(p_seconds number) return number;
   procedure say(p_text varchar2, p_fail number default 0);
+  procedure mark(p_txt varchar2, p_len out number);
 end lab_run;
 /
 create or replace package body lab_run as
@@ -283,6 +284,12 @@ create or replace package body lab_run as
     dbms_output.put_line(null);
     dbms_output.put_line('end');
     if p_fail = 1 then raise_application_error(-20043, 'failed after output'); end if;
+  end;
+  procedure mark(p_txt varchar2, p_len out number) is
+  begin
+    if p_txt = 'bad' then raise_application_error(-20044, 'bad mark'); end if;
+    insert into lab_mark values (p_txt);
+    p_len := length(p_txt);
   end;
 end lab_run;
 /
