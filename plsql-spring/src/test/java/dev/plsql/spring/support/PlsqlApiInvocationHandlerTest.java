@@ -238,6 +238,28 @@ class PlsqlApiInvocationHandlerTest {
         java.util.Set<String> nameSet();
     }
 
+    /** Состояние записи: в запрос уходит имя. */
+    enum State {
+        /** Действует. */
+        ACTIVE,
+        /** Закрыта. */
+        CLOSED
+    }
+
+    /** Запросы со списком для {@code IN}. */
+    @PlsqlApi(packageName = "PKG")
+    interface InLists {
+        /**
+         * Имена по списку номеров и состояний.
+         *
+         * @param ids    номера
+         * @param states состояния
+         * @return имена
+         */
+        @SqlQuery("select name from t where id in (:ids) and state in (:states)")
+        List<String> names(List<Long> ids, java.util.Set<State> states);
+    }
+
     /** Срок меньше {@code -1} — ошибка в аннотации. */
     @PlsqlApi(packageName = "PKG")
     interface BadTimeout {
@@ -898,5 +920,37 @@ class PlsqlApiInvocationHandlerTest {
 
         assertThat(meters.get("plsql.call").tags("plsql.target", Queries.class.getName() + ".touch",
                 "plsql.kind", "query").timer().count()).isEqualTo(1);
+    }
+
+    /**
+     * Проверяет список для {@code IN}: в тексте по знаку {@code ?} на элемент, и каждый элемент —
+     * отдельное значение ({@code enum} — своим именем); пустой список и список длиннее 1000
+     * отвергаются до обращения к базе.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void inListsAreExpanded() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        java.sql.ResultSet rs = mock(java.sql.ResultSet.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.execute()).thenReturn(true);
+        when(ps.getResultSet()).thenReturn(rs);
+        when(rs.getMetaData()).thenReturn(mock(java.sql.ResultSetMetaData.class));
+        InLists q = factory().create(InLists.class);
+
+        q.names(List.of(1L, 2L, 3L), java.util.EnumSet.of(State.ACTIVE));
+
+        verify(con).prepareStatement("select name from t where id in (?, ?, ?) and state in (?)");
+        verify(ps).setObject(1, 1L);
+        verify(ps).setObject(2, 2L);
+        verify(ps).setObject(3, 3L);
+        verify(ps).setString(4, "ACTIVE");
+        assertThatThrownBy(() -> q.names(List.of(), java.util.EnumSet.of(State.ACTIVE)))
+                .isInstanceOf(org.springframework.dao.InvalidDataAccessApiUsageException.class)
+                .hasMessageContaining(":ids is an empty list");
+        List<Long> many = java.util.stream.LongStream.rangeClosed(1, 1001).boxed().toList();
+        assertThatThrownBy(() -> q.names(many, java.util.EnumSet.of(State.ACTIVE)))
+                .hasMessageContaining("1001 values").hasMessageContaining("ORA-01795");
     }
 }

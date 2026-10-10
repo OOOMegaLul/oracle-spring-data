@@ -110,6 +110,15 @@ class PagingIT {
          */
         @SqlQuery("select level from dual connect by level <= :count")
         java.util.Set<Long> set(long count, Sort sort);
+
+        /**
+         * Числа из списка: {@code IN} со списком параметров.
+         *
+         * @param ids какие числа нужны
+         * @return найденные числа по возрастанию
+         */
+        @SqlQuery("select n from (select level n from dual connect by level <= 10) where n in (:ids) order by n")
+        List<Long> pick(List<Long> ids);
     }
 
     /** Пул к тестовой схеме. */
@@ -195,5 +204,11 @@ class PagingIT {
     @Test
     void setResult() {
         assertThat(numbers.set(4, Sort.by("level"))).containsExactlyInAnyOrder(1L, 2L, 3L, 4L);
+    }
+
+    /** Проверяет список для {@code IN} на настоящей базе: каждое число — отдельное значение. */
+    @Test
+    void inList() {
+        assertThat(numbers.pick(List.of(7L, 3L, 42L))).containsExactly(3L, 7L);
     }
 }

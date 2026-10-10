@@ -87,6 +87,9 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     private static final boolean SPRING_DATA = ClassUtils.isPresent("org.springframework.data.domain.Pageable",
             PlsqlApiInvocationHandler.class.getClassLoader());
 
+    /** Больше значений в одном {@code IN (...)} Oracle не принимает (ORA-01795). */
+    private static final int MAX_IN_LIST = 1000;
+
     /** Интерфейс, который реализует прокси; нужен для {@code toString}. */
     private final Class<?> api;
     /** Окружение времени выполнения: источник соединений, исполнитель вызовов, перевод ошибок. */
@@ -852,11 +855,19 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * останавливает вызов до отправки. {@code enum} передаётся своим именем. Параметры
      * {@code Pageable} и {@code Sort} пропускаются: они меняют сам текст запроса.
      *
+     * <p>Коллекция — список для {@code IN}: {@code where id in (:ids)} со списком из трёх чисел
+     * становится {@code where id in (?, ?, ?)}, и каждое число — отдельное значение. Spring
+     * раскрывает в тексте только знаки {@code ?}, а сами значения оставляет одним списком; здесь
+     * они раскладываются по одному. Пустой список и список длиннее 1000 элементов — ошибка до
+     * обращения к базе: {@code IN ()} не SQL, а больше 1000 значений в {@code IN} Oracle не
+     * принимает (ORA-01795).
+     *
      * @param q    разобранный запрос
      * @param args аргументы вызова в порядке параметров метода
      * @return текст с {@code ?} и значения по порядку
      * @throws CharsetGuard.UnrepresentableCharacterException если строку нельзя сохранить в
      *         кодировке базы
+     * @throws InvalidDataAccessApiUsageException если список для {@code IN} пустой или длиннее 1000
      */
     private Bound bind(QueryPlan q, Object[] args) {
         MapSqlParameterSource params = new MapSqlParameterSource();
@@ -864,14 +875,62 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             if (q.names()[i] == null) {
                 continue; // Pageable или Sort
             }
-            Object v = args[i];
-            if (v instanceof CharSequence s) {
-                rt.charsetGuard().check(q.names()[i], s);
-            }
-            params.addValue(q.names()[i], v instanceof Enum<?> e ? e.name() : v);
+            params.addValue(q.names()[i], value(q.names()[i], args[i]));
         }
-        return new Bound(NamedParameterUtils.substituteNamedParameters(q.parsed(), params),
-                NamedParameterUtils.buildValueArray(q.parsed(), params, null));
+        Object[] values = NamedParameterUtils.buildValueArray(q.parsed(), params, null);
+        List<Object> flat = new ArrayList<>(values.length);
+        for (Object v : values) {
+            if (v instanceof Collection<?> c) {
+                for (Object e : c) {
+                    // Элемент-массив — строка набора: (a, b) IN ((?, ?), (?, ?)).
+                    if (e instanceof Object[] tuple) {
+                        flat.addAll(Arrays.asList(tuple));
+                    } else {
+                        flat.add(e);
+                    }
+                }
+            } else {
+                flat.add(v);
+            }
+        }
+        return new Bound(NamedParameterUtils.substituteNamedParameters(q.parsed(), params), flat.toArray());
+    }
+
+    /**
+     * Готовит значение одного именованного параметра: строку проверяет на кодировку базы,
+     * {@code enum} заменяет его именем, у коллекции делает то же для каждого элемента.
+     *
+     * @param name имя параметра для сообщений
+     * @param v    значение аргумента
+     * @return значение для подстановки
+     * @throws CharsetGuard.UnrepresentableCharacterException если строку нельзя сохранить в
+     *         кодировке базы
+     * @throws InvalidDataAccessApiUsageException если коллекция пустая или длиннее 1000
+     */
+    private Object value(String name, Object v) {
+        if (v instanceof CharSequence s) {
+            rt.charsetGuard().check(name, s);
+            return v;
+        }
+        if (v instanceof Enum<?> e) {
+            return e.name();
+        }
+        if (v instanceof Collection<?> c) {
+            if (c.isEmpty()) {
+                throw new InvalidDataAccessApiUsageException(":" + name + " is an empty list; IN () is not valid SQL,"
+                        + " so check for an empty list before calling");
+            }
+            if (c.size() > MAX_IN_LIST) {
+                throw new InvalidDataAccessApiUsageException(":" + name + " has " + c.size() + " values; Oracle takes"
+                        + " at most " + MAX_IN_LIST + " in one IN list (ORA-01795)");
+            }
+            List<Object> out = new ArrayList<>(c.size());
+            for (Object e : c) {
+                out.add(value(name, e));
+            }
+            return out;
+        }
+        return v;
     }
 
     /**
