@@ -78,6 +78,8 @@ public class PlsqlAutoConfiguration {
      * @param defaults   необязательный бин со значениями аргументов, которых нет в методах Java
      *                   (например, {@code NTENANT})
      * @param signatures необязательный источник сигнатур подпрограмм вместо словаря Oracle
+     * @param observations реестр наблюдений Micrometer (его создаёт Spring Boot Actuator); если
+     *                   его нет или их несколько без основного, метрики не пишутся
      * @return готовая фабрика
      * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1
      * @throws org.springframework.beans.factory.NoUniqueBeanDefinitionException если бинов
