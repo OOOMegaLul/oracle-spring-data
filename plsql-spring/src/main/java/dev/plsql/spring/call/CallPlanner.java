@@ -314,7 +314,8 @@ public class CallPlanner {
         }
 
         String sql = b.render(callStmt);
-        return new CallPlan(sp, sql, b.binds(), b.recordOuts(), new CallPlan.Result(returnType, returnKey, outsToType));
+        return new CallPlan(sp, sql, b.binds(), b.recordOuts(), b.tableOuts(),
+                new CallPlan.Result(returnType, returnKey, outsToType), -1);
     }
 
     // ------------------------------------------------------------------ аргументы
@@ -361,8 +362,9 @@ public class CallPlanner {
                     throw new PlanException("argument " + a.name() + " is an IN REF CURSOR; a cursor cannot be sent from Java");
                 }
             }
-            case XMLTYPE, RECORD -> {
-                // Всегда через переменную блока.
+            case XMLTYPE, RECORD, INDEX_TABLE -> {
+                // Всегда через переменную блока; index-by таблица сюда попадает, только если драйвер
+                // не передаёт её сам, и раскладывается по полям.
             }
             default -> throw new PlanException("argument " + a.name() + " has unsupported type " + a.dataType());
         }
@@ -391,7 +393,7 @@ public class CallPlanner {
      */
     private static boolean bindsDirectly(ArgumentInfo a) {
         ArgKind k = a.kind();
-        return k.isScalar() || k == ArgKind.SQL_COLLECTION || k == ArgKind.OBJECT || k == ArgKind.INDEX_TABLE
+        return k.isScalar() || k == ArgKind.SQL_COLLECTION || k == ArgKind.OBJECT || directTable(a)
                 || (k == ArgKind.REF_CURSOR && !a.isIn());
     }
 
@@ -433,8 +435,102 @@ public class CallPlanner {
                     writeInto(b, target + "." + name, f, args -> Values.property(in.apply(args), name));
                 }
             }
+            case INDEX_TABLE -> {
+                if (directTable(a)) {
+                    b.pre(target + " := ", new CallPlan.Bind(ArgKind.INDEX_TABLE, a, in, null, null), ";");
+                } else {
+                    splitIn(b, target, a, in);
+                }
+            }
             default -> b.pre(target + " := ", new CallPlan.Bind(a.kind(), a, in, null, null), ";");
         }
+    }
+
+    /**
+     * Переносит входную index-by таблицу, которую драйвер не передаёт сам, в переменную блока:
+     * каждое поле элемента приходит своей простой таблицей, а цикл раскладывает их по элементам
+     * {@code target(1)}, {@code target(2)}... (см. {@link TableSplit}).
+     *
+     * @param b      собираемый блок
+     * @param target переменная или поле записи типа index-by таблицы
+     * @param table  описание таблицы
+     * @param in     откуда берётся список Java
+     */
+    private void splitIn(Block b, String target, ArgumentInfo table, Function<Object[], Object> in) {
+        List<TableSplit.Leaf> leaves = TableSplit.leaves(table);
+        List<String> vars = new ArrayList<>();
+        for (TableSplit.Leaf leaf : leaves) {
+            String f = b.variable(b.indexType(leaf.transport()));
+            b.pre(f + " := ", new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.leafTable(table, leaf),
+                    args -> TableSplit.values(in.apply(args), leaf), null, null), ";");
+            vars.add(f);
+        }
+        String j = b.loopVariable();
+        StringBuilder loop = new StringBuilder("FOR " + j + " IN 1 .. " + vars.get(0) + ".COUNT LOOP");
+        for (int k = 0; k < leaves.size(); k++) {
+            TableSplit.Leaf leaf = leaves.get(k);
+            loop.append(' ').append(target).append('(').append(j).append(')').append(leaf.suffix()).append(" := ")
+                    .append(TableSplit.toField(vars.get(k) + "(" + j + ")", leaf.field())).append(';');
+        }
+        b.pre(loop.append(" END LOOP;").toString());
+    }
+
+    /**
+     * Переносит выходную index-by таблицу, которую драйвер не передаёт сам, в простые таблицы по
+     * полям: цикл обходит элементы по ключам ({@code FIRST}/{@code NEXT}, таблица может быть
+     * разреженной) и кладёт поля в простые таблицы с ключа 1. Каждая простая таблица возвращается
+     * своей привязкой с ключом {@code key[].ПОЛЕ}; исполнитель собирает их обратно в список.
+     *
+     * @param b      собираемый блок
+     * @param source переменная или поле записи типа index-by таблицы
+     * @param table  описание таблицы
+     * @param key    ключ, под которым список окажется в выходных значениях
+     */
+    private void splitOut(Block b, String source, ArgumentInfo table, String key) {
+        List<TableSplit.Leaf> leaves = TableSplit.leaves(table);
+        List<String> vars = new ArrayList<>();
+        for (TableSplit.Leaf leaf : leaves) {
+            vars.add(b.variable(b.indexType(leaf.transport())));
+        }
+        String n = b.variable("PLS_INTEGER");
+        // Ключ в строке: так подходят и таблицы INDEX BY PLS_INTEGER, и INDEX BY VARCHAR2.
+        String i = b.variable("VARCHAR2(32767)");
+        StringBuilder loop = new StringBuilder(n + " := 0; " + i + " := " + source + ".FIRST; WHILE " + i
+                + " IS NOT NULL LOOP " + n + " := " + n + " + 1;");
+        for (int k = 0; k < leaves.size(); k++) {
+            TableSplit.Leaf leaf = leaves.get(k);
+            loop.append(' ').append(vars.get(k)).append('(').append(n).append(") := ")
+                    .append(TableSplit.toTransport(source + "(" + i + ")" + leaf.suffix(), leaf.field())).append(';');
+        }
+        loop.append(' ').append(i).append(" := ").append(source).append(".NEXT(").append(i).append("); END LOOP;");
+        b.post(loop.toString());
+        for (int k = 0; k < leaves.size(); k++) {
+            TableSplit.Leaf leaf = leaves.get(k);
+            b.post(new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.leafTable(table, leaf), null,
+                    key + "[]" + leaf.suffix(), null), " := " + vars.get(k) + ";");
+        }
+        b.tableOut(key);
+    }
+
+    /**
+     * Проверяет, передаёт ли драйвер эту index-by таблицу сам (таблицы чисел, строк и дат).
+     *
+     * @param a аргумент или поле
+     * @return {@code true} для index-by таблицы, которая привязывается напрямую
+     */
+    private static boolean directTable(ArgumentInfo a) {
+        return a.kind() == ArgKind.INDEX_TABLE && !a.children().isEmpty() && TableSplit.direct(a.children().get(0));
+    }
+
+    /**
+     * Проверяет, есть ли в аргументе index-by таблица: он сам или поле записи на любой глубине.
+     *
+     * @param a аргумент или поле
+     * @return {@code true}, если index-by таблица есть
+     */
+    private static boolean containsIndexTable(ArgumentInfo a) {
+        return a.kind() == ArgKind.INDEX_TABLE
+                || (a.kind() == ArgKind.RECORD && a.children().stream().anyMatch(CallPlanner::containsIndexTable));
     }
 
     /**
@@ -471,6 +567,13 @@ public class CallPlanner {
                     readBack(b, source + "." + f.name(), f, key + "." + f.name(), null);
                 }
                 b.recordOut(key);
+            }
+            case INDEX_TABLE -> {
+                if (directTable(a)) {
+                    b.post(new CallPlan.Bind(ArgKind.INDEX_TABLE, a, null, key, type), " := " + source + ";");
+                } else {
+                    splitOut(b, source, a, key);
+                }
             }
             default -> b.post(new CallPlan.Bind(a.kind(), a, null, key, type), " := " + source + ";");
         }
@@ -516,6 +619,13 @@ public class CallPlanner {
             case XMLTYPE -> "XMLTYPE";
             case REF_CURSOR -> "SYS_REFCURSOR";
             case RECORD -> recordType(a);
+            case INDEX_TABLE -> {
+                if (a.declaredType() == null) {
+                    throw new PlanException("index-by table " + (a.name() == null ? "return value" : a.name())
+                            + " has no type name in ALL_ARGUMENTS");
+                }
+                yield a.declaredType();
+            }
             default -> throw new PlanException((a.name() == null ? "return value" : a.name()) + " of type "
                     + a.dataType() + " is not supported");
         };
@@ -559,6 +669,11 @@ public class CallPlanner {
         if (f.kind() == ArgKind.RECORD) {
             return !f.children().isEmpty() && f.children().stream().allMatch(CallPlanner::fieldSupported);
         }
+        if (f.kind() == ArgKind.INDEX_TABLE) {
+            // Таблица в поле записи: напрямую или по полям, но без таблиц внутри её элементов.
+            return !f.children().isEmpty() && (TableSplit.direct(f.children().get(0))
+                    || TableSplit.splitIssue(f.children().get(0)) == null);
+        }
         return f.kind().isScalar() || f.kind() == ArgKind.BOOLEAN || f.kind() == ArgKind.XMLTYPE;
     }
 
@@ -593,7 +708,7 @@ public class CallPlanner {
             List<String> bad = new ArrayList<>();
             unsupportedFields(rec, "", bad);
             throw new PlanException("record " + rec.name() + " field " + String.join(", ", bad)
-                    + "; only scalar, BOOLEAN, XMLTYPE fields and records of them are supported");
+                    + "; supported are scalar, BOOLEAN, XMLTYPE fields, records of them and index-by tables");
         }
     }
 
@@ -613,9 +728,10 @@ public class CallPlanner {
     private static void checkIndexTable(ArgumentInfo a) {
         if (a.kind() == ArgKind.INDEX_TABLE) {
             ArgumentInfo el = a.children().isEmpty() ? null : a.children().get(0);
-            if (el == null || (el.kind() != ArgKind.NUMBER && el.kind() != ArgKind.STRING)) {
-                throw new PlanException("index-by table " + (a.name() == null ? "return value" : a.name()) + " of " + (el == null ? "?" : el.dataType())
-                        + " cannot be bound on 11.2; only tables of NUMBER or VARCHAR2 can");
+            if (el == null || !TableSplit.direct(el)) {
+                throw new PlanException("index-by table " + (a.name() == null ? "return value" : a.name()) + " of "
+                        + (el == null ? "?" : el.dataType()) + " cannot be bound directly; only tables of NUMBER,"
+                        + " VARCHAR2 or DATE can");
             }
         }
     }
@@ -660,8 +776,10 @@ public class CallPlanner {
                 }
                 case INDEX_TABLE -> {
                     ArgumentInfo el = a.children().isEmpty() ? null : a.children().get(0);
-                    if (el == null || (el.kind() != ArgKind.NUMBER && el.kind() != ArgKind.STRING)) {
-                        issues.add(who + ": index-by table of " + (el == null ? "?" : el.dataType()));
+                    if (el == null) {
+                        issues.add(who + ": index-by table of unknown elements");
+                    } else if (!TableSplit.direct(el) && TableSplit.splitIssue(el) != null) {
+                        issues.add(who + ": index-by table of " + el.dataType() + ": " + TableSplit.splitIssue(el));
                     }
                 }
                 case UNSUPPORTED -> issues.add(who + ": type " + a.dataType());
@@ -736,8 +854,9 @@ public class CallPlanner {
         Block b = new Block();
         List<String> callArgs = new ArrayList<>();
         for (ArgumentInfo a : sp.arguments()) {
-            if (a.kind() == ArgKind.REF_CURSOR || a.kind() == ArgKind.INDEX_TABLE) {
-                throw new PlanException("argument " + a.name() + " is " + a.dataType() + ", which cannot be batched");
+            if (a.kind() == ArgKind.REF_CURSOR || containsIndexTable(a)) {
+                throw new PlanException("argument " + a.name() + " is or contains " + (a.kind() == ArgKind.REF_CURSOR
+                        ? a.dataType() : "an index-by table") + ", which cannot be batched");
             }
             if (a.isOut() && a.isIn()) {
                 throw new PlanException("argument " + a.name() + " is IN OUT, which cannot be batched:"
@@ -765,7 +884,7 @@ public class CallPlanner {
             callArgs.add(a.name() + " => " + argument(b, a, in, null, null));
         }
         String call = sp.qualifiedName() + (callArgs.isEmpty() ? "" : "(" + String.join(", ", callArgs) + ")");
-        return new CallPlan(sp, b.render(call + ";"), b.binds(), b.recordOuts(),
+        return new CallPlan(sp, b.render(call + ";"), b.binds(), b.recordOuts(), b.tableOuts(),
                 new CallPlan.Result(returnType, null, false), batchParameter);
     }
 
@@ -927,8 +1046,8 @@ public class CallPlanner {
         if (raw == Object.class) {
             return List.of(); // что лежит в Object, видно только при вызове
         }
-        if (a.kind() == ArgKind.SQL_COLLECTION && !a.children().isEmpty()
-                && a.children().get(0).kind() == ArgKind.OBJECT) {
+        if (!a.children().isEmpty() && ((a.kind() == ArgKind.SQL_COLLECTION && a.children().get(0).kind() == ArgKind.OBJECT)
+                || (a.kind() == ArgKind.INDEX_TABLE && a.children().get(0).kind() == ArgKind.RECORD))) {
             ResolvableType el = raw.isArray() ? javaType.getComponentType()
                     : Collection.class.isAssignableFrom(raw) ? javaType.asCollection().getGeneric(0) : ResolvableType.NONE;
             return el == ResolvableType.NONE ? List.of() : missingProperties(a.children().get(0), el);
@@ -1394,6 +1513,15 @@ public class CallPlanner {
         /** Ключи выходных записей, чьи поля потом собираются обратно в одну карту. */
         private final List<String> recordOuts = new ArrayList<>();
 
+        /** Объявления типов простых index-by таблиц, по имени типа. */
+        private final Map<String, String> types = new LinkedHashMap<>();
+
+        /** Выходные index-by таблицы, разложенные по полям. */
+        private final List<String> tableOuts = new ArrayList<>();
+
+        /** Счётчик переменных циклов {@code FOR}. */
+        private int loops;
+
         /** Итоговые привязки в порядке {@code ?} в тексте; заполняются в {@code render}. */
         private final List<CallPlan.Bind> ordered = new ArrayList<>();
         /** Собран ли уже текст блока: {@link #render} вызывается один раз. */
@@ -1476,6 +1604,72 @@ public class CallPlanner {
         }
 
         /**
+         * Объявляет (один раз) тип простой index-by таблицы, в которой едет поле, и возвращает его имя.
+         *
+         * @param transport {@code NUMBER}, {@code STRING} или {@code DATE}
+         * @return имя типа для объявления переменной
+         */
+        String indexType(ArgKind transport) {
+            String name = switch (transport) {
+                case NUMBER -> "plsql_t_num";
+                case DATE -> "plsql_t_date";
+                default -> "plsql_t_str";
+            };
+            String element = switch (transport) {
+                case NUMBER -> "NUMBER";
+                case DATE -> "DATE";
+                default -> "VARCHAR2(32767)";
+            };
+            types.putIfAbsent(name, "TYPE " + name + " IS TABLE OF " + element + " INDEX BY PLS_INTEGER;");
+            return name;
+        }
+
+        /**
+         * Возвращает имя для переменной нового цикла {@code FOR}; объявлять её не нужно.
+         *
+         * @return имя переменной цикла
+         */
+        String loopVariable() {
+            return "j" + (++loops);
+        }
+
+        /**
+         * Добавляет оператор без привязок до вызова.
+         *
+         * @param text оператор PL/SQL целиком
+         */
+        void pre(String text) {
+            before.add(new Statement(text, null, ""));
+        }
+
+        /**
+         * Добавляет оператор без привязок после вызова.
+         *
+         * @param text оператор PL/SQL целиком
+         */
+        void post(String text) {
+            after.add(new Statement(text, null, ""));
+        }
+
+        /**
+         * Запоминает выходную таблицу, разложенную по полям, чтобы исполнитель собрал её обратно.
+         *
+         * @param key ключ таблицы
+         */
+        void tableOut(String key) {
+            tableOuts.add(key);
+        }
+
+        /**
+         * Возвращает выходные таблицы, разложенные по полям.
+         *
+         * @return ключи таблиц
+         */
+        List<String> tableOuts() {
+            return tableOuts;
+        }
+
+        /**
          * Собирает итоговый текст блока и заполняет список привязок в порядке {@code ?}.
          *
          * <p>Секция {@code DECLARE} выводится, только если объявлены переменные. Блок собирается
@@ -1491,8 +1685,9 @@ public class CallPlanner {
             }
             rendered = true;
             StringBuilder sb = new StringBuilder();
-            if (!declarations.isEmpty()) {
+            if (!declarations.isEmpty() || !types.isEmpty()) {
                 sb.append("DECLARE\n");
+                types.values().forEach(t -> sb.append("  ").append(t).append('\n'));
                 declarations.forEach(d -> sb.append("  ").append(d).append('\n'));
             }
             sb.append("BEGIN\n");
@@ -1515,6 +1710,10 @@ public class CallPlanner {
          */
         private void append(StringBuilder sb, List<Statement> statements) {
             for (Statement s : statements) {
+                if (s.bind() == null) {
+                    sb.append("  ").append(s.head()).append('\n');
+                    continue;
+                }
                 sb.append("  ").append(s.head()).append('?').append(s.tail()).append('\n');
                 ordered.add(s.bind());
             }

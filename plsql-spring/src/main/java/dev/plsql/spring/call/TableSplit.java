@@ -227,8 +227,11 @@ final class TableSplit {
      */
     static String toTransport(String expr, ArgumentInfo field) {
         return switch (field.kind()) {
+            // С поясом — в UTC: SYS_EXTRACT_UTC принимает и WITH TIME ZONE, и WITH LOCAL TIME ZONE, а
+            // CAST внутри PL/SQL на 11.2 даёт PLS-00382. Java всё равно получает момент времени.
             case TIMESTAMP -> withZone(field)
-                    ? "TO_CHAR(CAST(" + expr + " AS TIMESTAMP WITH TIME ZONE), '" + TSTZ_FORMAT + "')"
+                    ? "CASE WHEN " + expr + " IS NULL THEN NULL ELSE TO_CHAR(SYS_EXTRACT_UTC(" + expr + "), '"
+                            + TS_FORMAT + "') || ' +00:00' END"
                     : "TO_CHAR(" + expr + ", '" + TS_FORMAT + "')";
             case BOOLEAN -> "CASE WHEN " + expr + " THEN 1 WHEN NOT " + expr + " THEN 0 END";
             default -> expr;

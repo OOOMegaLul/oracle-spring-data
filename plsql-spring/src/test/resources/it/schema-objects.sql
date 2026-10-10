@@ -293,3 +293,77 @@ create or replace package body lab_run as
   end;
 end lab_run;
 /
+-- Index-by tables the driver cannot bind itself: records, TIMESTAMP, BOOLEAN; a table as a record
+-- field. Keys of ROWS_OUT are sparse (10, 20, 30) on purpose.
+create or replace package lab_tab as
+  type addr_t is record (city varchar2(50), zip number);
+  type row_t is record (id number, name varchar2(50), flag boolean, hired date, stamp timestamp,
+                        zoned timestamp with time zone, addr addr_t);
+  type row_tab is table of row_t index by pls_integer;
+  type ts_tab is table of timestamp index by pls_integer;
+  type bool_tab is table of boolean index by pls_integer;
+  type date_tab is table of date index by pls_integer;
+  type order_t is record (id number, lines row_tab);
+  function rows_out(p_n number) return row_tab;
+  function rows_echo(p_rows row_tab) return row_tab;
+  procedure rows_inout(p_rows in out row_tab);
+  function stamps(p_vals ts_tab) return ts_tab;
+  function flags(p_vals bool_tab) return bool_tab;
+  function dates(p_vals date_tab) return date_tab;
+  function order_echo(p_o order_t) return order_t;
+end lab_tab;
+/
+create or replace package body lab_tab as
+  function rows_out(p_n number) return row_tab is
+    r row_tab;
+  begin
+    for i in 1..p_n loop
+      r(i * 10).id := i;
+      r(i * 10).name := 'row ' || i;
+      r(i * 10).flag := mod(i, 2) = 0;
+      r(i * 10).hired := date '2024-01-01' + i;
+      r(i * 10).stamp := timestamp '2024-01-01 10:00:00.123456789' + numtodsinterval(i, 'HOUR');
+      r(i * 10).zoned := to_timestamp_tz('2024-01-01 10:00:00.5 +03:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM');
+      r(i * 10).addr.city := 'city ' || i;
+      r(i * 10).addr.zip := 100 + i;
+    end loop;
+    return r;
+  end;
+  function rows_echo(p_rows row_tab) return row_tab is
+    r row_tab := p_rows;
+    i pls_integer := r.first;
+  begin
+    while i is not null loop r(i).id := r(i).id + 1; i := r.next(i); end loop;
+    return r;
+  end;
+  procedure rows_inout(p_rows in out row_tab) is
+    i pls_integer := p_rows.first;
+  begin
+    while i is not null loop p_rows(i).name := upper(p_rows(i).name); i := p_rows.next(i); end loop;
+  end;
+  function stamps(p_vals ts_tab) return ts_tab is
+    r ts_tab;
+  begin
+    for i in 1..p_vals.count loop r(i) := p_vals(i) + interval '1' day; end loop;
+    return r;
+  end;
+  function flags(p_vals bool_tab) return bool_tab is
+    r bool_tab;
+  begin
+    for i in 1..p_vals.count loop r(i) := not p_vals(i); end loop;
+    return r;
+  end;
+  function dates(p_vals date_tab) return date_tab is
+    r date_tab;
+  begin
+    for i in 1..p_vals.count loop r(i) := p_vals(i) + 1; end loop;
+    return r;
+  end;
+  function order_echo(p_o order_t) return order_t is
+    r order_t := p_o;
+  begin
+    r.id := nvl(r.id, 0) + r.lines.count;
+    return r;
+  end;
+end lab_tab;
+/

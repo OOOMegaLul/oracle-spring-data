@@ -28,6 +28,9 @@ import dev.plsql.spring.meta.SubprogramInfo;
  * @param binds      по одной записи на каждый плейсхолдер, в порядке их появления в тексте
  * @param recordOuts OUT-аргументы типа RECORD, чьи поля возвращаются отдельными привязками
  *                   ({@code ARG.FIELD}) и затем собираются обратно в одну карту
+ * @param tableOuts  выходные index-by таблицы, разложенные по полям (записей, {@code TIMESTAMP},
+ *                   {@code BOOLEAN}): их поля возвращаются отдельными простыми таблицами
+ *                   ({@code ARG[].FIELD}) и собираются обратно в список
  * @param result     как выходные значения превращаются в результат метода
  * @param batchParameter номер параметра метода, по элементам которого процедура вызывается
  *                   пакетом ({@code @Procedure(batch = true)}), или {@code -1} для обычного вызова
@@ -37,6 +40,7 @@ public record CallPlan(
         String sql,
         List<Bind> binds,
         List<String> recordOuts,
+        List<String> tableOuts,
         Result result,
         int batchParameter) {
 
@@ -50,7 +54,7 @@ public record CallPlan(
      * @param result     как выходные значения превращаются в результат метода
      */
     public CallPlan(SubprogramInfo target, String sql, List<Bind> binds, List<String> recordOuts, Result result) {
-        this(target, sql, binds, recordOuts, result, -1);
+        this(target, sql, binds, recordOuts, List.of(), result, -1);
     }
 
     /**

@@ -335,16 +335,6 @@ class LabApiIT {
      */
     @PlsqlApi(packageName = "LAB_PKG")
     interface Unsupported {
-        /**
-         * Функция {@code LAB_PKG.RECS} существует, но возвращает index-by таблицу записей
-         * ({@code REC_IBT}), а такую форму библиотека не поддерживает: на 11.2 её не передать через
-         * JDBC.
-         *
-         * @param n число записей
-         * @return никогда не возвращает: реализация интерфейса не создаётся
-         */
-        List<Object> recs(int n);
-
         /** Процедуры {@code LAB_PKG.NO_SUCH_PROCEDURE} в базе нет. */
         void noSuchProcedure();
 
@@ -370,9 +360,8 @@ class LabApiIT {
 
     /**
      * Проверяет, что при создании реализации {@link Unsupported} библиотека сверяет все методы со
-     * словарём и бросает одно {@code IllegalStateException}, в котором перечислены все три проблемы
-     * сразу: неподдерживаемая index-by таблица записей, несуществующая процедура и параметр без
-     * аргумента.
+     * словарём и бросает одно {@code IllegalStateException}, в котором перечислены все проблемы
+     * сразу: несуществующая процедура, параметр без аргумента и объект с атрибутом {@code XMLTYPE}.
      *
      * <p>Ошибка должна случаться при старте приложения, а не при первом вызове в работе, и сразу по
      * всем методам, чтобы расхождения не приходилось чинить по одному.
@@ -381,8 +370,6 @@ class LabApiIT {
     void mismatchesAreReportedTogetherAtCreation() {
         assertThatThrownBy(() -> factory.create(Unsupported.class))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("Unsupported.recs")
-                .hasMessageContaining("index-by table")
                 .hasMessageContaining("Unsupported.noSuchProcedure")
                 .hasMessageContaining("not found")
                 .hasMessageContaining("'extra' has no matching argument")

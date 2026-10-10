@@ -187,6 +187,7 @@ public class CallExecutor {
         } finally {
             free(temporaries, failure);
         }
+        TableSplit.fold(outs, plan.tableOuts());
         foldRecords(outs, plan.recordOuts());
         return plan.result().assemble(outs);
     }
@@ -575,9 +576,8 @@ public class CallExecutor {
                 ArgumentInfo el = b.arg().children().get(0);
                 Object[] values = elements(v, el, b.arg());
                 OracleCallableStatement ocs = cs.unwrap(OracleCallableStatement.class);
-                ocs.setPlsqlIndexTable(idx, values, Math.max(values.length, 1), values.length,
-                        el.kind() == ArgKind.NUMBER ? OracleTypes.NUMBER : OracleTypes.VARCHAR,
-                        el.kind() == ArgKind.NUMBER ? 0 : longest(values, b.arg()));
+                ocs.setPlsqlIndexTable(idx, values, Math.max(values.length, 1), values.length, oracleType(el),
+                        el.kind() == ArgKind.STRING ? longest(values, b.arg()) : 0);
             }
             default -> throw new IllegalStateException("cannot bind " + b.kind() + " as IN");
         }
@@ -653,11 +653,14 @@ public class CallExecutor {
      */
     private Object[] elements(Object v, ArgumentInfo el, ArgumentInfo table) {
         Collection<?> c = asCollection(v);
-        Object[] out = el.kind() == ArgKind.NUMBER ? new BigDecimal[c.size()] : new String[c.size()];
+        Object[] out = el.kind() == ArgKind.NUMBER ? new BigDecimal[c.size()]
+                : el.kind() == ArgKind.DATE ? new java.sql.Timestamp[c.size()] : new String[c.size()];
         int i = 0;
         for (Object o : c) {
             if (el.kind() == ArgKind.NUMBER) {
                 out[i++] = Values.toNumber(o);
+            } else if (el.kind() == ArgKind.DATE) {
+                out[i++] = o == null ? null : Values.toTimestamp(o);
             } else {
                 String s = o == null ? null : Values.toText(o);
                 if (s != null && !isNational(el)) {
@@ -722,24 +725,44 @@ public class CallExecutor {
      *                                   {@code indexTableMaxLength}
      */
     public void verify(CallPlan plan) {
+        // Таблица записей едет несколькими таблицами строк, по одной на поле, и резервируется
+        // каждая; поэтому считается сумма по всему вызову.
+        long total = 0;
+        int chars = 0;
+        List<String> tables = new ArrayList<>();
         for (CallPlan.Bind b : plan.binds()) {
             if (b.outKey() == null || b.kind() != ArgKind.INDEX_TABLE || b.arg().children().isEmpty()) {
                 continue;
             }
             ArgumentInfo el = b.arg().children().get(0);
-            if (el.kind() == ArgKind.NUMBER) {
+            if (el.kind() != ArgKind.STRING) {
                 continue;
             }
             int len = declaredLength(el);
-            long reserve = (long) indexTableMaxLength * len;
-            if (reserve > MAX_INDEX_TABLE_RESERVE) {
-                String who = b.arg().name() == null ? "return value" : b.arg().name();
-                throw new CallPlanner.PlanException("OUT index-by table " + who + " of " + el.dataType() + "(" + len
-                        + ") would reserve about " + reserve * 19 / 4 / 1_048_576 + " MB per call for "
-                        + indexTableMaxLength + " elements; lower plsql.index-table-max-length to "
-                        + MAX_INDEX_TABLE_RESERVE / len + " or less");
-            }
+            total += (long) indexTableMaxLength * len;
+            chars += len;
+            tables.add((b.arg().name() == null ? "return value" : b.arg().name()) + " of " + el.dataType() + "(" + len + ")");
         }
+        if (total > MAX_INDEX_TABLE_RESERVE) {
+            throw new CallPlanner.PlanException("OUT index-by " + (tables.size() == 1 ? "table " : "tables ")
+                    + String.join(", ", tables) + " would reserve about " + total * 19 / 4 / 1_048_576
+                    + " MB per call for " + indexTableMaxLength + " elements; lower plsql.index-table-max-length to "
+                    + MAX_INDEX_TABLE_RESERVE / chars + " or less");
+        }
+    }
+
+    /**
+     * Возвращает код типа ojdbc для элемента index-by таблицы: число, дата или строка.
+     *
+     * @param el описание элемента
+     * @return {@code OracleTypes.NUMBER}, {@code DATE} или {@code VARCHAR}
+     */
+    private static int oracleType(ArgumentInfo el) {
+        return switch (el.kind()) {
+            case NUMBER -> OracleTypes.NUMBER;
+            case DATE -> OracleTypes.DATE;
+            default -> OracleTypes.VARCHAR;
+        };
     }
 
     /**
@@ -894,8 +917,7 @@ public class CallExecutor {
             case INDEX_TABLE -> {
                 ArgumentInfo el = b.arg().children().get(0);
                 cs.unwrap(OracleCallableStatement.class).registerIndexTableOutParameter(idx, indexTableMaxLength,
-                        el.kind() == ArgKind.NUMBER ? OracleTypes.NUMBER : OracleTypes.VARCHAR,
-                        el.kind() == ArgKind.NUMBER ? 0 : declaredLength(el));
+                        oracleType(el), el.kind() == ArgKind.STRING ? declaredLength(el) : 0);
             }
             default -> throw new IllegalStateException("cannot read " + b.kind() + " as OUT");
         }
@@ -965,7 +987,7 @@ public class CallExecutor {
             case INDEX_TABLE -> {
                 // Arrays.asList, а не List.of: элемент index-by таблицы может быть NULL.
                 Object[] raw = (Object[]) cs.unwrap(OracleCallableStatement.class).getPlsqlIndexTable(idx);
-                yield raw == null ? List.of() : Arrays.asList(raw);
+                yield raw == null ? List.of() : TableSplit.fromTransport(Arrays.asList(raw), b.arg().children().get(0));
             }
             default -> throw new IllegalStateException("cannot read " + b.kind());
         };

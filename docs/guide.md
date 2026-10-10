@@ -436,6 +436,38 @@ Person savePerson(Person p);
 `VARCHAR2(4000)` — около 190 МБ. Если резерв получается больше 240 МБ, приложение не стартует и
 подсказывает, до скольки уменьшить `plsql.index-table-max-length`.
 
+### Index-by таблицы записей, дат, `TIMESTAMP` и `BOOLEAN`
+
+Драйвер Oracle сам передаёт только index-by таблицы чисел, строк и дат. Таблицы `TIMESTAMP` на
+11.2 он ломает: на входе сервер падает с ORA-00600, на выходе рвётся соединение (проверено). Таблицы
+записей не передаёт вовсе. Библиотека обходит это внутри блока: такая таблица едет несколькими
+простыми таблицами, по одной на поле, и цикл в блоке перекладывает значения.
+
+```sql
+-- в пакете
+type emp_t   is record (id number, name varchar2(100), active boolean, hired date);
+type emp_tab is table of emp_t index by pls_integer;
+function team(p_dept number) return emp_tab;
+procedure hire_all(p_emps emp_tab);
+```
+
+```java
+record Emp(long id, String name, boolean active, LocalDate hired) {}
+
+List<Emp> team(long dept);
+void hireAll(List<Emp> emps);
+```
+
+- Работает в обе стороны и для `IN OUT`, с вложенными записями, полями `BOOLEAN`, `DATE`,
+  `TIMESTAMP` и `TIMESTAMP WITH TIME ZONE`, а также для таблицы, которая сама — поле записи
+  (`type order_t is record (id number, lines emp_tab)`).
+- Выходная таблица приходит списком в порядке ключей; ключи (они бывают разреженными: 10, 20,
+  30) не возвращаются. Входная таблица заполняется с ключа 1.
+- `TIMESTAMP` без указанной точности хранит 6 знаков после запятой: наносекунды Java Oracle
+  округлит. `TIMESTAMP WITH TIME ZONE` возвращается моментом времени (`Instant`), смещение не
+  сохраняется.
+- Таблица дат идёт напрямую, без раскладки: драйвер её передаёт.
+
 ## 7. Обычный SQL: `@SqlQuery`
 
 Не всё надо заворачивать в процедуры. Запрос прямо на методе:
@@ -826,10 +858,10 @@ com.example.hr.HrApi does not match the database:
 
 Такие подпрограммы останавливают старт с понятной причиной (`not callable: ...`):
 
-- **Таблица или коллекция как поле записи**: `type order_t is record (id number, lines line_tab)`.
-  (Запись внутри записи поддерживается, см. раздел 6.)
-- **index-by таблицы записей и дат** (`TABLE OF rec_t INDEX BY ...`): драйвер Oracle 11 их не
-  передаёт.
+- **Коллекция SQL как поле записи** (`lines line_list`, где `line_list` создан через
+  `CREATE TYPE`). Index-by таблица в поле записи поддерживается.
+- **Поля `CLOB`, `BLOB`, `XMLTYPE` и национальные строки (`NVARCHAR2`) внутри index-by таблицы
+  записей.**
 - **Курсор на вход** (`p_cur IN SYS_REFCURSOR`): открытый курсор из Java не передать.
 - **Страницы (`Pageable`) у процедур**: страница вырезается только у `@SqlQuery`. Курсор, который
   открыла процедура, приходит целиком.

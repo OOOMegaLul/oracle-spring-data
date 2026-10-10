@@ -785,19 +785,21 @@ class CallPlannerTest {
 
     /**
      * Проверяет отказы по форме подпрограммы: пустой список перегрузок даёт ровно сообщение
-     * {@code not found in the database}; index-by таблица записей и возвращаемая index-by
-     * таблица дат не поддержаны (на 11.2 привязываются только таблицы {@code NUMBER} и
-     * {@code VARCHAR2}); входная таблица {@code NUMBER} допустима и привязывается как
-     * {@code INDEX_TABLE}; тип {@code OPAQUE/ANYDATA} не поддержан.
+     * {@code not found in the database}; index-by таблица записей без известных полей и таблица
+     * {@code CLOB} не поддержаны, таблица дат возвращается напрямую; входная таблица
+     * {@code NUMBER} допустима и привязывается как {@code INDEX_TABLE}; тип
+     * {@code OPAQUE/ANYDATA} не поддержан.
      */
     @Test
     void notFoundAndUnsupportedShapes() {
         assertThatThrownBy(() -> PLANNER.plan(m("noOuts"), List.of())).hasMessage("not found in the database");
         SubprogramInfo recs = func("PKG", "RECS", indexTable(null, "OUT", "PL/SQL RECORD")).in("P_N", "NUMBER").build();
-        assertThat(CallPlanner.supportIssues(recs)).singleElement().asString().contains("index-by table of PL/SQL RECORD");
-        assertThatThrownBy(() -> PLANNER.plan(m("sum"), func("PKG", "SUM", indexTable(null, "OUT", "DATE"))
-                .add(indexTable("P_VALS", "IN", "NUMBER")).build()))
-                .hasMessageContaining("RETURN: index-by table of DATE");
+        assertThat(CallPlanner.supportIssues(recs)).singleElement().asString()
+                .contains("index-by table of PL/SQL RECORD: a record with no known fields");
+        SubprogramInfo clobs = func("PKG", "SUM", indexTable(null, "OUT", "CLOB")).build();
+        assertThat(CallPlanner.supportIssues(clobs)).singleElement().asString().contains("index-by table of CLOB");
+        assertThat(PLANNER.plan(m("sum"), func("PKG", "SUM", indexTable(null, "OUT", "DATE"))
+                .add(indexTable("P_VALS", "IN", "NUMBER")).build()).binds().get(0).kind()).isEqualTo(ArgKind.INDEX_TABLE);
         SubprogramInfo ok = func("PKG", "SUM", "NUMBER").add(indexTable("P_VALS", "IN", "NUMBER")).build();
         assertThat(CallPlanner.supportIssues(ok)).isEmpty();
         assertThat(PLANNER.plan(m("sum"), ok).binds().get(1).kind()).isEqualTo(ArgKind.INDEX_TABLE);
@@ -1072,5 +1074,30 @@ class CallPlannerTest {
 
         assertThatThrownBy(() -> PLANNER.plan(m("shortPerson"), proc("PKG", "P").add(personArg()).build()))
                 .hasMessageContaining("has no property for [ADDR.OK] of P_P");
+    }
+
+    /**
+     * Проверяет раскладку выходной index-by таблицы записей: блок объявляет простые таблицы
+     * чисел и строк, обходит элементы по ключам ({@code FIRST}/{@code NEXT}), {@code BOOLEAN} едет
+     * числом, и каждое поле возвращается своей привязкой {@code RETURN[].ПОЛЕ}; таблица запомнена
+     * для сборки обратно.
+     */
+    @Test
+    void recordTablesAreSplitByField() {
+        ArgumentInfo element = new ArgumentInfo(null, 1, 1, "PL/SQL RECORD", null, "OUT", false, null, null, null,
+                List.of(new ArgumentInfo("ID", 1, 2, "NUMBER", null, "OUT", false, null, null, null, List.of(), null),
+                        new ArgumentInfo("OK", 2, 2, "PL/SQL BOOLEAN", null, "OUT", false, null, null, null, List.of(), null)),
+                null);
+        ArgumentInfo table = new ArgumentInfo(null, 0, 0, "PL/SQL TABLE", null, "OUT", false, "APP", "PKG", "REC_TAB",
+                List.of(element), null);
+        CallPlan p = PLANNER.plan(m("cursor"), func("PKG", "RECS", table).in("P_MIN_ID", "NUMBER").build());
+
+        assertThat(p.sql()).contains("TYPE plsql_t_num IS TABLE OF NUMBER INDEX BY PLS_INTEGER;")
+                .contains("v1 APP.PKG.REC_TAB;")
+                .contains(".FIRST; WHILE")
+                .contains("CASE WHEN v1(v5).OK THEN 1 WHEN NOT v1(v5).OK THEN 0 END");
+        assertThat(p.binds()).extracting(CallPlan.Bind::outKey).contains(CallPlanner.RETURN_KEY + "[].ID",
+                CallPlanner.RETURN_KEY + "[].OK");
+        assertThat(p.tableOuts()).containsExactly(CallPlanner.RETURN_KEY);
     }
 }

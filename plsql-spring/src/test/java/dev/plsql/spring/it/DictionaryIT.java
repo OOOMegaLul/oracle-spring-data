@@ -139,18 +139,15 @@ class DictionaryIT {
     }
 
     /**
-     * Проверяет список неподдерживаемых форм ({@link CallPlanner#supportIssues}): у {@code RECS}
-     * (index-by таблица записей) ровно одна проблема с упоминанием {@code index-by table}, а у
-     * подпрограмм с {@code BOOLEAN}, {@code RECORD}, {@code %ROWTYPE}, {@code XMLTYPE}, записью с
-     * полем {@code XMLTYPE}, IN OUT-курсором и объектным типом проблем нет.
-     *
-     * <p>Тест фиксирует границу поддержки на реальных сигнатурах: перечисленные трудные формы
-     * вызываются, а index-by таблица записей нет, и причина называется понятно.
+     * Проверяет список неподдерживаемых форм ({@link CallPlanner#supportIssues}) на настоящих
+     * сигнатурах: у подпрограмм с {@code BOOLEAN}, {@code RECORD}, {@code %ROWTYPE},
+     * {@code XMLTYPE}, записью с полем {@code XMLTYPE}, IN OUT-курсором, объектным типом и
+     * index-by таблицей записей ({@code RECS}: в записи {@code BOOLEAN} и {@code DATE}) проблем
+     * нет. Таблица записей едет по полям, см. {@code IndexTablesIT}.
      */
     @Test
-    void onlyIndexTablesOfRecordsAreUnsupported() {
-        assertThat(CallPlanner.supportIssues(only("RECS"))).singleElement().asString().contains("index-by table");
-        for (String name : List.of("ECHO_BOOL", "REC_INOUT", "EMP_ROW", "WRAP_XML", "XREC_INOUT", "EMPS_INOUT", "ECHO_OBJ")) {
+    void hardShapesAreSupported() {
+        for (String name : List.of("ECHO_BOOL", "REC_INOUT", "EMP_ROW", "WRAP_XML", "XREC_INOUT", "EMPS_INOUT", "ECHO_OBJ", "RECS")) {
             assertThat(CallPlanner.supportIssues(only(name))).as(name).isEmpty();
         }
     }
