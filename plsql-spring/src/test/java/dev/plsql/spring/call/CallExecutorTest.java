@@ -20,6 +20,7 @@ import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.sql.CallableStatement;
 import java.sql.Clob;
+import java.sql.NClob;
 import java.sql.Struct;
 import java.sql.SQLException;
 import java.sql.Types;
@@ -434,25 +435,6 @@ class CallExecutorTest {
     }
 
     /**
-     * Проверяет, что строки index-by таблицы {@code NVARCHAR2} не проверяются по основной
-     * кодировке базы: у национальных типов свой набор символов (раньше проверка их отвергала).
-     *
-     * @throws SQLException не бросается: драйвер подменён
-     */
-    @Test
-    void nationalIndexTablesAreNotCheckedAgainstTheDatabaseCharset() throws SQLException {
-        OracleCallableStatement ocs = mock(OracleCallableStatement.class);
-        when(cs.unwrap(OracleCallableStatement.class)).thenReturn(ocs);
-        CallExecutor strict = new CallExecutor(100, CharsetGuard.forDatabase("CL8MSWIN1251", CharsetGuard.Policy.FAIL));
-        CallPlan in = planner.plan(m("texts"), func("PKG", "TEXTS", "NUMBER")
-                .add(stringTable("P_VALS", "IN", "NVARCHAR2", 100)).build());
-
-        strict.execute(con, in, new Object[]{List.of("Әлем")});
-
-        verify(ocs).setPlsqlIndexTable(2, new String[]{"Әлем"}, 1, 1, OracleTypes.VARCHAR, 4);
-    }
-
-    /**
      * Проверяет, что атрибут {@code CLOB} объекта, пришедшего из базы, читается в строку, а сам
      * LOB освобождается (раньше он так и оставался объектом {@code Clob} в карте).
      *
@@ -536,5 +518,78 @@ class CallExecutorTest {
                 .out("NRN", "NUMBER").build());
         assertThatThrownBy(() -> new CallExecutor(100).executeBatch(con, plain, new Object[]{1L, "x"}, 0, 2))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    /**
+     * Проверяет национальные строки: {@code NVARCHAR2} уходит через {@code setNString}, а
+     * {@code NULL} — как {@code NVARCHAR}. Через {@code setString} драйвер отправил бы текст в
+     * кодировке базы (проверено на XE: {@code DUMP} показывает {@code AL32UTF8}, у
+     * {@code setNString} — {@code AL16UTF16}), и в базе с однобайтовой кодировкой символы вне неё
+     * молча стали бы {@code ?}. Проверка по кодировке базы национальную строку не
+     * останавливает: её символы идут в национальном наборе. Выход {@code NVARCHAR2}
+     * регистрируется как {@code NVARCHAR}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void nationalStringsTravelInTheNationalCharacterSet() throws SQLException {
+        CallPlan p = planner.plan(m("insert"), proc(null, "P_INSERT").in("NTENANT", "NUMBER").in("SNAME", "NVARCHAR2")
+                .out("NRN", "NUMBER").build());
+        when(cs.getBigDecimal(3)).thenReturn(BigDecimal.ONE);
+        CallExecutor strict = new CallExecutor(100, CharsetGuard.forDatabase("CL8MSWIN1251", CharsetGuard.Policy.FAIL));
+        strict.execute(con, p, new Object[]{1L, "\u4e2d"});
+        strict.execute(con, p, new Object[]{1L, null});
+        verify(cs).setNString(2, "\u4e2d");
+        verify(cs).setNull(2, Types.NVARCHAR);
+        verify(cs, never()).setString(org.mockito.ArgumentMatchers.eq(2), anyString());
+
+        CallPlan f = planner.plan(m("wrap"), func(null, "F_N", "NCHAR").in("P_X", "NCHAR").build());
+        when(cs.getString(1)).thenReturn("\u4e2d");
+        assertThat(new CallExecutor(100).execute(con, f, new Object[]{"x"})).isEqualTo("\u4e2d");
+        verify(cs).registerOutParameter(1, Types.NVARCHAR);
+    }
+
+    /**
+     * Проверяет {@code NCLOB}: текст уходит во временном {@code NCLOB} (временный {@code CLOB}
+     * хранит текст в кодировке базы), который освобождается после вызова; выход регистрируется
+     * как {@code NCLOB}.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void nclobUsesANationalTemporaryLob() throws SQLException {
+        CallPlan p = planner.plan(m("length"), func(null, "F_LEN", "NUMBER").in("P_TEXT", "NCLOB").build());
+        NClob nclob = mock(NClob.class);
+        when(con.createNClob()).thenReturn(nclob);
+        when(cs.getBigDecimal(1)).thenReturn(BigDecimal.ONE);
+
+        new CallExecutor(100).execute(con, p, new Object[]{"\u4e2d"});
+        verify(nclob).setString(1, "\u4e2d");
+        verify(cs).setNClob(2, nclob);
+        verify(nclob).free();
+        verify(con, never()).createClob();
+
+        CallPlan out = planner.plan(m("wrap"), func(null, "F_N", "NCLOB").in("P_X", "VARCHAR2").build());
+        new CallExecutor(100).execute(con, out, new Object[]{"x"});
+        verify(cs).registerOutParameter(1, Types.NCLOB);
+    }
+
+    /**
+     * Проверяет, что у {@code OUT}-аргумента {@code CHAR} и {@code NCHAR} отрезаются хвостовые
+     * пробелы. У параметра {@code CHAR} без длины размер берётся из привязки, и Oracle добивает
+     * значение пробелами до неё: проверено на XE, {@code 'ab'} приходит строкой из 32 767 символов
+     * ({@code NCHAR} — из 16 383). Поле записи {@code CHAR(n)} не трогается: у него длина объявлена.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void outCharArgumentsLoseTheirPadding() throws SQLException {
+        CallPlan p = planner.plan(m("wrap"), proc(null, "P").in("P_X", "VARCHAR2").out("P_OUT", "CHAR").build());
+        when(cs.getString(2)).thenReturn("ab" + " ".repeat(32_765));
+        assertThat(new CallExecutor(100).execute(con, p, new Object[]{"x"})).isEqualTo("ab");
+
+        CallPlan n = planner.plan(m("wrap"), proc(null, "P").in("P_X", "VARCHAR2").out("P_OUT", "NCHAR").build());
+        when(cs.getString(2)).thenReturn("  " + " ".repeat(16_381));
+        assertThat(new CallExecutor(100).execute(con, n, new Object[]{"x"})).isEqualTo("");
     }
 }

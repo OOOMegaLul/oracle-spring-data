@@ -79,12 +79,15 @@ final class TableSplit {
 
     /**
      * Проверяет, передаёт ли драйвер таблицу с такими элементами сам: числа, строки и даты.
+     * Таблицу национальных строк ({@code NVARCHAR2}) — нет: на XE 11.2 любая её привязка даёт
+     * PLS-00382.
      *
      * @param el описание элемента таблицы
      * @return {@code true}, если таблица привязывается напрямую
      */
     static boolean direct(ArgumentInfo el) {
-        return el.kind() == ArgKind.NUMBER || el.kind() == ArgKind.STRING || el.kind() == ArgKind.DATE;
+        return el.kind() == ArgKind.NUMBER || (el.kind() == ArgKind.STRING && !national(el))
+                || el.kind() == ArgKind.DATE;
     }
 
     /**

@@ -434,3 +434,34 @@ create or replace package body lab_tab2 as
   end;
 end lab_tab2;
 /
+-- National character types: NVARCHAR2, NCHAR, NCLOB, a record with an NVARCHAR2 field. Each echo
+-- appends U+4E2D, which is outside single-byte character sets.
+create or replace package lab_nchar as
+  type nrec_t is record (id number, name nvarchar2(50));
+  function echo(p_s nvarchar2) return nvarchar2;
+  procedure fixed(p_s in nchar, p_out out nchar);
+  function nclob_echo(p_c nclob) return nclob;
+  function rec_echo(p_r nrec_t) return nrec_t;
+end lab_nchar;
+/
+create or replace package body lab_nchar as
+  function echo(p_s nvarchar2) return nvarchar2 is
+  begin
+    return p_s || unistr('\4E2D');
+  end;
+  procedure fixed(p_s in nchar, p_out out nchar) is
+  begin
+    p_out := rtrim(p_s) || unistr('\4E2D');
+  end;
+  function nclob_echo(p_c nclob) return nclob is
+  begin
+    return p_c || unistr('\4E2D');
+  end;
+  function rec_echo(p_r nrec_t) return nrec_t is
+    r nrec_t := p_r;
+  begin
+    r.name := r.name || unistr('\4E2D');
+    return r;
+  end;
+end lab_nchar;
+/

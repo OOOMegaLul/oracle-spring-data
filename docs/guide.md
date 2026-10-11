@@ -396,7 +396,7 @@ try (Stream<Employee> s = hr.activeStream()) {
 | PL/SQL | Java | Заметки |
 |---|---|---|
 | `NUMBER`, `INTEGER`, `PLS_INTEGER` | `long`, `int`, `BigDecimal`, `double`... | `0.1f` уходит как `0.1` |
-| `VARCHAR2`, `CHAR`, `NVARCHAR2` | `String`, `enum` (по имени) | |
+| `VARCHAR2`, `CHAR`, `NVARCHAR2`, `NCHAR` | `String`, `enum` (по имени) | `NVARCHAR2`, `NCHAR` и `NCLOB` идут в национальной кодировке базы; у `OUT`-аргумента `CHAR` хвостовые пробелы отрезаются |
 | `DATE`, `TIMESTAMP` | `LocalDate`, `LocalDateTime`, `Instant`, `OffsetDateTime`, `ZonedDateTime`, `java.util.Date` | |
 | `CLOB`, `BLOB` | `String`, `byte[]` | временный LOB освобождается после вызова |
 | `BOOLEAN` | `boolean`, `Boolean` | строки `Y`/`N`, `1`/`0`, `TRUE`/`FALSE`; другое — ошибка |
@@ -406,6 +406,17 @@ try (Stream<Employee> s = hr.activeStream()) {
 | объектный тип SQL (`CREATE TYPE ... AS OBJECT`) | record, бин, `Map` | |
 | коллекция SQL (`TABLE OF`, `VARRAY`) | `List`, массив | |
 | index-by таблица `NUMBER`/`VARCHAR2` | `List`, массив | см. ниже про память |
+
+**Национальные строки.** `NVARCHAR2`, `NCHAR` и `NCLOB` хранятся в национальной кодировке базы
+(обычно AL16UTF16), в которой есть любой символ, даже если основная кодировка однобайтовая
+(CL8MSWIN1251). Библиотека и передаёт их в национальной кодировке (`setNString`, временный
+`NCLOB`): обычный `setString` отправил бы текст в основной, и иероглиф или эмодзи стали бы `?`
+ещё до вызова. Поэтому проверка кодировки (`plsql.charset-policy`) их не касается.
+
+**`OUT`-аргумент `CHAR`.** Параметр `CHAR` без длины Oracle добивает пробелами до размера
+привязки: `'ab'` приходит строкой из 32 767 символов. Библиотека отрезает хвостовые пробелы у
+`OUT`-аргументов `CHAR` и `NCHAR`. У поля записи `CHAR(10)` длина объявлена, и его значение
+приходит добитым до 10 символов, как в PL/SQL.
 
 **Записи и курсоры по именам.** Поле `FULL_NAME` ложится в компонент `fullName`, колонка
 `SNAME` — в `name` (типовой префикс снимается), а `@Arg("D_START")` на компоненте задаёт имя
@@ -864,7 +875,7 @@ com.example.hr.HrApi does not match the database:
 - **Коллекция SQL как поле записи** (`lines line_list`, где `line_list` создан через
   `CREATE TYPE`). Index-by таблица в поле записи поддерживается.
 - **Поля `CLOB`, `BLOB`, `XMLTYPE` и национальные строки (`NVARCHAR2`) внутри index-by таблицы
-  записей.**
+  записей, а также index-by таблица `NVARCHAR2`**: драйвер её не передаёт (PLS-00382).
 - **Курсор на вход** (`p_cur IN SYS_REFCURSOR`): открытый курсор из Java не передать.
 - **Страницы (`Pageable`) у процедур**: страница вырезается только у `@SqlQuery`. Курсор, который
   открыла процедура, приходит целиком.
