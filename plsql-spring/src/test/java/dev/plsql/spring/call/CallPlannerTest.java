@@ -848,7 +848,8 @@ class CallPlannerTest {
     /**
      * Проверяет отказы по форме подпрограммы: пустой список перегрузок даёт ровно сообщение
      * {@code not found in the database}; index-by таблица записей без известных полей и таблица
-     * {@code CLOB} не поддержаны, таблица дат возвращается напрямую; входная таблица
+     * курсоров не поддержаны, таблица {@code CLOB} раскладывается, таблица дат возвращается
+     * напрямую; входная таблица
      * {@code NUMBER} допустима и привязывается как {@code INDEX_TABLE}; тип
      * {@code OPAQUE/ANYDATA} не поддержан.
      */
@@ -858,8 +859,9 @@ class CallPlannerTest {
         SubprogramInfo recs = func("PKG", "RECS", indexTable(null, "OUT", "PL/SQL RECORD")).in("P_N", "NUMBER").build();
         assertThat(CallPlanner.supportIssues(recs)).singleElement().asString()
                 .contains("index-by table of PL/SQL RECORD: a record with no known fields");
-        SubprogramInfo clobs = func("PKG", "SUM", indexTable(null, "OUT", "CLOB")).build();
-        assertThat(CallPlanner.supportIssues(clobs)).singleElement().asString().contains("index-by table of CLOB");
+        SubprogramInfo cursors = func("PKG", "SUM", indexTable(null, "OUT", "REF CURSOR")).build();
+        assertThat(CallPlanner.supportIssues(cursors)).singleElement().asString().contains("index-by table of REF CURSOR");
+        assertThat(CallPlanner.supportIssues(func("PKG", "SUM", indexTable(null, "OUT", "CLOB")).build())).isEmpty();
         assertThat(PLANNER.plan(m("sum"), func("PKG", "SUM", indexTable(null, "OUT", "DATE"))
                 .add(indexTable("P_VALS", "IN", "NUMBER")).build()).binds().get(0).kind()).isEqualTo(ArgKind.INDEX_TABLE);
         SubprogramInfo ok = func("PKG", "SUM", "NUMBER").add(indexTable("P_VALS", "IN", "NUMBER")).build();
@@ -1203,13 +1205,40 @@ class CallPlannerTest {
     }
 
     /**
-     * Проверяет, что index-by таблица {@code NVARCHAR2} не считается таблицей, которую драйвер
-     * передаёт сам: на XE любая её привязка даёт PLS-00382, и вызов падал бы каждый раз.
+     * Проверяет, что index-by таблица {@code NVARCHAR2} не привязывается напрямую (на XE любая её
+     * привязка даёт PLS-00382), а едет склеенным {@code NCLOB} с таблицей длин.
      */
     @Test
     void nationalIndexTablesAreNotBoundDirectly() {
         SubprogramInfo sp = proc("PKG", "P").add(indexTable("P_NAMES", "IN", "NVARCHAR2")).build();
-        assertThat(CallPlanner.supportIssues(sp)).singleElement().asString().contains("P_NAMES")
-                .contains("NVARCHAR2");
+        assertThat(CallPlanner.supportIssues(sp)).isEmpty();
+        CallPlan p = PLANNER.plan(m("sum"), func("PKG", "SUM", "NUMBER").add(indexTable("P_VALS", "IN", "NVARCHAR2"))
+                .build());
+        assertThat(p.sql()).contains(" NCLOB;").contains("DBMS_LOB.SUBSTR(");
+        assertThat(p.binds()).extracting(CallPlan.Bind::kind).contains(ArgKind.INDEX_TABLE, ArgKind.CLOB);
+    }
+
+    /**
+     * Проверяет поле {@code CLOB} и национальную строку в выходной таблице записей: значения
+     * дописываются в склеенный LOB ({@code DBMS_LOB.APPEND}, {@code WRITEAPPEND}), длины — в
+     * таблицу чисел, и обе привязки возвращаются с ключами {@code RETURN[].ПОЛЕ#len} и
+     * {@code #lob}; национальный текст склеивается в {@code NCLOB}.
+     */
+    @Test
+    void lobFieldsOfRecordTablesTravelGlued() {
+        ArgumentInfo element = new ArgumentInfo(null, 1, 1, "PL/SQL RECORD", null, "OUT", false, null, null, null,
+                List.of(new ArgumentInfo("BODY", 1, 2, "CLOB", null, "OUT", false, null, null, null, List.of(), null),
+                        new ArgumentInfo("TITLE", 2, 2, "NVARCHAR2", null, "OUT", false, null, null, null, List.of(), 50)),
+                null);
+        ArgumentInfo table = new ArgumentInfo(null, 0, 0, "PL/SQL TABLE", null, "OUT", false, "APP", "PKG", "DOC_TAB",
+                List.of(element), null);
+        CallPlan p = PLANNER.plan(m("cursor"), func("PKG", "DOCS", table).in("P_MIN_ID", "NUMBER").build());
+
+        assertThat(p.sql()).contains("DBMS_LOB.CREATETEMPORARY(").contains("DBMS_LOB.APPEND(")
+                .contains("DBMS_LOB.WRITEAPPEND(").contains(" NCLOB;").contains(" CLOB;");
+        assertThat(p.binds()).extracting(CallPlan.Bind::outKey).contains(
+                CallPlanner.RETURN_KEY + "[].BODY" + TableSplit.LENGTHS, CallPlanner.RETURN_KEY + "[].BODY" + TableSplit.CONTENT,
+                CallPlanner.RETURN_KEY + "[].TITLE" + TableSplit.LENGTHS, CallPlanner.RETURN_KEY + "[].TITLE" + TableSplit.CONTENT);
+        assertThat(CallPlanner.supportIssues(func("PKG", "DOCS", table).build())).isEmpty();
     }
 }

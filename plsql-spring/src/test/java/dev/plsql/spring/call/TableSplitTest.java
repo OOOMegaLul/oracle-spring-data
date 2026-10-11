@@ -42,4 +42,45 @@ class TableSplitTest {
             TimeZone.setDefault(saved);
         }
     }
+
+    /**
+     * Проверяет поле, которое едет склеенным LOB: на входе — длины (у {@code null} — {@code null})
+     * и склеенный текст или байты, на выходе — разрезание обратно по длинам, где пустое значение
+     * не путается с {@code null}.
+     */
+    @Test
+    void lobFieldsAreGluedAndCutBack() {
+        ArgumentInfo doc = new ArgumentInfo("DOC", 1, 2, "CLOB", null, "IN/OUT", false, null, null, null, List.of(),
+                null);
+        ArgumentInfo data = new ArgumentInfo("DATA", 2, 2, "BLOB", null, "IN/OUT", false, null, null, null, List.of(),
+                null);
+        ArgumentInfo element = new ArgumentInfo(null, 1, 1, "PL/SQL RECORD", null, "IN/OUT", false, null, null, null,
+                List.of(doc, data), null);
+        ArgumentInfo table = new ArgumentInfo("T", 1, 0, "PL/SQL TABLE", null, "IN/OUT", false, "APP", "PKG", "T_TAB",
+                List.of(element), null);
+        List<TableSplit.Leaf> leaves = TableSplit.leaves(table);
+        assertThat(leaves).allMatch(TableSplit::lob);
+
+        List<java.util.Map<String, Object>> rows = List.of(java.util.Map.of("doc", "ab", "data", new byte[]{1}),
+                java.util.Map.of("doc", "", "data", new byte[]{2, 3}), new java.util.HashMap<>());
+        assertThat(TableSplit.lengths(rows, leaves.get(0))).containsExactly(2, 0, null);
+        assertThat(TableSplit.content(rows, leaves.get(0))).isEqualTo("ab");
+        assertThat(TableSplit.lengths(rows, leaves.get(1))).containsExactly(1, 2, null);
+        assertThat((byte[]) TableSplit.content(rows, leaves.get(1))).containsExactly(1, 2, 3);
+
+        java.util.Map<String, Object> outs = new java.util.HashMap<>();
+        outs.put("T[].DOC" + TableSplit.LENGTHS, java.util.Arrays.asList(new java.math.BigDecimal(2), java.math.BigDecimal.ZERO, null));
+        outs.put("T[].DOC" + TableSplit.CONTENT, "ab");
+        outs.put("T[].DATA" + TableSplit.LENGTHS, java.util.Arrays.asList(new java.math.BigDecimal(1), new java.math.BigDecimal(2), null));
+        outs.put("T[].DATA" + TableSplit.CONTENT, new byte[]{1, 2, 3});
+        TableSplit.fold(outs, List.of("T"));
+        @SuppressWarnings("unchecked")
+        List<java.util.Map<String, Object>> back = (List<java.util.Map<String, Object>>) outs.get("T");
+        assertThat(back).hasSize(3);
+        assertThat(back.get(0)).containsEntry("DOC", "ab");
+        assertThat((byte[]) back.get(1).get("DATA")).containsExactly(2, 3);
+        assertThat(back.get(1)).containsEntry("DOC", "");
+        assertThat(back.get(2)).containsEntry("DOC", null).containsEntry("DATA", null);
+    }
+
 }

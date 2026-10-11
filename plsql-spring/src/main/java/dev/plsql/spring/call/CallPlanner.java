@@ -458,19 +458,43 @@ public class CallPlanner {
      */
     private void splitIn(Block b, String target, ArgumentInfo table, Function<Object[], Object> in) {
         List<TableSplit.Leaf> leaves = TableSplit.leaves(table);
+        // На поле — простая таблица (у поля-LOB это таблица длин) и, у поля-LOB, склеенный LOB,
+        // счётчик позиции в нём и вспомогательный LOB.
         List<String> vars = new ArrayList<>();
+        List<String[]> lobs = new ArrayList<>();
         for (TableSplit.Leaf leaf : leaves) {
-            String f = b.variable(b.indexType(leaf.transport()));
-            b.pre(f + " := ", new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.leafTable(table, leaf),
-                    args -> TableSplit.values(in.apply(args), leaf), null, null), ";");
+            String f = b.variable(b.indexType(TableSplit.lob(leaf) ? ArgKind.NUMBER : leaf.transport()));
             vars.add(f);
+            if (!TableSplit.lob(leaf)) {
+                b.pre(f + " := ", new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.leafTable(table, leaf),
+                        args -> TableSplit.values(in.apply(args), leaf), null, null), ";");
+                lobs.add(null);
+                continue;
+            }
+            b.pre(f + " := ", new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.lengthsTable(table, leaf),
+                    args -> TableSplit.lengths(in.apply(args), leaf), null, null), ";");
+            String type = TableSplit.lobType(leaf.field());
+            String content = b.variable(type);
+            ArgumentInfo lob = TableSplit.contentArg(table, leaf);
+            b.pre(content + " := ", new CallPlan.Bind(lob.kind(), lob,
+                    args -> TableSplit.content(in.apply(args), leaf), null, null), ";");
+            String pos = b.variable("PLS_INTEGER");
+            b.pre(pos + " := 1;");
+            lobs.add(new String[]{content, pos, TableSplit.needsScratch(leaf.field()) ? b.variable(type) : null});
         }
         String j = b.loopVariable();
         StringBuilder loop = new StringBuilder("FOR " + j + " IN 1 .. " + vars.get(0) + ".COUNT LOOP");
         for (int k = 0; k < leaves.size(); k++) {
             TableSplit.Leaf leaf = leaves.get(k);
-            loop.append(' ').append(target).append('(').append(j).append(')').append(leaf.suffix()).append(" := ")
-                    .append(TableSplit.toField(vars.get(k) + "(" + j + ")", leaf.field())).append(';');
+            String dest = target + "(" + j + ")" + leaf.suffix();
+            String[] lob = lobs.get(k);
+            if (lob != null) {
+                loop.append(' ').append(TableSplit.lobToField(dest, vars.get(k) + "(" + j + ")", lob[0], lob[1], lob[2],
+                        leaf.field()));
+            } else {
+                loop.append(' ').append(dest).append(" := ")
+                        .append(TableSplit.toField(vars.get(k) + "(" + j + ")", leaf.field())).append(';');
+            }
         }
         b.pre(loop.append(" END LOOP;").toString());
     }
@@ -488,26 +512,55 @@ public class CallPlanner {
      */
     private void splitOut(Block b, String source, ArgumentInfo table, String key) {
         List<TableSplit.Leaf> leaves = TableSplit.leaves(table);
+        // На поле — простая таблица (у поля-LOB это таблица длин) и, у поля-LOB, склеенный LOB и
+        // вспомогательный CLOB для XMLTYPE.
         List<String> vars = new ArrayList<>();
+        List<String[]> lobs = new ArrayList<>();
+        StringBuilder start = new StringBuilder();
         for (TableSplit.Leaf leaf : leaves) {
-            vars.add(b.variable(b.indexType(leaf.transport())));
+            vars.add(b.variable(b.indexType(TableSplit.lob(leaf) ? ArgKind.NUMBER : leaf.transport())));
+            if (!TableSplit.lob(leaf)) {
+                lobs.add(null);
+                continue;
+            }
+            String content = b.variable(TableSplit.lobType(leaf.field()));
+            // Без длительности CALL: LOB должен дожить до того, как его прочитает Java (и освободит).
+            start.append("DBMS_LOB.CREATETEMPORARY(").append(content).append(", TRUE); ");
+            lobs.add(new String[]{content, leaf.field().kind() == ArgKind.XMLTYPE ? b.variable("CLOB") : null});
         }
         String n = b.variable("PLS_INTEGER");
         // Ключ в строке: так подходят и таблицы INDEX BY PLS_INTEGER, и INDEX BY VARCHAR2.
         String i = b.variable("VARCHAR2(32767)");
-        StringBuilder loop = new StringBuilder(n + " := 0; " + i + " := " + source + ".FIRST; WHILE " + i
-                + " IS NOT NULL LOOP " + n + " := " + n + " + 1;");
+        StringBuilder loop = new StringBuilder(start).append(n).append(" := 0; ").append(i).append(" := ").append(source)
+                .append(".FIRST; WHILE ").append(i).append(" IS NOT NULL LOOP ").append(n).append(" := ").append(n)
+                .append(" + 1;");
         for (int k = 0; k < leaves.size(); k++) {
             TableSplit.Leaf leaf = leaves.get(k);
-            loop.append(' ').append(vars.get(k)).append('(').append(n).append(") := ")
-                    .append(TableSplit.toTransport(source + "(" + i + ")" + leaf.suffix(), leaf.field())).append(';');
+            String value = source + "(" + i + ")" + leaf.suffix();
+            String[] lob = lobs.get(k);
+            if (lob != null) {
+                loop.append(' ').append(TableSplit.lobFromField(value, vars.get(k) + "(" + n + ")", lob[0], lob[1],
+                        leaf.field()));
+            } else {
+                loop.append(' ').append(vars.get(k)).append('(').append(n).append(") := ")
+                        .append(TableSplit.toTransport(value, leaf.field())).append(';');
+            }
         }
         loop.append(' ').append(i).append(" := ").append(source).append(".NEXT(").append(i).append("); END LOOP;");
         b.post(loop.toString());
         for (int k = 0; k < leaves.size(); k++) {
             TableSplit.Leaf leaf = leaves.get(k);
-            b.post(new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.leafTable(table, leaf), null,
-                    key + "[]" + leaf.suffix(), null), " := " + vars.get(k) + ";");
+            String[] lob = lobs.get(k);
+            if (lob == null) {
+                b.post(new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.leafTable(table, leaf), null,
+                        key + "[]" + leaf.suffix(), null), " := " + vars.get(k) + ";");
+                continue;
+            }
+            b.post(new CallPlan.Bind(ArgKind.INDEX_TABLE, TableSplit.lengthsTable(table, leaf), null,
+                    key + "[]" + leaf.suffix() + TableSplit.LENGTHS, null), " := " + vars.get(k) + ";");
+            ArgumentInfo content = TableSplit.contentArg(table, leaf);
+            b.post(new CallPlan.Bind(content.kind(), content, null, key + "[]" + leaf.suffix() + TableSplit.CONTENT,
+                    null), " := " + lob[0] + ";");
         }
         b.tableOut(key);
     }

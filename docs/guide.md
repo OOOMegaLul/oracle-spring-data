@@ -406,7 +406,7 @@ try (Stream<Employee> s = hr.activeStream()) {
 | объектный тип SQL (`CREATE TYPE ... AS OBJECT`) | record, бин, `Map` | |
 | коллекция SQL (`TABLE OF`, `VARRAY`) | `List`, массив | |
 | index-by таблица `NUMBER`/`VARCHAR2`/`DATE` | `List`, массив | см. ниже про память |
-| index-by таблица записей, `TIMESTAMP`, `BOOLEAN` | `List<record>`, `List` | по полям, см. ниже |
+| index-by таблица записей, `TIMESTAMP`, `BOOLEAN`, `CLOB`, `BLOB`, `XMLTYPE`, `RAW`, `NVARCHAR2` | `List<record>`, `List` | по полям, см. ниже |
 
 **Национальные строки.** `NVARCHAR2`, `NCHAR` и `NCLOB` хранятся в национальной кодировке базы
 (обычно AL16UTF16), в которой есть любой символ, даже если основная кодировка однобайтовая
@@ -461,7 +461,7 @@ record Order(Long id, List<String> tags, PersonObj buyer) {}
 240 МБ, приложение не стартует и подсказывает, до скольки уменьшить
 `plsql.index-table-max-length`.
 
-### Index-by таблицы записей, дат, `TIMESTAMP` и `BOOLEAN`
+### Index-by таблицы записей, дат, `TIMESTAMP`, `BOOLEAN` и LOB
 
 Драйвер Oracle сам передаёт только index-by таблицы чисел, строк и дат. Таблицы `TIMESTAMP` на
 11.2 он ломает: на входе сервер падает с ORA-00600, на выходе рвётся соединение (проверено). Таблицы
@@ -486,6 +486,12 @@ void hireAll(List<Emp> emps);
 - Работает в обе стороны и для `IN OUT`, с вложенными записями, полями `BOOLEAN`, `DATE`,
   `TIMESTAMP` и `TIMESTAMP WITH TIME ZONE`, а также для таблицы, которая сама — поле записи
   (`type order_t is record (id number, lines emp_tab)`).
+- Поля `CLOB`, `NCLOB`, `BLOB`, `XMLTYPE`, `RAW`, `NVARCHAR2` и `NCHAR` (и таблицы из них, например
+  `table of nvarchar2(100) index by pls_integer`) едут иначе: значения поля всех элементов
+  склеиваются в один LOB, рядом идёт таблица длин, и блок разрезает LOB обратно. Предела в
+  32 КБ на значение нет, памяти заранее драйвер под них не резервирует, пустой `CLOB` не
+  путается с `NULL`, а национальный текст идёт в `NCLOB` и не теряет символов. В Java это
+  `String` (`XMLTYPE` — текстом или `Document`) и `byte[]`.
 - Выходная таблица приходит списком в порядке ключей; ключи (они бывают разреженными: 10, 20,
   30) не возвращаются. Входная таблица заполняется с ключа 1.
 - `TIMESTAMP` без указанной точности хранит 6 знаков после запятой: наносекунды Java Oracle
@@ -884,8 +890,8 @@ com.example.hr.HrApi does not match the database:
 
 Такие подпрограммы останавливают старт с понятной причиной (`not callable: ...`):
 
-- **Поля `CLOB`, `BLOB`, `XMLTYPE` и национальные строки (`NVARCHAR2`) внутри index-by таблицы
-  записей, а также index-by таблица `NVARCHAR2`**: драйвер её не передаёт (PLS-00382).
+- **Коллекции, объекты и курсоры внутри элементов index-by таблицы** (`table of rec_t`, где у
+  `rec_t` поле `lab_num_tab` или `sys_refcursor`).
 - **Курсор на вход** (`p_cur IN SYS_REFCURSOR`): открытый курсор из Java не передать.
 - **Страницы (`Pageable`) у процедур**: страница вырезается только у `@SqlQuery`. Курсор, который
   открыла процедура, приходит целиком.

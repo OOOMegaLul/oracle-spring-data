@@ -1,5 +1,6 @@
 package dev.plsql.spring.call;
 
+import java.io.ByteArrayOutputStream;
 import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
@@ -24,8 +25,9 @@ import dev.plsql.spring.meta.ArgumentInfo;
 import dev.plsql.spring.support.Values;
 
 /**
- * Index-by таблицы, которые драйвер Oracle не передаёт сам: таблицы записей, {@code TIMESTAMP} и
- * {@code BOOLEAN}. Такая таблица едет несколькими простыми таблицами, по одной на поле элемента.
+ * Index-by таблицы, которые драйвер Oracle не передаёт сам: таблицы записей, {@code TIMESTAMP},
+ * {@code BOOLEAN}, LOB, {@code XMLTYPE}, {@code RAW} и национальных строк. Такая таблица едет
+ * несколькими простыми таблицами, по одной на поле элемента.
  *
  * <p>Драйвер умеет привязывать только index-by таблицы чисел, строк и дат (проверено на 11.2:
  * таблица {@code TIMESTAMP} на входе даёт ORA-00600, на выходе рвёт соединение). Поэтому блок
@@ -34,6 +36,13 @@ import dev.plsql.spring.support.Values;
  * на выходе — обратно. {@code TIMESTAMP} едет строкой в строгом формате, {@code BOOLEAN} — числом
  * 1/0. Ключи выходной таблицы не сохраняются: элементы приходят списком в порядке ключей
  * (таблица может быть разреженной: 10, 20, 30); входная таблица заполняется с ключа 1.
+ *
+ * <p>Поля {@code CLOB}, {@code NCLOB}, {@code BLOB}, {@code XMLTYPE}, {@code RAW} и национальные
+ * строки ({@code NVARCHAR2}, {@code NCHAR}) едут иначе: значения поля всех элементов склеиваются в
+ * один LOB ({@code CLOB}, {@code NCLOB} или {@code BLOB}), а рядом идёт таблица чисел с длиной
+ * каждого значения ({@code NULL} — значение {@code NULL}). Так нет предела в 32 767 байт на
+ * значение и драйверу не нужно заранее резервировать память под выходные строки. Национальный
+ * текст едет в {@code NCLOB}, и символы вне основной кодировки базы не пропадают.
  */
 final class TableSplit {
 
@@ -49,6 +58,10 @@ final class TableSplit {
     static final int TS_LENGTH = 40;
     /** Тип данных, которым помечается поле {@code BOOLEAN} в описании простой таблицы. */
     private static final String BOOLEAN_ORIGIN = "PL/SQL BOOLEAN";
+    /** Окончание ключа таблицы длин у поля, которое едет склеенным LOB. */
+    static final String LENGTHS = "#len";
+    /** Окончание ключа склеенного LOB. */
+    static final String CONTENT = "#lob";
 
     /** Класс только со статическими методами: экземпляры не создаются. */
     private TableSplit() {
@@ -61,7 +74,7 @@ final class TableSplit {
      *                  элемент сам простое значение
      * @param field     описание поля (или самого элемента)
      * @param transport в какой простой таблице оно едет: {@code NUMBER}, {@code STRING} или
-     *                  {@code DATE}
+     *                  {@code DATE}; {@code CLOB} и {@code BLOB} — склеенным LOB с таблицей длин
      */
     record Leaf(List<String> path, ArgumentInfo field, ArgKind transport) {
 
@@ -94,10 +107,10 @@ final class TableSplit {
      * Возвращает причину, по которой таблицу с такими элементами нельзя разложить по полям, или
      * {@code null}, если можно.
      *
-     * <p>Раскладываются записи (в том числе вложенные) с полями-числами, строками, датами,
-     * {@code TIMESTAMP} и {@code BOOLEAN}, а также таблицы {@code TIMESTAMP} и {@code BOOLEAN}.
-     * Национальные строки ({@code NVARCHAR2}) не раскладываются: простая таблица строк хранит их в
-     * основной кодировке базы, и символы вне неё пропали бы.
+     * <p>Раскладываются записи (в том числе вложенные) с полями-числами, строками (и
+     * национальными), датами, {@code TIMESTAMP}, {@code BOOLEAN}, LOB, {@code XMLTYPE} и
+     * {@code RAW}, а также таблицы этих типов. Не раскладываются поля-коллекции, объекты,
+     * курсоры и таблицы внутри элементов.
      *
      * @param el описание элемента таблицы
      * @return причина или {@code null}
@@ -116,11 +129,8 @@ final class TableSplit {
                 }
                 return null;
             }
-            case NUMBER, DATE, TIMESTAMP, BOOLEAN -> {
+            case NUMBER, STRING, DATE, TIMESTAMP, BOOLEAN, CLOB, BLOB, RAW, XMLTYPE -> {
                 return null;
-            }
-            case STRING -> {
-                return national(el) ? el.dataType() + " (national characters)" : null;
             }
             default -> {
                 return el.dataType();
@@ -159,6 +169,9 @@ final class TableSplit {
         ArgKind transport = switch (el.kind()) {
             case NUMBER, BOOLEAN -> ArgKind.NUMBER;
             case DATE -> ArgKind.DATE;
+            case CLOB, XMLTYPE -> ArgKind.CLOB;
+            case BLOB, RAW -> ArgKind.BLOB;
+            case STRING -> national(el) ? ArgKind.CLOB : ArgKind.STRING;
             default -> ArgKind.STRING;
         };
         out.add(new Leaf(List.copyOf(path), el, transport));
@@ -201,6 +214,202 @@ final class TableSplit {
         String name = (table.name() == null ? "RETURN" : table.name()) + leaf.suffix();
         return new ArgumentInfo(name, table.position(), table.dataLevel(), "PL/SQL TABLE", null, table.inOut(),
                 false, null, null, null, List.of(el), null);
+    }
+
+    /**
+     * Проверяет, едет ли поле склеенным LOB с таблицей длин.
+     *
+     * @param leaf поле
+     * @return {@code true} для LOB, {@code XMLTYPE}, {@code RAW} и национальных строк
+     */
+    static boolean lob(Leaf leaf) {
+        return leaf.transport() == ArgKind.CLOB || leaf.transport() == ArgKind.BLOB;
+    }
+
+    /**
+     * Возвращает тип LOB, в котором склеиваются значения поля.
+     *
+     * @param field поле
+     * @return {@code BLOB} для {@code BLOB} и {@code RAW}, {@code NCLOB} для национального
+     *         текста, иначе {@code CLOB}
+     */
+    static String lobType(ArgumentInfo field) {
+        if (field.kind() == ArgKind.BLOB || field.kind() == ArgKind.RAW) {
+            return "BLOB";
+        }
+        return national(field) ? "NCLOB" : "CLOB";
+    }
+
+    /**
+     * Описывает склеенный LOB поля — для привязки: тип данных {@code CLOB}, {@code NCLOB} или
+     * {@code BLOB}.
+     *
+     * @param table исходная index-by таблица
+     * @param leaf  поле элемента
+     * @return описание LOB
+     */
+    static ArgumentInfo contentArg(ArgumentInfo table, Leaf leaf) {
+        return new ArgumentInfo(name(table, leaf) + CONTENT, table.position(), table.dataLevel(), lobType(leaf.field()),
+                null, table.inOut(), false, null, null, null, List.of(), null);
+    }
+
+    /**
+     * Описывает таблицу длин поля, которое едет склеенным LOB, — простую таблицу чисел.
+     *
+     * @param table исходная index-by таблица
+     * @param leaf  поле элемента
+     * @return описание таблицы длин
+     */
+    static ArgumentInfo lengthsTable(ArgumentInfo table, Leaf leaf) {
+        ArgumentInfo el = new ArgumentInfo(null, 1, table.dataLevel() + 1, "NUMBER", null, table.inOut(), false,
+                null, null, null, List.of(), null);
+        return new ArgumentInfo(name(table, leaf) + LENGTHS, table.position(), table.dataLevel(), "PL/SQL TABLE", null,
+                table.inOut(), false, null, null, null, List.of(el), null);
+    }
+
+    /**
+     * Возвращает имя поля для сообщений: имя таблицы (или {@code RETURN}) и путь к полю.
+     *
+     * @param table index-by таблица
+     * @param leaf  поле элемента
+     * @return имя вида {@code P_ROWS.DOC}
+     */
+    private static String name(ArgumentInfo table, Leaf leaf) {
+        return (table.name() == null ? "RETURN" : table.name()) + leaf.suffix();
+    }
+
+    /**
+     * Проверяет, нужна ли полю вспомогательная переменная-LOB в блоке: на входе — у
+     * {@code CLOB}, {@code NCLOB}, {@code BLOB} и {@code XMLTYPE} (значение собирается во
+     * временном LOB), на выходе — у {@code XMLTYPE} (текст из {@code getClobVal()}).
+     *
+     * @param field поле
+     * @return {@code true}, если переменная нужна
+     */
+    static boolean needsScratch(ArgumentInfo field) {
+        return field.kind() == ArgKind.CLOB || field.kind() == ArgKind.BLOB || field.kind() == ArgKind.XMLTYPE;
+    }
+
+    /**
+     * Возвращает операторы PL/SQL для входной таблицы, которые достают значение поля одного
+     * элемента из склеенного LOB: длина берётся из таблицы длин, начало — из счётчика позиции,
+     * который затем сдвигается на эту длину. {@code CLOB}, {@code NCLOB} и {@code BLOB}
+     * копируются во временный LOB (живёт до конца вызова), {@code XMLTYPE} строится из него же;
+     * национальная строка и {@code RAW} читаются через {@code DBMS_LOB.SUBSTR}.
+     *
+     * @param dest    поле элемента, например {@code v1(j1).DOC}
+     * @param length  длина значения, например {@code v2(j1)}; {@code NULL} — значение {@code NULL}
+     * @param content переменная со склеенным LOB
+     * @param pos     переменная-счётчик позиции в нём
+     * @param scratch вспомогательная переменная-LOB или {@code null}, если она не нужна
+     * @param field   поле
+     * @return операторы PL/SQL
+     */
+    static String lobToField(String dest, String length, String content, String pos, String scratch,
+                             ArgumentInfo field) {
+        String copy = scratch + " := NULL; DBMS_LOB.CREATETEMPORARY(" + scratch + ", TRUE, DBMS_LOB.CALL); ";
+        return switch (field.kind()) {
+            case CLOB, BLOB -> "IF " + length + " IS NULL THEN " + dest + " := NULL; ELSE " + copy
+                    + "IF " + length + " > 0 THEN DBMS_LOB.COPY(" + scratch + ", " + content + ", " + length + ", 1, "
+                    + pos + "); " + pos + " := " + pos + " + " + length + "; END IF; " + dest + " := " + scratch
+                    + "; END IF;";
+            case XMLTYPE -> "IF " + length + " IS NULL OR " + length + " = 0 THEN " + dest + " := NULL; ELSE " + copy
+                    + "DBMS_LOB.COPY(" + scratch + ", " + content + ", " + length + ", 1, " + pos + "); " + pos
+                    + " := " + pos + " + " + length + "; " + dest + " := XMLTYPE(" + scratch + "); END IF;";
+            default -> "IF " + length + " IS NULL OR " + length + " = 0 THEN " + dest + " := NULL; ELSE " + dest
+                    + " := DBMS_LOB.SUBSTR(" + content + ", " + length + ", " + pos + "); " + pos + " := " + pos
+                    + " + " + length + "; END IF;";
+        };
+    }
+
+    /**
+     * Возвращает операторы PL/SQL для выходной таблицы, которые дописывают значение поля одного
+     * элемента в склеенный LOB и кладут его длину в таблицу длин ({@code NULL} — значение
+     * {@code NULL}). Длина {@code CLOB} и национальной строки — в символах так, как их считает
+     * LOB (эмодзи — два, как в Java), {@code BLOB} и {@code RAW} — в байтах.
+     *
+     * @param value   значение поля, например {@code v1(v9).DOC}
+     * @param length  элемент таблицы длин, например {@code v2(v8)}
+     * @param content переменная со склеенным LOB
+     * @param scratch вспомогательная переменная-{@code CLOB} для {@code XMLTYPE} или {@code null}
+     * @param field   поле
+     * @return операторы PL/SQL
+     */
+    static String lobFromField(String value, String length, String content, String scratch, ArgumentInfo field) {
+        String none = "IF " + value + " IS NULL THEN " + length + " := NULL; ELSE ";
+        return switch (field.kind()) {
+            case CLOB, BLOB -> none + length + " := DBMS_LOB.GETLENGTH(" + value + "); IF " + length
+                    + " > 0 THEN DBMS_LOB.APPEND(" + content + ", " + value + "); END IF; END IF;";
+            case XMLTYPE -> none + scratch + " := " + value + ".getClobVal(); " + length + " := DBMS_LOB.GETLENGTH("
+                    + scratch + "); IF " + length + " > 0 THEN DBMS_LOB.APPEND(" + content + ", " + scratch
+                    + "); END IF; IF DBMS_LOB.ISTEMPORARY(" + scratch + ") = 1 THEN DBMS_LOB.FREETEMPORARY(" + scratch
+                    + "); END IF; END IF;";
+            case RAW -> none + length + " := UTL_RAW.LENGTH(" + value + "); DBMS_LOB.WRITEAPPEND(" + content + ", "
+                    + length + ", " + value + "); END IF;";
+            default -> none + length + " := LENGTH(" + value + "); DBMS_LOB.WRITEAPPEND(" + content + ", " + length
+                    + ", " + value + "); END IF;";
+        };
+    }
+
+    /**
+     * Возвращает длины значений поля для таблицы длин (входная таблица): число символов текста
+     * или байтов; {@code null} — значение {@code null}.
+     *
+     * @param list список (или массив) элементов; {@code null} — пустая таблица
+     * @param leaf поле, которое едет склеенным LOB
+     * @return длины по элементам, по порядку
+     * @throws IllegalArgumentException если значение для {@code BLOB} или {@code RAW} не массив байтов
+     */
+    static List<Object> lengths(Object list, Leaf leaf) {
+        List<Object> out = new ArrayList<>();
+        for (Object v : fieldValues(list, leaf)) {
+            out.add(v == null ? null : leaf.transport() == ArgKind.BLOB ? bytes(v, leaf).length : Values.toText(v).length());
+        }
+        return out;
+    }
+
+    /**
+     * Склеивает значения поля всех элементов в одно (входная таблица): текст — в строку
+     * ({@code XML} — своим текстом), байты — в массив; {@code null} пропускается.
+     *
+     * @param list список (или массив) элементов; {@code null} — пустая таблица
+     * @param leaf поле, которое едет склеенным LOB
+     * @return строка или массив байтов
+     * @throws IllegalArgumentException если значение для {@code BLOB} или {@code RAW} не массив байтов
+     */
+    static Object content(Object list, Leaf leaf) {
+        if (leaf.transport() == ArgKind.BLOB) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            for (Object v : fieldValues(list, leaf)) {
+                if (v != null) {
+                    out.writeBytes(bytes(v, leaf));
+                }
+            }
+            return out.toByteArray();
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Object v : fieldValues(list, leaf)) {
+            if (v != null) {
+                sb.append(Values.toText(v));
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Проверяет, что значение для {@code BLOB} или {@code RAW} — массив байтов.
+     *
+     * @param v    значение
+     * @param leaf поле
+     * @return массив байтов
+     * @throws IllegalArgumentException если это не массив байтов
+     */
+    private static byte[] bytes(Object v, Leaf leaf) {
+        if (v instanceof byte[] b) {
+            return b;
+        }
+        throw new IllegalArgumentException("Cannot bind " + v.getClass().getName() + " as "
+                + leaf.field().dataType() + " field " + String.join(".", leaf.path()) + "; use byte[]");
     }
 
     /**
@@ -251,6 +460,22 @@ final class TableSplit {
      * @return значения поля по элементам, по порядку
      */
     static List<Object> values(Object list, Leaf leaf) {
+        List<Object> out = new ArrayList<>();
+        for (Object v : fieldValues(list, leaf)) {
+            out.add(toTransport(v, leaf.field()));
+        }
+        return out;
+    }
+
+    /**
+     * Достаёт из списка Java значения одного поля как есть.
+     *
+     * @param list список (или массив) элементов: record, бины, {@code Map} или простые значения;
+     *             {@code null} — пустая таблица
+     * @param leaf поле
+     * @return значения поля по элементам, по порядку
+     */
+    private static List<Object> fieldValues(Object list, Leaf leaf) {
         Collection<?> c = list == null ? List.of()
                 : list instanceof Collection<?> col ? col : Arrays.asList(ObjectUtils.toObjectArray(list));
         List<Object> out = new ArrayList<>(c.size());
@@ -259,7 +484,7 @@ final class TableSplit {
             for (String p : leaf.path()) {
                 v = v == null ? null : Values.property(v, p);
             }
-            out.add(toTransport(v, leaf.field()));
+            out.add(v);
         }
         return out;
     }
@@ -344,6 +569,7 @@ final class TableSplit {
     static void fold(Map<String, Object> outs, List<String> tables) {
         for (String table : tables) {
             String prefix = table + "[]";
+            slice(outs, prefix);
             Map<String, List<?>> columns = new LinkedHashMap<>();
             for (Iterator<Map.Entry<String, Object>> it = outs.entrySet().iterator(); it.hasNext(); ) {
                 Map.Entry<String, Object> e = it.next();
@@ -366,6 +592,36 @@ final class TableSplit {
                 rows.add(row);
             }
             outs.put(table, rows);
+        }
+    }
+
+    /**
+     * Разрезает склеенные LOB таблицы обратно на значения: пара ключей {@code ПОЛЕ#lob} (строка
+     * или массив байтов) и {@code ПОЛЕ#len} (длины) становится списком значений под ключом
+     * {@code ПОЛЕ}.
+     *
+     * @param outs   выходные значения вызова; меняется на месте
+     * @param prefix начало ключей таблицы, {@code ТАБЛИЦА[]}
+     */
+    private static void slice(Map<String, Object> outs, String prefix) {
+        List<String> keys = outs.keySet().stream().filter(k -> k.startsWith(prefix) && k.endsWith(LENGTHS)).toList();
+        for (String k : keys) {
+            String base = k.substring(0, k.length() - LENGTHS.length());
+            List<?> lengths = (List<?>) outs.remove(k);
+            Object content = outs.remove(base + CONTENT);
+            List<Object> values = new ArrayList<>(lengths.size());
+            int pos = 0;
+            for (Object l : lengths) {
+                if (l == null) {
+                    values.add(null);
+                    continue;
+                }
+                int n = ((Number) l).intValue();
+                values.add(content instanceof byte[] b ? Arrays.copyOfRange(b, pos, pos + n)
+                        : ((String) content).substring(pos, pos + n));
+                pos += n;
+            }
+            outs.put(base, values);
         }
     }
 

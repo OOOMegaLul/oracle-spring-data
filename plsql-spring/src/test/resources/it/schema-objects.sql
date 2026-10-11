@@ -499,3 +499,69 @@ create or replace package body lab_nchar as
   end;
 end lab_nchar;
 /
+-- Index-by tables with LOB, XMLTYPE, RAW and national fields, and tables of NVARCHAR2, CLOB, BLOB.
+create or replace package lab_lob as
+  type doc_t is record (id number, body clob, title nvarchar2(50), data blob, x xmltype, tag raw(16),
+                        code nchar(3));
+  type doc_tab is table of doc_t index by pls_integer;
+  type nstr_tab is table of nvarchar2(100) index by pls_integer;
+  type clob_tab is table of clob index by pls_integer;
+  type blob_tab is table of blob index by pls_integer;
+  function docs_echo(p_docs doc_tab) return doc_tab;
+  function docs_out(p_n number) return doc_tab;
+  function nstrs(p_vals nstr_tab) return nstr_tab;
+  function clobs(p_vals clob_tab) return clob_tab;
+  function blobs(p_vals blob_tab) return blob_tab;
+end lab_lob;
+/
+create or replace package body lab_lob as
+  function docs_echo(p_docs doc_tab) return doc_tab is
+    r doc_tab := p_docs;
+    i pls_integer := r.first;
+  begin
+    while i is not null loop
+      r(i).id := r(i).id + 1;
+      if r(i).body is not null then r(i).body := r(i).body || '!'; end if;
+      if r(i).title is not null then r(i).title := r(i).title || unistr('\4E2D'); end if;
+      i := r.next(i);
+    end loop;
+    return r;
+  end;
+  function docs_out(p_n number) return doc_tab is
+    r doc_tab;
+  begin
+    for i in 1..p_n loop
+      r(i * 10).id := i;
+      if i != 2 then
+        r(i * 10).body := to_clob(rpad('a', 30000, 'a')) || to_clob(rpad('b', 10000, 'b'));
+        r(i * 10).title := unistr('\4E2D') || i;
+        r(i * 10).data := hextoraw('DEADBEEF0' || i);
+        r(i * 10).x := xmltype('<n>' || i || '</n>');
+        r(i * 10).tag := hextoraw('0A0B');
+        r(i * 10).code := 'C' || i;
+      end if;
+    end loop;
+    return r;
+  end;
+  function nstrs(p_vals nstr_tab) return nstr_tab is
+    r nstr_tab;
+  begin
+    for i in 1..p_vals.count loop
+      if p_vals(i) is null then r(i) := null; else r(i) := p_vals(i) || unistr('\4E2D'); end if;
+    end loop;
+    return r;
+  end;
+  function clobs(p_vals clob_tab) return clob_tab is
+    r clob_tab;
+  begin
+    for i in 1..p_vals.count loop
+      if p_vals(i) is null then r(i) := null; else r(i) := p_vals(i) || 'x'; end if;
+    end loop;
+    return r;
+  end;
+  function blobs(p_vals blob_tab) return blob_tab is
+  begin
+    return p_vals;
+  end;
+end lab_lob;
+/
