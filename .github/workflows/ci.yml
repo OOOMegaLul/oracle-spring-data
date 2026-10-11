@@ -61,6 +61,22 @@ jobs:
           print('::notice title=Timings::' + '%0A'.join(text))
           EOF
 
+      - name: Report probe
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          p = 'plsql-spring/target/probe.txt'
+          if os.path.exists(p):
+              text = open(p, encoding='utf-8').read()
+              chunks = [text[i:i + 30000] for i in range(0, len(text), 30000)][:9]
+              for n, c in enumerate(chunks):
+                  esc = c.replace('%', '%25').replace('', '%0D').replace('
+', '%0A')
+                  print(f'::notice title=Probe {n}::' + esc)
+          PY
+
       - name: Keep test reports
         if: always()
         uses: actions/upload-artifact@v7
