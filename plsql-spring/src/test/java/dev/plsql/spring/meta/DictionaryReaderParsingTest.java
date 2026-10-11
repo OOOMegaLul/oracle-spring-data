@@ -195,4 +195,44 @@ class DictionaryReaderParsingTest {
         assertThat(DictionaryReader.rowtypeOf(DictionaryReader.findDeclaration(spec, "Load", null), "P_ROW")).isEqualTo("EMP");
         assertThat(DictionaryReader.rowtypeOf(DictionaryReader.findDeclaration(spec, "LOAD", null), "P_ROW")).isEqualTo("DEPT");
     }
+
+    /**
+     * Проверяет, что имена встроенных типов из {@code ALL_PLSQL_*} 18c+ приводятся к виду
+     * {@code ALL_ARGUMENTS} 11.2: без размера, {@code TIMESTAMP WITH TZ} — с полным названием, а
+     * {@code BOOLEAN} 23ai — как {@code PL/SQL BOOLEAN}; по ним же выбирается вид аргумента.
+     */
+    @Test
+    void newDictionaryTypeNamesLookLike11g() {
+        assertThat(DictionaryReader.builtinType("TIMESTAMP WITH TZ")).isEqualTo("TIMESTAMP WITH TIME ZONE");
+        assertThat(DictionaryReader.builtinType("TIMESTAMP WITH LOCAL TZ")).isEqualTo("TIMESTAMP WITH LOCAL TIME ZONE");
+        assertThat(DictionaryReader.builtinType("TIMESTAMP(6) WITH TIME ZONE")).isEqualTo("TIMESTAMP WITH TIME ZONE");
+        assertThat(DictionaryReader.builtinType("BOOLEAN")).isEqualTo("PL/SQL BOOLEAN");
+        assertThat(DictionaryReader.builtinType("VARCHAR2")).isEqualTo("VARCHAR2");
+        assertThat(DictionaryReader.builtinType(null)).isNull();
+        assertThat(dev.plsql.spring.test.Signatures.arg("P", DictionaryReader.builtinType("BOOLEAN"), "IN").kind())
+                .isEqualTo(ArgKind.BOOLEAN);
+    }
+
+    /**
+     * Проверяет, что длина строкового элемента index-by таблицы находится в объявлении (23ai не
+     * пишет её в {@code ALL_PLSQL_COLL_TYPES}): с пробелами, {@code CHAR}, национальными строками и
+     * мимо закомментированного объявления; без числа длины нет.
+     */
+    @Test
+    void elementLengthComesFromTheDeclaration() {
+        String spec = """
+                create or replace package p as
+                  -- type str_tab is table of varchar2(5) index by pls_integer;
+                  type str_tab is table of varchar2 ( 20 char ) index by pls_integer;
+                  type nstr_tab is table of nvarchar2(100) index by pls_integer;
+                  type code_tab is table of char(3) index by pls_integer;
+                  type name_tab is table of emp.name%type index by pls_integer;
+                end;
+                """;
+        assertThat(DictionaryReader.declaredElementLength(spec, "STR_TAB")).isEqualTo(20);
+        assertThat(DictionaryReader.declaredElementLength(spec, "NSTR_TAB")).isEqualTo(100);
+        assertThat(DictionaryReader.declaredElementLength(spec, "CODE_TAB")).isEqualTo(3);
+        assertThat(DictionaryReader.declaredElementLength(spec, "NAME_TAB")).isNull();
+        assertThat(DictionaryReader.declaredElementLength(spec, "NO_TAB")).isNull();
+    }
 }

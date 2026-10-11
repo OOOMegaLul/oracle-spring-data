@@ -1241,4 +1241,15 @@ class CallPlannerTest {
                 CallPlanner.RETURN_KEY + "[].TITLE" + TableSplit.LENGTHS, CallPlanner.RETURN_KEY + "[].TITLE" + TableSplit.CONTENT);
         assertThat(CallPlanner.supportIssues(func("PKG", "DOCS", table).build())).isEmpty();
     }
+
+    /**
+     * Проверяет, что запись без известных полей не вызывается: иначе она ушла бы в процедуру и
+     * вернулась пустой без единой ошибки (так было на Oracle 18c+, где {@code ALL_ARGUMENTS} не
+     * раскладывает записи).
+     */
+    @Test
+    void recordsWithoutKnownFieldsAreNotCallable() {
+        SubprogramInfo sp = proc("PKG", "REC").add(record("P_REC", "IN/OUT", "PKG", "REC_T")).build();
+        assertThat(CallPlanner.supportIssues(sp)).containsExactly("P_REC: record fields unknown");
+    }
 }

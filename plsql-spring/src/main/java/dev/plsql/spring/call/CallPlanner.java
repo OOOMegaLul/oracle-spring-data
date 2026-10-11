@@ -804,7 +804,8 @@ public class CallPlanner {
      *
      * <p>Проверяются аргументы и возвращаемое значение функции:
      * <ul>
-     *   <li>запись с неизвестным именем типа или с полями неподдерживаемых типов;</li>
+     *   <li>запись с неизвестным именем типа, без известных полей или с полями неподдерживаемых
+     *       типов;</li>
      *   <li>index-by таблица, которую нельзя ни передать напрямую, ни разложить по полям;</li>
      *   <li>тип, который библиотека не знает вовсе (например, {@code OPAQUE/ANYDATA});</li>
      *   <li>REF CURSOR только на вход: открытый курсор нельзя передать из Java;</li>
@@ -831,6 +832,10 @@ public class CallPlanner {
                 case RECORD -> {
                     if (a.declaredType() == null) {
                         issues.add(who + ": record type unknown");
+                    }
+                    if (a.children().isEmpty()) {
+                        // Иначе запись ушла бы и вернулась пустой: молча, без единого поля.
+                        issues.add(who + ": record fields unknown");
                     }
                     List<String> bad = new ArrayList<>();
                     unsupportedFields(a, "", bad);

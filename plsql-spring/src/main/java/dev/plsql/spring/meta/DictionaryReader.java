@@ -217,6 +217,9 @@ public class DictionaryReader {
             ps.setString(3, r.packageName());
             rows = rows(ps);
         }
+        if (r.packageName() != null && !rows.isEmpty()) {
+            addArgumentless(con, r.owner(), r.packageName(), rows);
+        }
         Map<String, List<Row>> byOverload = rows.getOrDefault(r.name(), Map.of());
         if (byOverload.isEmpty()) {
             String owner = r.owner();
@@ -259,6 +262,7 @@ public class DictionaryReader {
         if (rows.isEmpty() && "INVALID".equals(objectStatus(con, owner, packageName))) {
             throw new InvalidObjectException(owner, packageName);
         }
+        addArgumentless(con, owner, packageName, rows);
         Map<String, List<SubprogramInfo>> out = new LinkedHashMap<>();
         for (var e : rows.entrySet()) {
             out.put(e.getKey(), complete(con, new Resolved(owner, packageName, e.getKey()), e.getValue()));
@@ -377,7 +381,7 @@ public class DictionaryReader {
                         rs.getInt("position"),
                         rs.getInt("data_level"),
                         rs.getString("argument_name"),
-                        rs.getString("data_type"),
+                        builtinType(rs.getString("data_type")),
                         rs.getString("pls_type"),
                         rs.getString("in_out"),
                         "Y".equals(rs.getString("defaulted")),
@@ -418,10 +422,348 @@ public class DictionaryReader {
     private List<SubprogramInfo> complete(Connection con, Resolved r, Map<String, List<Row>> byOverload) throws SQLException {
         List<SubprogramInfo> result = new ArrayList<>();
         for (List<Row> rows : byOverload.values()) {
-            SubprogramInfo sp = fillRowtypes(con, build(r, rows));
+            SubprogramInfo sp = fillPlsqlTypes(con, fillRowtypes(con, build(r, rows)));
             result.add(fillSqlTypes(con, sp));
         }
         return result;
+    }
+
+    // ------------------------------------------------------------ типы PL/SQL на 18c и новее
+
+    /**
+     * Дочитывает поля записей и элементы index-by таблиц, которых нет в {@code ALL_ARGUMENTS}.
+     *
+     * <p>На 11.2 {@code ALL_ARGUMENTS} раскладывает запись поле за полем, а таблицу — до типа
+     * элемента (строки с {@code DATA_LEVEL} больше 0). Начиная с 18c там остаётся только строка
+     * самого аргумента с именем его типа (проверено на XE 21 и Oracle Free 23), а устройство типов
+     * пакетов описывают {@code ALL_PLSQL_TYPES}, {@code ALL_PLSQL_TYPE_ATTRS} и
+     * {@code ALL_PLSQL_COLL_TYPES} (они есть с 12c). Поля {@code %ROWTYPE} таблицы берутся из
+     * {@code ALL_TAB_COLUMNS}. Описания приводятся к виду, в каком их дал бы {@code ALL_ARGUMENTS}
+     * 11.2, и дальше библиотека работает с ними так же. На 11.2 шаг ничего не делает: у записей и
+     * таблиц там уже есть вложенные строки.
+     *
+     * @param con соединение, на котором читается словарь
+     * @param sp  подпрограмма, собранная из строк {@code ALL_ARGUMENTS}
+     * @return {@code sp} или копия с дочитанными полями и элементами
+     * @throws SQLException при ошибке обращения к словарю, кроме отсутствия этих представлений
+     */
+    private SubprogramInfo fillPlsqlTypes(Connection con, SubprogramInfo sp) throws SQLException {
+        boolean needed = sp.arguments().stream().anyMatch(DictionaryReader::lacksStructure)
+                || (sp.returnValue() != null && lacksStructure(sp.returnValue()));
+        if (!needed) {
+            return sp;
+        }
+        List<ArgumentInfo> args = new ArrayList<>();
+        for (ArgumentInfo a : sp.arguments()) {
+            args.add(completePlsqlType(con, sp, a, 0));
+        }
+        ArgumentInfo ret = sp.returnValue() == null ? null : completePlsqlType(con, sp, sp.returnValue(), 0);
+        return new SubprogramInfo(sp.owner(), sp.packageName(), sp.name(), sp.overload(), ret, args);
+    }
+
+    /**
+     * Проверяет, что у записи или index-by таблицы нет вложенных строк, хотя имя типа известно.
+     *
+     * @param a аргумент или поле
+     * @return {@code true}, если устройство типа нужно дочитать
+     */
+    private static boolean lacksStructure(ArgumentInfo a) {
+        return (a.kind() == ArgKind.RECORD || a.kind() == ArgKind.INDEX_TABLE) && a.children().isEmpty()
+                && a.typeName() != null;
+    }
+
+    /**
+     * Дочитывает устройство одной записи или таблицы и рекурсивно — их полей.
+     *
+     * @param con   соединение, на котором читается словарь
+     * @param sp    подпрограмма (для чтения объявлений из исходника)
+     * @param a     аргумент, поле или элемент
+     * @param depth текущая глубина, 0 у аргумента верхнего уровня
+     * @return {@code a} или копия с дочитанными вложенными элементами
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private ArgumentInfo completePlsqlType(Connection con, SubprogramInfo sp, ArgumentInfo a, int depth)
+            throws SQLException {
+        if (depth > MAX_TYPE_DEPTH) {
+            return new ArgumentInfo(a.name(), a.position(), a.dataLevel(), "NESTED TOO DEEP", a.plsType(), a.inOut(),
+                    a.defaulted(), a.typeOwner(), a.typeName(), a.typeSubname(), null, a.charLength());
+        }
+        List<ArgumentInfo> children = a.children();
+        if (lacksStructure(a)) {
+            if (a.kind() == ArgKind.RECORD && a.typeSubname() != null) {
+                children = plsqlAttributes(con, a.typeOwner(), a.typeName(), a.typeSubname(), a.inOut(), a.dataLevel() + 1);
+            } else if (a.kind() == ArgKind.RECORD) {
+                // %ROWTYPE таблицы: TYPE_NAME — таблица (на 18c+), либо OWNER.TABLE после fillRowtypes.
+                String owner = a.typeOwner();
+                String table = a.typeName();
+                if (owner == null) {
+                    List<String> parts = nameParts(table);
+                    owner = parts.size() == 2 ? parts.get(0) : sp.owner();
+                    table = parts.get(parts.size() - 1);
+                }
+                children = tableColumns(con, owner, table, a.inOut(), a.dataLevel() + 1);
+            } else if (a.typeSubname() != null) {
+                ArgumentInfo el = plsqlElement(con, sp, a.typeOwner(), a.typeName(), a.typeSubname(), a.inOut(),
+                        a.dataLevel() + 1);
+                children = el == null ? List.of() : List.of(el);
+            }
+        }
+        List<ArgumentInfo> completed = new ArrayList<>();
+        for (ArgumentInfo c : children) {
+            completed.add(completePlsqlType(con, sp, c, depth + 1));
+        }
+        return new ArgumentInfo(a.name(), a.position(), a.dataLevel(), a.dataType(), a.plsType(), a.inOut(),
+                a.defaulted(), a.typeOwner(), a.typeName(), a.typeSubname(), completed, a.charLength());
+    }
+
+    /** Уже прочитанные поля типов PL/SQL пакетов: {@code ВЛАДЕЛЕЦ.ПАКЕТ.ТИП} → строки описаний. */
+    private final Map<String, List<String[]>> plsqlTypeAttrs = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Читает поля записи, объявленной в пакете, из {@code ALL_PLSQL_TYPE_ATTRS}.
+     *
+     * @param con   соединение, на котором читается словарь
+     * @param owner владелец пакета
+     * @param pkg   пакет
+     * @param type  имя типа записи ({@code REC_T}, {@code C_EMP%ROWTYPE})
+     * @param inOut направление, унаследованное от аргумента
+     * @param level уровень вложенности полей
+     * @return поля по порядку; пустой список, если описание не нашлось (или представления нет)
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private List<ArgumentInfo> plsqlAttributes(Connection con, String owner, String pkg, String type, String inOut,
+                                               int level) throws SQLException {
+        List<String[]> rows = plsqlTypeAttrs.get(owner + "." + pkg + "." + type);
+        if (rows == null) {
+            rows = new ArrayList<>();
+            try (PreparedStatement ps = con.prepareStatement("""
+                    select attr_name, attr_type_owner, attr_type_name, attr_type_package, length, character_set_name
+                      from all_plsql_type_attrs
+                     where owner = ? and package_name = ? and type_name = ?
+                     order by attr_no""")) {
+                ps.setString(1, owner);
+                ps.setString(2, pkg);
+                ps.setString(3, type);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        rows.add(new String[]{rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4),
+                                rs.getString(5), rs.getString(6)});
+                    }
+                }
+            } catch (SQLException e) {
+                if (e.getErrorCode() != NO_SUCH_VIEW) {
+                    throw e;
+                }
+            }
+            plsqlTypeAttrs.put(owner + "." + pkg + "." + type, rows);
+        }
+        List<ArgumentInfo> out = new ArrayList<>();
+        for (String[] r : rows) {
+            out.add(plsqlTyped(con, r[0], r[1], r[2], r[3], r[4] == null ? null : Integer.valueOf(r[4]), r[5], inOut,
+                    level));
+        }
+        return out;
+    }
+
+    /**
+     * Читает тип элемента index-by таблицы, объявленной в пакете, из
+     * {@code ALL_PLSQL_COLL_TYPES}. Если длина строкового элемента в словаре не указана (так
+     * бывает на 23ai), она берётся из объявления типа в исходнике спецификации пакета.
+     *
+     * @param con   соединение, на котором читается словарь
+     * @param sp    подпрограмма, в чьём пакете может лежать объявление
+     * @param owner владелец пакета
+     * @param pkg   пакет
+     * @param type  имя типа таблицы
+     * @param inOut направление, унаследованное от аргумента
+     * @param level уровень вложенности элемента
+     * @return элемент или {@code null}, если описание не нашлось (или представления нет)
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private ArgumentInfo plsqlElement(Connection con, SubprogramInfo sp, String owner, String pkg, String type,
+                                      String inOut, int level) throws SQLException {
+        try (PreparedStatement ps = con.prepareStatement("""
+                select coll_type, elem_type_owner, elem_type_name, elem_type_package, length, character_set_name
+                  from all_plsql_coll_types
+                 where owner = ? and package_name = ? and type_name = ?""")) {
+            ps.setString(1, owner);
+            ps.setString(2, pkg);
+            ps.setString(3, type);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                String length = rs.getString(5);
+                ArgumentInfo el = plsqlTyped(con, null, rs.getString(2), rs.getString(3), rs.getString(4),
+                        length == null ? null : Integer.valueOf(length), rs.getString(6), inOut, level);
+                if (el.kind() == ArgKind.STRING && el.charLength() == null) {
+                    Integer declared = declaredElementLength(sourceOf(con, owner, pkg), type);
+                    if (declared != null) {
+                        el = new ArgumentInfo(null, el.position(), el.dataLevel(), el.dataType(), null, inOut, false,
+                                null, null, null, List.of(), declared);
+                    }
+                }
+                return el;
+            }
+        } catch (SQLException e) {
+            if (e.getErrorCode() != NO_SUCH_VIEW) {
+                throw e;
+            }
+            return null;
+        }
+    }
+
+    /** ORA-00942: таблица или представление не существует (на 11.2 нет {@code ALL_PLSQL_*}). */
+    private static final int NO_SUCH_VIEW = 942;
+
+    /**
+     * Описывает поле записи или элемент таблицы по описанию его типа из {@code ALL_PLSQL_*}.
+     *
+     * <ul>
+     *   <li>тип из пакета ({@code PACKAGE} задан) — запись, курсорная {@code %ROWTYPE} или
+     *       index-by таблица; их устройство дочитывается на следующем шаге;</li>
+     *   <li>{@code ТАБЛИЦА%ROWTYPE} — запись с полями из столбцов таблицы;</li>
+     *   <li>тип со схемой — объектный тип или коллекция SQL, {@code XMLTYPE};</li>
+     *   <li>встроенный тип — его имя в том виде, как его пишет {@code ALL_ARGUMENTS}.</li>
+     * </ul>
+     *
+     * @param con       соединение, на котором читается словарь
+     * @param name      имя поля или {@code null} у элемента
+     * @param owner     схема типа или {@code null} у встроенного
+     * @param typeName  имя типа
+     * @param pkg       пакет типа или {@code null}
+     * @param length    длина строки или {@code null}
+     * @param charset   {@code CHAR_CS} или {@code NCHAR_CS} у строк
+     * @param inOut     направление, унаследованное от аргумента
+     * @param level     уровень вложенности
+     * @return описание без вложенных элементов (кроме полей {@code %ROWTYPE})
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private ArgumentInfo plsqlTyped(Connection con, String name, String owner, String typeName, String pkg,
+                                    Integer length, String charset, String inOut, int level) throws SQLException {
+        if (pkg != null) {
+            String dataType = "PL/SQL RECORD";
+            try (PreparedStatement ps = con.prepareStatement("""
+                    select t.typecode, c.coll_type from all_plsql_types t
+                      left join all_plsql_coll_types c
+                        on c.owner = t.owner and c.package_name = t.package_name and c.type_name = t.type_name
+                     where t.owner = ? and t.package_name = ? and t.type_name = ?""")) {
+                ps.setString(1, owner);
+                ps.setString(2, pkg);
+                ps.setString(3, typeName);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && "COLLECTION".equals(rs.getString(1))) {
+                        dataType = "PL/SQL INDEX TABLE".equals(rs.getString(2)) ? "PL/SQL TABLE" : "PL/SQL " + rs.getString(2);
+                    }
+                }
+            }
+            return new ArgumentInfo(name, 0, level, dataType, null, inOut, false, owner, pkg, typeName, null, null);
+        }
+        if (owner != null && typeName.endsWith("%ROWTYPE")) {
+            String table = typeName.substring(0, typeName.length() - "%ROWTYPE".length());
+            return new ArgumentInfo(name, 0, level, "PL/SQL RECORD", "ROWTYPE", inOut, false, null,
+                    sqlName(owner, table), null, tableColumns(con, owner, table, inOut, level + 1), null);
+        }
+        if (owner != null) {
+            ArgumentInfo t = typedArg(con, name, owner, typeName, inOut);
+            return new ArgumentInfo(name, 0, level, t.dataType(), null, inOut, false, t.typeOwner(), t.typeName(), null,
+                    null, null);
+        }
+        String dataType = builtinType(typeName);
+        if ("NCHAR_CS".equals(charset) && !dataType.startsWith("N")) {
+            dataType = "N" + dataType;
+        }
+        return new ArgumentInfo(name, 0, level, dataType, null, inOut, false, null, null, null, null, length);
+    }
+
+    /**
+     * Читает столбцы таблицы или представления как поля записи {@code %ROWTYPE}, по порядку.
+     *
+     * @param con   соединение, на котором читается словарь
+     * @param owner схема таблицы
+     * @param table таблица или представление
+     * @param inOut направление, унаследованное от аргумента
+     * @param level уровень вложенности полей
+     * @return поля; пустой список, если таблицу не видно
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private List<ArgumentInfo> tableColumns(Connection con, String owner, String table, String inOut, int level)
+            throws SQLException {
+        List<ArgumentInfo> out = new ArrayList<>();
+        try (PreparedStatement ps = con.prepareStatement("""
+                select column_name, data_type_owner, data_type, nullif(char_length, 0)
+                  from all_tab_columns
+                 where owner = ? and table_name = ?
+                 order by column_id""")) {
+            ps.setString(1, owner);
+            ps.setString(2, table);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String length = rs.getString(4);
+                    out.add(plsqlTyped(con, rs.getString(1), rs.getString(2), rs.getString(3), null,
+                            length == null ? null : Integer.valueOf(length), null, inOut, level));
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Приводит имя встроенного типа к виду {@code ALL_ARGUMENTS} 11.2: без размера в скобках,
+     * {@code TIMESTAMP WITH TZ} — {@code TIMESTAMP WITH TIME ZONE}, {@code BOOLEAN} (так его
+     * называет 23ai) — {@code PL/SQL BOOLEAN}.
+     *
+     * @param type имя типа из словаря или {@code null}
+     * @return имя в виде 11.2 или {@code null}
+     */
+    static String builtinType(String type) {
+        if (type == null) {
+            return null;
+        }
+        String t = type.replaceAll("\\(\\d+\\)", "").replaceAll("\\s+", " ").trim();
+        return switch (t) {
+            case "BOOLEAN" -> "PL/SQL BOOLEAN";
+            case "TIMESTAMP WITH TZ" -> "TIMESTAMP WITH TIME ZONE";
+            case "TIMESTAMP WITH LOCAL TZ" -> "TIMESTAMP WITH LOCAL TIME ZONE";
+            default -> t;
+        };
+    }
+
+    /** Уже прочитанные исходники спецификаций пакетов: {@code ВЛАДЕЛЕЦ.ПАКЕТ} → текст. */
+    private final Map<String, String> packageSources = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Возвращает исходник спецификации пакета, читая его один раз.
+     *
+     * @param con   соединение, на котором читается словарь
+     * @param owner владелец пакета
+     * @param pkg   пакет
+     * @return исходный текст; пустая строка, если его не видно
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private String sourceOf(Connection con, String owner, String pkg) throws SQLException {
+        String key = owner + "." + pkg;
+        String s = packageSources.get(key);
+        if (s == null) {
+            s = sourceText(con, new SubprogramInfo(owner, pkg, pkg, null, null, List.of()));
+            packageSources.put(key, s);
+        }
+        return s;
+    }
+
+    /**
+     * Находит в исходнике длину строкового элемента index-by таблицы:
+     * {@code TYPE T IS TABLE OF VARCHAR2(20) ...} даёт 20.
+     *
+     * @param source исходник спецификации пакета
+     * @param type   имя типа таблицы
+     * @return длина или {@code null}, если объявление не нашлось или длина не написана числом
+     */
+    static Integer declaredElementLength(String source, String type) {
+        String text = stripComments(source).toUpperCase(java.util.Locale.ROOT);
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\bTYPE\\s+\"?" + java.util.regex.Pattern.quote(type)
+                + "\"?\\s+IS\\s+TABLE\\s+OF\\s+N?(?:VAR)?CHAR2?\\s*\\(\\s*(\\d+)").matcher(text);
+        return m.find() ? Integer.valueOf(m.group(1)) : null;
     }
 
     // ------------------------------------------------------------ объектные типы SQL
@@ -1316,6 +1658,53 @@ public class DictionaryReader {
         }
         String overload = rows.get(0).overload;
         return new SubprogramInfo(r.owner(), r.packageName(), r.name(), overload, ret, top);
+    }
+
+    /**
+     * Добавляет процедуры пакета без аргументов, у которых нет ни одной строки в
+     * {@code ALL_ARGUMENTS}: на 11.2 у такой процедуры одна пустая строка, а начиная с 18c строк
+     * нет вовсе (проверено на XE 21 и Oracle Free 23), и без этого шага её «не было бы» в пакете.
+     * Каждая подпрограмма и перегрузка из {@code ALL_PROCEDURES}, которой нет среди строк,
+     * получает такую же пустую строку, как на 11.2; перегрузки затем идут по номеру.
+     *
+     * @param con         соединение, на котором читается словарь
+     * @param owner       схема пакета
+     * @param packageName имя пакета
+     * @param rows        строки {@code ALL_ARGUMENTS} по подпрограммам и перегрузкам; дополняется
+     * @throws SQLException при ошибке обращения к словарю
+     */
+    private static void addArgumentless(Connection con, String owner, String packageName,
+                                        Map<String, Map<String, List<Row>>> rows) throws SQLException {
+        try (PreparedStatement ps = con.prepareStatement("""
+                select procedure_name, overload from all_procedures
+                 where owner = ? and object_name = ? and procedure_name is not null""")) {
+            ps.setString(1, owner);
+            ps.setString(2, packageName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String overload = rs.getString(2);
+                    Map<String, List<Row>> byOverload = rows.computeIfAbsent(rs.getString(1), k -> new LinkedHashMap<>());
+                    if (!byOverload.containsKey(overload == null ? "" : overload)) {
+                        byOverload.put(overload == null ? "" : overload, new ArrayList<>(List.of(
+                                new Row(overload, 0, 0, null, null, null, null, false, null, null, null, null))));
+                        sortOverloads(byOverload);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Упорядочивает перегрузки по номеру: без номера — первой, затем 1, 2, ... как в запросе
+     * {@code order by overload nulls first}.
+     *
+     * @param byOverload строки по перегрузкам; меняется на месте
+     */
+    private static void sortOverloads(Map<String, List<Row>> byOverload) {
+        List<Map.Entry<String, List<Row>>> sorted = new ArrayList<>(byOverload.entrySet());
+        sorted.sort(java.util.Comparator.comparingInt(e -> e.getKey().isEmpty() ? 0 : Integer.parseInt(e.getKey())));
+        byOverload.clear();
+        sorted.forEach(e -> byOverload.put(e.getKey(), e.getValue()));
     }
 
     /**
