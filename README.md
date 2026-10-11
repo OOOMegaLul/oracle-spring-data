@@ -25,7 +25,9 @@ public interface Hr {
 ```
 
 Писалось под Oracle **11.2.0.4**, где JDBC не умеет передавать `BOOLEAN`, `RECORD` и
-`XMLTYPE`. На более новых версиях работает так же.
+`XMLTYPE`. Работает и на новых версиях: CI гоняет интеграционные тесты на Oracle 11g, 21c и
+23ai. С 18c словарь описывает типы PL/SQL иначе (поля записей — не в `ALL_ARGUMENTS`, а в
+`ALL_PLSQL_TYPE_ATTRS`), и библиотека читает оба вида.
 
 ## Подключение
 
@@ -245,7 +247,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (177, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (180, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования. CI гоняет их
 ещё и на Spring Boot 3.5 (Spring 6.2): `./mvnw test -Dspring-boot.version=3.5.6`.
 
@@ -257,12 +259,14 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 пересоздают при каждом запуске. Где взять базу:
 
 - по умолчанию одноразовый контейнер `gvenzl/oracle-xe:11-slim` (Testcontainers, нужен Docker);
+  другая версия — `-Dplsql.it.image=gvenzl/oracle-xe:21-slim` или `gvenzl/oracle-free:23-slim`;
 - своя база: `-Dplsql.it.url=jdbc:oracle:thin:@//host:1521/SVC -Dplsql.it.dba.password=...`
   (DBA по умолчанию `system`, `-Dplsql.it.dba.user` меняет);
 - Windows + Docker Desktop: добавьте `-Dplsql.it.port=1541` и `TESTCONTAINERS_RYUK_DISABLED=true`,
   там случайные порты контейнеров бывают недоступны.
 
-Проверено на Oracle 11.2.0.4 EE в CL8MSWIN1251 и Oracle XE 11.2.0.2 в AL32UTF8.
+Проверено на Oracle 11.2.0.4 EE в CL8MSWIN1251, Oracle XE 11.2.0.2 и XE 21c, Oracle Free 23ai в
+AL32UTF8.
 
 ## Лицензия
 

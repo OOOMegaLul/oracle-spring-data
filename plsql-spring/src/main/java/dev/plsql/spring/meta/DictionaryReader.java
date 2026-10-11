@@ -489,19 +489,32 @@ public class DictionaryReader {
                     a.defaulted(), a.typeOwner(), a.typeName(), a.typeSubname(), null, a.charLength());
         }
         List<ArgumentInfo> children = a.children();
+        String typeOwner = a.typeOwner();
+        String typeName = a.typeName();
         if (lacksStructure(a)) {
             if (a.kind() == ArgKind.RECORD && a.typeSubname() != null) {
                 children = plsqlAttributes(con, a.typeOwner(), a.typeName(), a.typeSubname(), a.inOut(), a.dataLevel() + 1);
             } else if (a.kind() == ArgKind.RECORD) {
-                // %ROWTYPE таблицы: TYPE_NAME — таблица (на 18c+), либо OWNER.TABLE после fillRowtypes.
-                String owner = a.typeOwner();
-                String table = a.typeName();
-                if (owner == null) {
-                    List<String> parts = nameParts(table);
-                    owner = parts.size() == 2 ? parts.get(0) : sp.owner();
-                    table = parts.get(parts.size() - 1);
+                // %ROWTYPE: на 18c+ TYPE_NAME — таблица, синоним или курсор пакета; после
+                // fillRowtypes — OWNER.TABLE или OWNER.PKG.CURSOR.
+                List<String> parts = nameParts(typeName);
+                String owner = typeOwner != null ? typeOwner : parts.size() >= 2 ? parts.get(0) : sp.owner();
+                if (typeOwner == null && parts.size() == 3) {
+                    children = plsqlAttributes(con, owner, parts.get(1), parts.get(2) + "%ROWTYPE", a.inOut(),
+                            a.dataLevel() + 1);
+                } else {
+                    String table = parts.get(parts.size() - 1);
+                    children = tableColumns(con, owner, table, a.inOut(), a.dataLevel() + 1);
+                    if (children.isEmpty() && sp.packageName() != null) {
+                        // Курсор этого пакета: CURSOR C_EMP IS ...; P_ROW C_EMP%ROWTYPE.
+                        children = plsqlAttributes(con, sp.owner(), sp.packageName(), table + "%ROWTYPE", a.inOut(),
+                                a.dataLevel() + 1);
+                        if (!children.isEmpty()) {
+                            typeOwner = null;
+                            typeName = sqlName(sp.owner(), sp.packageName(), table);
+                        }
+                    }
                 }
-                children = tableColumns(con, owner, table, a.inOut(), a.dataLevel() + 1);
             } else if (a.typeSubname() != null) {
                 ArgumentInfo el = plsqlElement(con, sp, a.typeOwner(), a.typeName(), a.typeSubname(), a.inOut(),
                         a.dataLevel() + 1);
@@ -513,7 +526,7 @@ public class DictionaryReader {
             completed.add(completePlsqlType(con, sp, c, depth + 1));
         }
         return new ArgumentInfo(a.name(), a.position(), a.dataLevel(), a.dataType(), a.plsType(), a.inOut(),
-                a.defaulted(), a.typeOwner(), a.typeName(), a.typeSubname(), completed, a.charLength());
+                a.defaulted(), typeOwner, typeName, a.typeSubname(), completed, a.charLength());
     }
 
     /** Уже прочитанные поля типов PL/SQL пакетов: {@code ВЛАДЕЛЕЦ.ПАКЕТ.ТИП} → строки описаний. */
@@ -678,6 +691,8 @@ public class DictionaryReader {
 
     /**
      * Читает столбцы таблицы или представления как поля записи {@code %ROWTYPE}, по порядку.
+     * Если под этим именем столбцов нет, имя раскрывается как синоним (частный, затем публичный) до
+     * таблицы.
      *
      * @param con   соединение, на котором читается словарь
      * @param owner схема таблицы
@@ -703,6 +718,13 @@ public class DictionaryReader {
                     out.add(plsqlTyped(con, rs.getString(1), rs.getString(2), rs.getString(3), null,
                             length == null ? null : Integer.valueOf(length), null, inOut, level));
                 }
+            }
+        }
+        if (out.isEmpty()) {
+            String target = resolveTable(con, owner, table, true);
+            List<String> parts = target == null ? List.of() : nameParts(target);
+            if (parts.size() == 2 && !(parts.get(0).equals(owner) && parts.get(1).equals(table))) {
+                return tableColumns(con, parts.get(0), parts.get(1), inOut, level);
             }
         }
         return out;
