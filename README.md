@@ -246,7 +246,8 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
 Юнит-тесты (177, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
-сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования.
+сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования. CI гоняет их
+ещё и на Spring Boot 3.5 (Spring 6.2): `./mvnw test -Dspring-boot.version=3.5.6`.
 
 ```bash
 ./mvnw verify -Pit

@@ -67,3 +67,19 @@ jobs:
             **/target/surefire-reports/
             **/target/failsafe-reports/
           if-no-files-found: ignore
+
+  # The library also targets Spring Framework 6.2 (Spring Boot 3.5): unit tests against it, so
+  # that nothing from Spring 7 or Boot 4 slips into the code. Integration tests run in "build".
+  boot3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Unit tests on Spring Boot 3.5
+        shell: bash
+        run: ./mvnw -B -ntp test -Dspring-boot.version=3.5.6
