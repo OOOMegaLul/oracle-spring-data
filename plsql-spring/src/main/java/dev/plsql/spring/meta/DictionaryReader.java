@@ -513,6 +513,15 @@ public class DictionaryReader {
                             a.dataLevel() + 1);
                 } else {
                     String table = parts.get(parts.size() - 1);
+                    // Синоним раскрывается до таблицы и в объявлении переменной блока, как на 11.2.
+                    String resolved = resolveTable(con, owner, table, true);
+                    List<String> target = resolved == null ? List.of() : nameParts(resolved);
+                    if (target.size() == 2) {
+                        owner = target.get(0);
+                        table = target.get(1);
+                        typeOwner = null;
+                        typeName = resolved;
+                    }
                     children = tableColumns(con, owner, table, a.inOut(), a.dataLevel() + 1);
                     if (children.isEmpty() && sp.packageName() != null) {
                         // Курсор этого пакета: CURSOR C_EMP IS ...; P_ROW C_EMP%ROWTYPE.
