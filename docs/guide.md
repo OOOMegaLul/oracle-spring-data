@@ -80,7 +80,7 @@ public interface HrApi {
   <dependency>
     <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
     <artifactId>plsql-spring</artifactId>
-    <version>v0.5.0</version>
+    <version>v0.5.1</version>
   </dependency>
 </dependencies>
 ```

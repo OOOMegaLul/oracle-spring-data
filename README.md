@@ -43,12 +43,12 @@ public interface Hr {
 <dependency>
   <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
   <artifactId>plsql-spring</artifactId>
-  <version>v0.5.0</version>
+  <version>v0.5.1</version>
 </dependency>
 ```
 
 Gradle: `maven { url 'https://jitpack.io' }` и
-`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.5.0'`.
+`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.5.1'`.
 
 **Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
 у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
@@ -246,14 +246,14 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (171, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (174, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования.
 
 ```bash
 ./mvnw verify -Pit
 ```
 
-Интеграционные тесты (60) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
+Интеграционные тесты (62) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
 пересоздают при каждом запуске. Где взять базу:
 
 - по умолчанию одноразовый контейнер `gvenzl/oracle-xe:11-slim` (Testcontainers, нужен Docker);
