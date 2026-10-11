@@ -48,7 +48,8 @@ jobs:
 
           **Files:** \`plsql-spring-$VERSION.jar\` is the library, \`-sources.jar\` its source,
           \`-javadoc.jar\` its documentation. Using the jar directly, put these next to it:
-          ojdbc10 and orai18n 19.x, spring-jdbc and spring-context 6.2+ or 7.x, slf4j-api.
+          ojdbc10 and orai18n 19.x, spring-jdbc and spring-context 6.2+ or 7.x with their dependencies
+          (micrometer-observation among them), slf4j-api.
 
           Java 17+. Oracle 11.2 and newer. See README.md.
           EOF

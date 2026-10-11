@@ -53,7 +53,8 @@ Gradle: `maven { url 'https://jitpack.io' }` и
 **Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
 у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
 документация (`-javadoc.jar`). Зависимости в этом случае кладутся рядом вручную:
-`ojdbc10` и `orai18n` версии 19.x, `spring-jdbc`, `spring-context`, `slf4j-api`.
+`ojdbc10` и `orai18n` версии 19.x, `spring-jdbc` и `spring-context` с их зависимостями (среди них
+`micrometer-observation`), `slf4j-api`.
 
 **Из исходников.** `./mvnw install -pl plsql-spring -am`, затем зависимость
 `dev.plsql:plsql-spring:<версия из pom.xml>`.
