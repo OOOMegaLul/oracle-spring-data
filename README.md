@@ -43,12 +43,12 @@ public interface Hr {
 <dependency>
   <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
   <artifactId>plsql-spring</artifactId>
-  <version>v0.4.1</version>
+  <version>v0.5.0</version>
 </dependency>
 ```
 
 Gradle: `maven { url 'https://jitpack.io' }` и
-`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.4.1'`.
+`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.5.0'`.
 
 **Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
 у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
@@ -210,7 +210,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 - **Пакет.** `@Procedure(batch = true) int hireAll(List<Row> rows)` вызывает процедуру по разу
   на элемент, пачками по 1000 за обращение к базе (на XE 11.2: 2000 вызовов — 0,64 с вместо
   3,8 с по одному); вне транзакции весь пакет — одна единица работы.
-- **`IN (:ids)`.** Параметр-коллекция в `@SqlQuery` раскладывается на отдельные значения;
+- **`IN (:ids)`.** Параметр-коллекция или массив в `@SqlQuery` раскладывается на отдельные значения;
   пустой список и больше 1000 значений (ORA-01795) — понятная ошибка до обращения к базе.
 - **Страницы.** `@SqlQuery` с параметром `Pageable` или `Sort` возвращает `Page`, `Slice` или
   `List`; страница вырезается через `ROWNUM`, потому что 11g не знает `OFFSET ... FETCH`.
@@ -244,14 +244,14 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (162, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (171, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования.
 
 ```bash
 ./mvnw verify -Pit
 ```
 
-Интеграционные тесты (47) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
+Интеграционные тесты (60) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
 пересоздают при каждом запуске. Где взять базу:
 
 - по умолчанию одноразовый контейнер `gvenzl/oracle-xe:11-slim` (Testcontainers, нужен Docker);
