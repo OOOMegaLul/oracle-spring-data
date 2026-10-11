@@ -29,8 +29,9 @@ import com.zaxxer.hikari.HikariDataSource;
  * <p>Откуда берётся база:
  * <ul>
  *   <li>по умолчанию — одноразовый контейнер {@code gvenzl/oracle-xe:11-slim} (Testcontainers, нужен
- *       Docker); {@code -Dplsql.it.image=...} выбирает другой образ, {@code -Dplsql.it.port=...} —
- *       фиксированный порт на хосте;</li>
+ *       Docker); {@code -Dplsql.it.image=...} выбирает другой образ (например,
+ *       {@code gvenzl/oracle-xe:21-slim} или {@code gvenzl/oracle-free:23-slim}),
+ *       {@code -Dplsql.it.port=...} — фиксированный порт на хосте;</li>
  *   <li>{@code -Dplsql.it.url=... -Dplsql.it.dba.password=...} (и при необходимости
  *       {@code -Dplsql.it.dba.user}, по умолчанию {@code system}) — уже существующая база Oracle.</li>
  * </ul>
@@ -212,8 +213,7 @@ public final class ItDatabase {
             // Контейнер останавливает и «чистильщик» Testcontainers (Ryuk); хук нужен на случай
             // TESTCONTAINERS_RYUK_DISABLED=true, когда Ryuk выключен.
             Runtime.getRuntime().addShutdownHook(new Thread(db::stop, "stop-oracle-it"));
-            jdbcUrl = "jdbc:oracle:thin:@//" + db.getHost() + ":" + db.getMappedPort(1521) + "/XE";
-            // В gvenzl/oracle-xe:11 нет PDB (подключаемых баз, они появились в 12c): сервис — XE.
+            jdbcUrl = "jdbc:oracle:thin:@//" + db.getHost() + ":" + db.getMappedPort(1521) + "/" + service(image);
             dbaUser = "system";
             dbaPassword = "it_password";
         } else {
@@ -241,6 +241,26 @@ public final class ItDatabase {
             throw new IllegalStateException("cannot create test objects on " + jdbcUrl, e);
         }
         url = jdbcUrl;
+    }
+
+    /**
+     * Возвращает имя сервиса базы в контейнере. В {@code gvenzl/oracle-xe:11} нет PDB (подключаемых
+     * баз, они появились в 12c), и схема создаётся в самой базе {@code XE}; в образах 18c и новее
+     * обычного пользователя можно создать только в PDB: {@code XEPDB1} у XE, {@code FREEPDB1} у
+     * Oracle Free. {@code -Dplsql.it.service=...} задаёт имя явно.
+     *
+     * @param image образ контейнера
+     * @return имя сервиса для адреса JDBC
+     */
+    static String service(String image) {
+        String explicit = System.getProperty("plsql.it.service");
+        if (explicit != null && !explicit.isBlank()) {
+            return explicit;
+        }
+        if (image.contains("oracle-xe:11")) {
+            return "XE";
+        }
+        return image.contains("oracle-free") ? "FREEPDB1" : "XEPDB1";
     }
 
     /**
