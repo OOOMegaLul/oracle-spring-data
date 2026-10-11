@@ -70,7 +70,7 @@ jobs:
           p = 'plsql-spring/target/probe.txt'
           if os.path.exists(p):
               text = open(p, encoding='utf-8').read()
-              chunks = [text[i:i + 30000] for i in range(0, len(text), 30000)][:9]
+              chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)][:10]
               for n, c in enumerate(chunks):
                   esc = c.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
                   print(f'::notice title=Probe {n}::' + esc)
