@@ -38,6 +38,9 @@ import dev.plsql.spring.meta.SignatureSource;
  * @param observations        куда сообщать о каждом вызове и запросе (Micrometer Observation: из
  *                            него Spring Boot Actuator делает метрики и трассировку);
  *                            {@code ObservationRegistry.NOOP} — никуда
+ * @param restrictions        обязательные ограничения строк для {@code @Restricted}, по именам
+ * @param requireRestrictions каждый запрос {@code @SqlQuery}, который возвращает строки, должен быть
+ *                            помечен {@code @Restricted} или {@code @Unrestricted}
  */
 public record PlsqlRuntime(
         DataSource dataSource,
@@ -49,5 +52,7 @@ public record PlsqlRuntime(
         boolean retryDiscardedState,
         int queryTimeout,
         int fetchSize,
-        io.micrometer.observation.ObservationRegistry observations) {
+        io.micrometer.observation.ObservationRegistry observations,
+        java.util.Map<String, dev.plsql.spring.query.QueryRestriction> restrictions,
+        boolean requireRestrictions) {
 }

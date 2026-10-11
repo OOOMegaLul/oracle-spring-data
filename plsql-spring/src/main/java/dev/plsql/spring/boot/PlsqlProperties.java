@@ -45,6 +45,9 @@ public class PlsqlProperties {
     // умолчанию. Что они совпадают, проверяет PlsqlAutoConfigurationTest.
     private int fetchSize = 100;
 
+    /** Каждый запрос @SqlQuery, который возвращает строки, должен быть помечен @Restricted или @Unrestricted. */
+    private boolean requireRestrictions;
+
     /**
      * Возвращает политику для текста, который кодировка базы не может сохранить
      * (свойство {@code plsql.charset-policy}).
@@ -185,6 +188,30 @@ public class PlsqlProperties {
     }
 
     /**
+     * Возвращает, должен ли каждый запрос {@code @SqlQuery}, который возвращает строки, быть
+     * помечен {@code @Restricted} или {@code @Unrestricted} (свойство
+     * {@code plsql.require-restrictions}); по умолчанию нет.
+     *
+     * <p>Включённое свойство не даёт забыть обязательное ограничение строк (например, «только
+     * записи доступных пользователю организаций»): запрос без пометки останавливает старт
+     * приложения, а сознательное исключение видно на ревью.
+     *
+     * @return {@code true}, если пометка обязательна
+     */
+    public boolean isRequireRestrictions() {
+        return requireRestrictions;
+    }
+
+    /**
+     * Задаёт, должен ли каждый запрос быть помечен {@code @Restricted} или {@code @Unrestricted}.
+     *
+     * @param requireRestrictions {@code true} — пометка обязательна
+     */
+    public void setRequireRestrictions(boolean requireRestrictions) {
+        this.requireRestrictions = requireRestrictions;
+    }
+
+    /**
      * Переносит настройки в построитель фабрики. Так настройки попадают и в фабрику
      * автоконфигурации, и в фабрику, которую {@code PlsqlApiFactoryBean} строит сам для
      * {@code dataSourceRef}.
@@ -201,6 +228,7 @@ public class PlsqlProperties {
                 .indexTableMaxLength(indexTableMaxLength)
                 .retryDiscardedState(retryDiscardedState)
                 .queryTimeout(queryTimeout)
-                .fetchSize(fetchSize);
+                .fetchSize(fetchSize)
+                .requireRestrictions(requireRestrictions);
     }
 }

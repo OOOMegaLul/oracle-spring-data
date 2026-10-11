@@ -5,6 +5,8 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
 import javax.sql.DataSource;
@@ -18,6 +20,7 @@ import dev.plsql.spring.call.CallExecutor;
 import dev.plsql.spring.call.CallPlanner;
 import dev.plsql.spring.meta.DictionarySignatureSource;
 import dev.plsql.spring.meta.SignatureSource;
+import dev.plsql.spring.query.QueryRestriction;
 import dev.plsql.spring.session.SessionContextDataSource;
 import dev.plsql.spring.support.CharsetGuard;
 import dev.plsql.spring.support.PlsqlApiInvocationHandler;
@@ -130,6 +133,10 @@ public final class PlsqlApiFactory {
         private int fetchSize = CallExecutor.DEFAULT_FETCH_SIZE;
         /** Куда сообщать о вызовах; по умолчанию никуда. */
         private ObservationRegistry observationRegistry = ObservationRegistry.NOOP;
+        /** Обязательные ограничения строк по именам. */
+        private final Map<String, QueryRestriction> restrictions = new LinkedHashMap<>();
+        /** Должен ли каждый запрос быть помечен {@code @Restricted} или {@code @Unrestricted}. */
+        private boolean requireRestrictions;
         /** Источник соединений для чтения словаря и кодировки или {@code null} — выбрать самому. */
         private DataSource metadataDataSource;
 
@@ -303,6 +310,39 @@ public final class PlsqlApiFactory {
         }
 
         /**
+         * Регистрирует обязательное ограничение строк под именем для {@code @Restricted}: его
+         * условие добавляется к каждому помеченному этим именем запросу {@code @SqlQuery} (см.
+         * {@link QueryRestriction}). Spring Boot регистрирует бины {@code QueryRestriction} сам, по
+         * именам бинов.
+         *
+         * @param name        имя ограничения
+         * @param restriction ограничение
+         * @return этот же построитель
+         */
+        public Builder restriction(String name, QueryRestriction restriction) {
+            if (name == null || name.isBlank()) {
+                throw new IllegalArgumentException("restriction name is empty");
+            }
+            restrictions.put(name, Objects.requireNonNull(restriction, "restriction"));
+            return this;
+        }
+
+        /**
+         * Делает пометку запросов обязательной: каждый запрос {@code @SqlQuery}, который возвращает
+         * строки, должен быть помечен {@code @Restricted} (ограничение есть) или
+         * {@code @Unrestricted} (сознательно без него), иначе создание реализации интерфейса
+         * останавливается с ошибкой. Так ограничение нельзя забыть, а исключение видно на ревью.
+         * По умолчанию выключено.
+         *
+         * @param required {@code true} — требовать пометку
+         * @return этот же построитель
+         */
+        public Builder requireRestrictions(boolean required) {
+            this.requireRestrictions = required;
+            return this;
+        }
+
+        /**
          * Задаёт, куда сообщать о каждом вызове процедуры и запросе {@code @SqlQuery}; по умолчанию
          * никуда.
          *
@@ -383,7 +423,8 @@ public final class PlsqlApiFactory {
                     : CharsetGuard.forDatabase(databaseCharset != null ? databaseCharset : readCharset(meta), charsetPolicy);
             return new PlsqlApiFactory(new PlsqlRuntime(dataSource, signatures, new CallPlanner(argumentDefaults),
                     new CallExecutor(indexTableMaxLength, guard, fetchSize), exceptionTranslator, guard,
-                    retryDiscardedState, queryTimeout, fetchSize, observationRegistry));
+                    retryDiscardedState, queryTimeout, fetchSize, observationRegistry, Map.copyOf(restrictions),
+                    requireRestrictions));
         }
 
         /**

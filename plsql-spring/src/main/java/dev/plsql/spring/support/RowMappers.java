@@ -105,6 +105,17 @@ public final class RowMappers {
     }
 
     /**
+     * Проверяет, собирается ли строка этого типа по именам колонок (record или бин с
+     * конструктором без аргументов), как в {@link #forType}.
+     *
+     * @param type тип одной строки
+     * @return {@code true} для record и бина
+     */
+    static boolean byName(Class<?> type) {
+        return forType(type) instanceof ByName;
+    }
+
+    /**
      * Читает все оставшиеся строки {@link ResultSet} и превращает каждую в объект типа
      * {@code element}.
      *

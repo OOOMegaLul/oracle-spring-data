@@ -737,6 +737,22 @@ public final class Values {
             }
             return null;
         }
+
+        /**
+         * Возвращает имя компонента или свойства, которому достался ключ с этим номером: так
+         * фильтр запроса узнаёт, какое свойство record лежит в какой колонке.
+         *
+         * @param key номер ключа
+         * @return имя компонента или {@code null}, если ключ никому не достался
+         */
+        String nameOf(int key) {
+            for (int i = 0; i < keyIndex.length; i++) {
+                if (keyIndex[i] == key) {
+                    return names[i];
+                }
+            }
+            return null;
+        }
     }
 
     /**

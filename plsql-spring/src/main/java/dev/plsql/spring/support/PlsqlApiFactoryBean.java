@@ -258,6 +258,9 @@ public class PlsqlApiFactoryBean<T> implements FactoryBean<T>, BeanFactoryAware,
         beanFactory.getBeanProvider(ArgumentDefaults.class).ifAvailable(b::argumentDefaults);
         beanFactory.getBeanProvider(SignatureSource.class).ifAvailable(b::signatureSource);
         beanFactory.getBeanProvider(io.micrometer.observation.ObservationRegistry.class).ifUnique(b::observationRegistry);
+        if (beanFactory instanceof org.springframework.beans.factory.ListableBeanFactory lbf) {
+            lbf.getBeansOfType(dev.plsql.spring.query.QueryRestriction.class).forEach(b::restriction);
+        }
         return b.build();
     }
 

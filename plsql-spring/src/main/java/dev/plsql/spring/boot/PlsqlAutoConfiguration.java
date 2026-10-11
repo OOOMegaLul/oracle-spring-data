@@ -80,6 +80,8 @@ public class PlsqlAutoConfiguration {
      * @param signatures необязательный источник сигнатур подпрограмм вместо словаря Oracle
      * @param observations реестр наблюдений Micrometer (его создаёт Spring Boot Actuator); если
      *                   его нет или их несколько без основного, метрики не пишутся
+     * @param beans      контекст: из него берутся все бины {@code QueryRestriction} — обязательные
+     *                   ограничения строк, каждое под именем своего бина
      * @return готовая фабрика
      * @throws IllegalArgumentException если {@code plsql.index-table-max-length} меньше 1
      * @throws org.springframework.beans.factory.NoUniqueBeanDefinitionException если бинов
@@ -91,11 +93,13 @@ public class PlsqlAutoConfiguration {
     PlsqlApiFactory plsqlApiFactory(DataSource dataSource, PlsqlProperties props,
                                     ObjectProvider<ArgumentDefaults> defaults,
                                     ObjectProvider<SignatureSource> signatures,
-                                    ObjectProvider<ObservationRegistry> observations) {
+                                    ObjectProvider<ObservationRegistry> observations,
+                                    org.springframework.beans.factory.ListableBeanFactory beans) {
         PlsqlApiFactory.Builder b = props.applyTo(PlsqlApiFactory.builder(dataSource));
         defaults.ifAvailable(b::argumentDefaults);
         signatures.ifAvailable(b::signatureSource);
         observations.ifUnique(b::observationRegistry); // метрики необязательны: два реестра — не причина падать
+        beans.getBeansOfType(dev.plsql.spring.query.QueryRestriction.class).forEach(b::restriction);
         return b.build();
     }
 

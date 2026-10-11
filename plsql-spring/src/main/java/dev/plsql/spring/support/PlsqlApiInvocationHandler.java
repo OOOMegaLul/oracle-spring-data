@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,10 +44,14 @@ import org.springframework.util.ObjectUtils;
 import dev.plsql.spring.annotation.Arg;
 import dev.plsql.spring.annotation.PlsqlApi;
 import dev.plsql.spring.annotation.Procedure;
+import dev.plsql.spring.annotation.Restricted;
 import dev.plsql.spring.annotation.SqlQuery;
+import dev.plsql.spring.annotation.Unrestricted;
 import dev.plsql.spring.call.CallPlan;
 import dev.plsql.spring.call.CallPlanner;
 import dev.plsql.spring.meta.SubprogramInfo;
+import dev.plsql.spring.query.Filter;
+import dev.plsql.spring.query.QueryRestriction;
 
 /**
  * Реализация интерфейса с аннотацией {@link PlsqlApi}: обработчик вызовов, который стоит за
@@ -197,7 +203,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
                     continue;
                 }
                 try {
-                    queries.put(m, QueryPlan.of(m, q.value()));
+                    queries.put(m, QueryPlan.of(m, q.value(), q.filterable(), restrictions(api, m, q.value(), rt)));
                 } catch (RuntimeException e) {
                     problems.add(describe(m) + ": " + message(e));
                 }
@@ -692,10 +698,15 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * @param paging     параметры {@code Pageable}/{@code Sort} и вид результата {@code Page}/{@code Slice}
      *                   или {@code null}, если метод не постраничный
      * @param stream     метод возвращает {@code Stream}: строки читаются по одной, пока их берут
+     * @param filter     номер параметра {@link Filter} или {@code -1}
+     * @param filterable поля, по которым фильтр может отбирать строки ({@code @SqlQuery(filterable)})
+     * @param restrictions обязательные ограничения запроса
+     * @param columns    колонки запроса, когда их уже описала база (для фильтра и ограничений)
      */
     private record QueryPlan(String sql, ParsedSql parsed, String[] names, ResolvableType returnType,
                              boolean many, boolean optional, ResolvableType element, boolean noResult,
-                             QueryPaging.Spec paging, boolean stream) {
+                             QueryPaging.Spec paging, boolean stream, int filter, String[] filterable,
+                             List<AppliedRestriction> restrictions, AtomicReference<QueryFilters.Columns> columns) {
 
         /**
          * Разбирает SQL метода и определяет, как отдавать результат.
@@ -712,23 +723,39 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
          * {@code Sort} (Spring Data) в SQL не подставляются: по ним запрос оборачивается
          * постранично ({@link QueryPaging}), а результат может быть {@code Page} или {@code Slice}.
          *
-         * @param m   метод интерфейса с {@code @SqlQuery}
-         * @param sql текст из аннотации
+         * <p>Параметр {@link Filter} тоже не подставляется: по нему, как и по обязательным
+         * ограничениям, запрос оборачивается условиями ({@link QueryFilters}). Это возможно только
+         * у запроса, который возвращает строки.
+         *
+         * @param m            метод интерфейса с {@code @SqlQuery}
+         * @param sql          текст из аннотации
+         * @param filterable   поля для фильтра из аннотации
+         * @param restrictions обязательные ограничения запроса
          * @return готовый план запроса
          * @throws org.springframework.dao.InvalidDataAccessApiUsageException если в SQL есть
          *         параметр, которого нет у метода
          * @throws IllegalStateException если {@code Pageable}, {@code Sort}, {@code Page} или
-         *         {@code Slice} использованы неправильно (см. {@link QueryPaging#of})
+         *         {@code Slice} использованы неправильно (см. {@link QueryPaging#of}), параметров
+         *         {@link Filter} больше одного или фильтр и ограничения стоят на запросе, который не
+         *         возвращает строк
          */
-        static QueryPlan of(Method m, String sql) {
+        static QueryPlan of(Method m, String sql, String[] filterable, List<AppliedRestriction> restrictions) {
             ParsedSql parsed = NamedParameterUtils.parseSqlStatement(sql);
             QueryPaging.Spec paging = SPRING_DATA ? QueryPaging.of(m) : null;
             Parameter[] ps = m.getParameters();
             String[] names = new String[ps.length];
             MapSqlParameterSource probe = new MapSqlParameterSource();
+            int filter = -1;
             for (int i = 0; i < ps.length; i++) {
                 if (SPRING_DATA && QueryPaging.isPagingParameter(ps[i].getType())) {
                     continue; // Pageable и Sort меняют текст запроса, а не подставляются в него
+                }
+                if (Filter.class.isAssignableFrom(ps[i].getType())) {
+                    if (filter >= 0) {
+                        throw new IllegalStateException("more than one Filter parameter");
+                    }
+                    filter = i;
+                    continue; // фильтр тоже меняет текст запроса
                 }
                 Arg a = ps[i].getAnnotation(Arg.class);
                 names[i] = a != null ? a.value() : ps[i].getName();
@@ -745,9 +772,85 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             ResolvableType element = pageOrSlice || stream ? rt.getGeneric(0)
                     : many ? rt.asCollection().getGeneric(0) : optional ? rt.getGeneric(0) : rt;
             boolean noResult = raw == void.class || raw == Void.class;
-            return new QueryPlan(sql, parsed, names, rt, many, optional, element, noResult, paging, stream);
+            if ((filter >= 0 || !restrictions.isEmpty()) && (noResult || !returnsRows(sql))) {
+                throw new IllegalStateException((filter >= 0 ? "a Filter parameter" : "@Restricted")
+                        + " needs a query that returns rows (SELECT or WITH)");
+            }
+            return new QueryPlan(sql, parsed, names, rt, many, optional, element, noResult, paging, stream, filter,
+                    filterable, restrictions, new AtomicReference<>());
         }
     }
+
+    /** Начало запроса, который возвращает строки: {@code SELECT} или {@code WITH} после комментариев и скобок. */
+    private static final Pattern ROWS = Pattern.compile("^(?:\\s|\\(|--[^\\n]*(?:\\n|$)|/\\*.*?\\*/)*(?:SELECT|WITH)\\b",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
+    /**
+     * Проверяет по первому слову, возвращает ли запрос строки.
+     *
+     * @param sql текст запроса
+     * @return {@code true} для {@code SELECT} и {@code WITH}
+     */
+    static boolean returnsRows(String sql) {
+        return ROWS.matcher(sql).find();
+    }
+
+    /**
+     * Обязательное ограничение, найденное для запроса: имя, само ограничение и поле запроса.
+     *
+     * @param name        имя ограничения
+     * @param restriction ограничение
+     * @param field       поле запроса, по которому ограничиваются строки
+     */
+    private record AppliedRestriction(String name, QueryRestriction restriction, String field) {
+    }
+
+    /**
+     * Находит обязательные ограничения запроса: {@link Restricted} метода, а если их нет — интерфейса;
+     * {@link Unrestricted} метода отменяет ограничения интерфейса.
+     *
+     * <p>Если ограничения обязательны ({@code requireRestrictions}), запрос, который возвращает
+     * строки, должен быть помечен {@code @Restricted} или {@code @Unrestricted} (на методе или
+     * интерфейсе).
+     *
+     * @param api интерфейс
+     * @param m   метод с {@code @SqlQuery}
+     * @param sql текст запроса
+     * @param rt  окружение со списком ограничений
+     * @return ограничения запроса, может быть пустым
+     * @throws IllegalStateException если ограничения с таким именем нет, у него нет поля или
+     *                               обязательное ограничение не указано
+     */
+    private static List<AppliedRestriction> restrictions(Class<?> api, Method m, String sql, PlsqlRuntime rt) {
+        Restricted[] onMethod = m.getAnnotationsByType(Restricted.class);
+        boolean unrestricted = m.isAnnotationPresent(Unrestricted.class);
+        Restricted[] effective = onMethod.length > 0 ? onMethod
+                : unrestricted ? new Restricted[0] : api.getAnnotationsByType(Restricted.class);
+        if (effective.length == 0 && onMethod.length == 0 && !unrestricted && api != m.getDeclaringClass()) {
+            effective = m.getDeclaringClass().getAnnotationsByType(Restricted.class);
+        }
+        if (rt.requireRestrictions() && effective.length == 0 && returnsRows(sql) && !unrestricted
+                && !api.isAnnotationPresent(Unrestricted.class) && !m.getDeclaringClass().isAnnotationPresent(Unrestricted.class)) {
+            throw new IllegalStateException("restrictions are required: mark the query @Restricted(...) or, if every row"
+                    + " may be read, @Unrestricted(\"why\")");
+        }
+        List<AppliedRestriction> out = new ArrayList<>();
+        for (Restricted r : effective) {
+            QueryRestriction qr = rt.restrictions().get(r.value());
+            if (qr == null) {
+                throw new IllegalStateException("@Restricted(\"" + r.value() + "\"): no such restriction; known are "
+                        + rt.restrictions().keySet());
+            }
+            String field = !r.field().isEmpty() ? r.field() : qr.defaultField();
+            if (field == null || field.isBlank()) {
+                throw new IllegalStateException("@Restricted(\"" + r.value() + "\"): the restriction has no default"
+                        + " field; name it with @Restricted(value = \"" + r.value() + "\", field = \"...\")");
+            }
+            out.add(new AppliedRestriction(r.value(), qr, field));
+        }
+        return out;
+    }
+
 
     /**
      * Выполняет SQL метода с {@code @SqlQuery} на переданном соединении и приводит результат к
@@ -787,9 +890,10 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      *         строке {@code NULL}
      * @throws CharsetGuard.UnrepresentableCharacterException если строковый аргумент нельзя сохранить
      *         в кодировке базы
+     * @throws SQLException если база не смогла описать колонки запроса для фильтра или ограничения
      */
-    private Object query(Connection con, QueryPlan q, Object[] args, String task, int timeout) {
-        Bound bound = bind(q, args);
+    private Object query(Connection con, QueryPlan q, Object[] args, String task, int timeout) throws SQLException {
+        Bound bound = conditioned(con, q, args, bind(q, args));
         String sql = bound.sql();
         Object[] values = bound.values();
         JdbcTemplate jdbc = new JdbcTemplate(new SingleConnectionDataSource(con, true));
@@ -980,6 +1084,56 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
     }
 
     /**
+     * Добавляет к запросу обязательные ограничения и фильтр из параметра ({@link QueryFilters}).
+     *
+     * <p>Колонки запроса база описывает один раз, при первом таком вызове, без выполнения запроса
+     * ({@code PreparedStatement.getMetaData}); дальше описание берётся из плана. Условие ограничения
+     * строится заново при каждом вызове: оно может зависеть от текущего пользователя.
+     *
+     * @param con   соединение единицы работы
+     * @param q     разобранный запрос
+     * @param args  аргументы вызова
+     * @param bound запрос с подставленными параметрами
+     * @return запрос с условиями или {@code bound}, если условий нет
+     * @throws SQLException если база не смогла описать колонки запроса
+     * @throws IllegalStateException если ограничение вернуло {@code null}
+     * @throws InvalidDataAccessApiUsageException если поле или значение фильтра не подходят
+     */
+    private Bound conditioned(Connection con, QueryPlan q, Object[] args, Bound bound) throws SQLException {
+        Filter user = q.filter() >= 0 ? (Filter) args[q.filter()] : null;
+        if (q.restrictions().isEmpty() && user == null) {
+            return bound;
+        }
+        QueryFilters.Columns columns = q.columns().get();
+        if (columns == null) {
+            try (PreparedStatement ps = con.prepareStatement(bound.sql())) {
+                java.sql.ResultSetMetaData md = ps.getMetaData();
+                if (md == null) {
+                    throw new IllegalStateException("the driver did not describe the columns of the query");
+                }
+                columns = QueryFilters.Columns.of(md, q.element(), q.filterable());
+            }
+            q.columns().compareAndSet(null, columns);
+        }
+        List<Filter> conditions = new ArrayList<>();
+        for (AppliedRestriction r : q.restrictions()) {
+            Filter f = r.restriction().apply(r.field());
+            if (f == null) {
+                throw new IllegalStateException("restriction '" + r.name() + "' returned null; return Filter.none()"
+                        + " to let every row through");
+            }
+            conditions.add(f);
+        }
+        QueryFilters.Rendered r = QueryFilters.apply(bound.sql(), bound.values(), columns, user, conditions,
+                rt.charsetGuard());
+        if (log.isDebugEnabled() && !r.sql().equals(bound.sql())) {
+            // Видно, что именно дописали ограничения и фильтр; значения — только числом, не текстом.
+            log.debug("query with conditions ({} values):\n{}", r.values().length, r.sql());
+        }
+        return new Bound(r.sql(), r.values());
+    }
+
+    /**
      * Выполняет запрос метода, который возвращает {@code Stream}, и отдаёт результат открытым.
      *
      * @param con     соединение единицы работы
@@ -991,7 +1145,7 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      */
     private dev.plsql.spring.call.CallExecutor.OpenCursor openQuery(Connection con, QueryPlan q, Object[] args, int timeout)
             throws SQLException {
-        Bound bound = bind(q, args);
+        Bound bound = conditioned(con, q, args, bind(q, args));
         PreparedStatement ps = creator(bound.sql(), bound.values(), timeout).createPreparedStatement(con);
         try {
             return new dev.plsql.spring.call.CallExecutor.OpenCursor(ps.executeQuery(), ps, q.element());

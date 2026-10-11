@@ -215,6 +215,12 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
   3,8 с по одному); вне транзакции весь пакет — одна единица работы.
 - **`IN (:ids)`.** Параметр-коллекция или массив в `@SqlQuery` раскладывается на отдельные значения;
   пустой список и больше 1000 значений (ORA-01795) — понятная ошибка до обращения к базе.
+- **Фильтры и обязательное ограничение.** Параметр `Filter` — условия, которые выбирает
+  пользователь (равно, диапазон, содержит, начинается с, список, пусто; И/ИЛИ/НЕ): имена полей
+  сверяются с колонками запроса, значения идут только параметрами и приводятся к типу колонки.
+  `@Restricted("orgs")` и бин `QueryRestriction` добавляют обязательное условие («только
+  записи доступных организаций») ко всем запросам интерфейса; с
+  `plsql.require-restrictions=true` запрос без `@Restricted`/`@Unrestricted` не даёт стартовать.
 - **Страницы.** `@SqlQuery` с параметром `Pageable` или `Sort` возвращает `Page`, `Slice` или
   `List`; страница вырезается через `ROWNUM`, потому что 11g не знает `OFFSET ... FETCH`.
   Имена в `Sort` проверяются, `?sort=` не подставит в SQL ничего, кроме имени колонки.
@@ -229,7 +235,8 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
   тегами `plsql.target`, `plsql.kind`, `error` (через Micrometer Observation, который приходит
   вместе со Spring; с трассировкой — ещё и отрезки трассы).
 - **Настройки Boot** (`plsql.*`): `charset-policy` (`FAIL`/`IGNORE`), `database-charset`,
-  `index-table-max-length`, `retry-discarded-state`, `query-timeout`, `fetch-size`. IDE подсказывает их в
+  `index-table-max-length`, `retry-discarded-state`, `query-timeout`, `fetch-size`,
+  `require-restrictions`. IDE подсказывает их в
   `application.properties` сама.
 - **Лог.** `dev.plsql.spring=DEBUG` показывает сгенерированные блоки и время вызовов и
   запросов `@SqlQuery`. `PlsqlApiInvocationHandler.sqlOf(api, "method", типы...)` отдаёт блок
@@ -247,7 +254,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (181, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (193, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования. CI гоняет их
 ещё и на Spring Boot 3.5 (Spring 6.2): `./mvnw test -Dspring-boot.version=3.5.6`.
 
@@ -255,7 +262,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 ./mvnw verify -Pit
 ```
 
-Интеграционные тесты (67) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
+Интеграционные тесты (71) на настоящем Oracle. Схему `PLSQL_IT` тесты создают сами и
 пересоздают при каждом запуске. Где взять базу:
 
 - по умолчанию одноразовый контейнер `gvenzl/oracle-xe:11-slim` (Testcontainers, нужен Docker);

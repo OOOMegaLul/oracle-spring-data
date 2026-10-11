@@ -103,6 +103,24 @@ class PlsqlAutoConfigurationTest {
     }
 
     /**
+     * Проверяет, что бины {@code QueryRestriction} попадают в фабрику под именами бинов, а
+     * {@code plsql.require-restrictions} включает обязательную пометку запросов.
+     */
+    @Test
+    void restrictionBeansAndRequireRestrictions() {
+        runner.withPropertyValues("plsql.charset-policy=IGNORE", "plsql.require-restrictions=true")
+                .withBean("visible", dev.plsql.spring.query.QueryRestriction.class,
+                        () -> dev.plsql.spring.query.QueryRestriction.on("ID", f -> dev.plsql.spring.query.Filter.none()))
+                .run(ctx -> {
+                    PlsqlApiFactory f = ctx.getBean(PlsqlApiFactory.class);
+                    assertThat(f.runtime().restrictions()).containsOnlyKeys("visible");
+                    assertThat(f.runtime().requireRestrictions()).isTrue();
+                });
+        runner.withPropertyValues("plsql.charset-policy=IGNORE").run(ctx ->
+                assertThat(ctx.getBean(PlsqlApiFactory.class).runtime().requireRestrictions()).isFalse());
+    }
+
+    /**
      * Проверяет, что собственный бин {@link PlsqlApiFactory} приложения отменяет фабрику
      * автоконфигурации: в контексте ровно одна фабрика, и это {@code myFactory}. Собственная
      * фабрика собрана с политикой {@code IGNORE}, поэтому не запрашивает кодировку у мока.

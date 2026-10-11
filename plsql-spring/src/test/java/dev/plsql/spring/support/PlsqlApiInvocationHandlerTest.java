@@ -278,6 +278,72 @@ class PlsqlApiInvocationHandlerTest {
         List<String> byPairs(List<Object[]> pairs);
     }
 
+    /** Реестр с обязательным ограничением {@code visible} на весь интерфейс. */
+    @dev.plsql.spring.annotation.Restricted("visible")
+    @PlsqlApi(packageName = "PKG")
+    interface Registry {
+        /**
+         * Строки реестра с фильтром.
+         *
+         * @param filter фильтр пользователя
+         * @return строки
+         */
+        @SqlQuery("select id, name from t")
+        List<java.util.Map<String, Object>> rows(dev.plsql.spring.query.Filter filter);
+
+        /**
+         * Запрос, которому ограничение не нужно.
+         *
+         * @return число
+         */
+        @dev.plsql.spring.annotation.Unrestricted("для теста")
+        @SqlQuery("select 1 from dual")
+        int one();
+    }
+
+    /** Фильтр там, где он невозможен. */
+    @PlsqlApi(packageName = "PKG")
+    interface BadFilters {
+        /**
+         * Фильтр у {@code update}.
+         *
+         * @param f фильтр
+         * @return число изменённых строк
+         */
+        @SqlQuery("update t set a = 1")
+        int touch(dev.plsql.spring.query.Filter f);
+
+        /**
+         * Два фильтра.
+         *
+         * @param a первый
+         * @param b второй
+         * @return строки
+         */
+        @SqlQuery("select 1 from dual")
+        List<Object> two(dev.plsql.spring.query.Filter a, dev.plsql.spring.query.Filter b);
+    }
+
+    /** Запросы без пометки ограничения. */
+    @PlsqlApi(packageName = "PKG")
+    interface Unmarked {
+        /**
+         * Строки без пометки.
+         *
+         * @return строки
+         */
+        @SqlQuery("-- reading\n  (select 1 from dual)")
+        List<Object> rows();
+
+        /**
+         * {@code update} без пометки: ему ограничение не нужно.
+         *
+         * @return число изменённых строк
+         */
+        @SqlQuery("update t set a = 1")
+        int touch();
+    }
+
     /** Срок меньше {@code -1} — ошибка в аннотации. */
     @PlsqlApi(packageName = "PKG")
     interface BadTimeout {
@@ -997,5 +1063,73 @@ class PlsqlApiInvocationHandlerTest {
         verify(con).prepareStatement("select name from t where (id, state) in ((?, ?))");
         verify(ps).setObject(1, 7L);
         verify(ps).setString(2, "ACTIVE");
+    }
+
+    /**
+     * Проверяет ограничения и фильтры при старте: неизвестное ограничение, ограничение без поля,
+     * фильтр у запроса без строк и два фильтра — ошибки; с обязательными ограничениями запрос без
+     * пометки останавливает старт, а {@code update} и {@code @Unrestricted} — нет.
+     */
+    @Test
+    void restrictionsAndFiltersAreCheckedAtStartup() {
+        dev.plsql.spring.query.QueryRestriction visible = dev.plsql.spring.query.QueryRestriction.on("ID",
+                f -> dev.plsql.spring.query.Filter.eq(f, 1));
+        assertThatThrownBy(() -> factory().create(Registry.class))
+                .hasMessageContaining("@Restricted(\"visible\"): no such restriction");
+        assertThatThrownBy(() -> builder().restriction("visible", f -> dev.plsql.spring.query.Filter.none()).build()
+                .create(Registry.class)).hasMessageContaining("has no default field");
+        assertThat(builder().restriction("visible", visible).build().create(Registry.class)).isNotNull();
+
+        assertThatThrownBy(() -> factory().create(BadFilters.class))
+                .hasMessageContaining("touch: a Filter parameter needs a query that returns rows")
+                .hasMessageContaining("two: more than one Filter parameter");
+
+        assertThat(factory().create(Unmarked.class)).isNotNull();
+        assertThatThrownBy(() -> builder().requireRestrictions(true).build().create(Unmarked.class))
+                .hasMessageContaining("rows: restrictions are required")
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain("touch"));
+        assertThat(builder().requireRestrictions(true).restriction("visible", visible).build()
+                .create(Registry.class)).isNotNull();
+    }
+
+    /**
+     * Проверяет вызов с ограничением и фильтром: колонки запроса описываются без выполнения, запрос
+     * оборачивается условиями, значения ограничения и фильтра идут параметрами после значений
+     * запроса; ограничение, вернувшее {@code null}, — ошибка, а не «без ограничения».
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void restrictionAndFilterWrapTheQuery() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        java.sql.ResultSet rs = mock(java.sql.ResultSet.class);
+        java.sql.ResultSetMetaData md = mock(java.sql.ResultSetMetaData.class);
+        when(md.getColumnCount()).thenReturn(2);
+        when(md.getColumnLabel(1)).thenReturn("ID");
+        when(md.getColumnLabel(2)).thenReturn("NAME");
+        when(md.getColumnType(1)).thenReturn(java.sql.Types.NUMERIC);
+        when(md.getColumnType(2)).thenReturn(java.sql.Types.VARCHAR);
+        when(md.getColumnTypeName(1)).thenReturn("NUMBER");
+        when(md.getColumnTypeName(2)).thenReturn("VARCHAR2");
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.getMetaData()).thenReturn(md);
+        when(ps.execute()).thenReturn(true);
+        when(ps.getResultSet()).thenReturn(rs);
+        when(rs.getMetaData()).thenReturn(md);
+        Registry r = builder().restriction("visible", dev.plsql.spring.query.QueryRestriction.on("ID",
+                f -> dev.plsql.spring.query.Filter.eq(f, 1))).build().create(Registry.class);
+
+        r.rows(dev.plsql.spring.query.Filter.eq("name", "x"));
+        r.rows(null);
+
+        verify(con).prepareStatement("SELECT * FROM (select id, name from t\n) q_ WHERE q_.\"ID\" = ? AND q_.\"NAME\" = ?");
+        verify(con).prepareStatement("SELECT * FROM (select id, name from t\n) q_ WHERE q_.\"ID\" = ?");
+        verify(ps, times(1)).getMetaData(); // описание колонок одно на запрос
+        verify(ps, times(2)).setObject(1, 1);
+        verify(ps).setString(2, "x");
+
+        Registry broken = builder().restriction("visible", dev.plsql.spring.query.QueryRestriction.on("ID", f -> null))
+                .build().create(Registry.class);
+        assertThatThrownBy(() -> broken.rows(null)).hasMessageContaining("restriction 'visible' returned null");
     }
 }
