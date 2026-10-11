@@ -36,7 +36,9 @@ jobs:
           python3 - <<'EOF'
           import re
           lines = open('build.log', encoding='utf-8', errors='replace').read().splitlines()
-          key = re.compile(r'\[ERROR\]|Tests run:.*(Failures|Errors): [1-9]|Caused by|Exception|expected|but was|ORA-\d')
+          # "  - Api.method -> PKG.PROC: reason" are the lines of a "does not match the database" error.
+          key = re.compile(r'\[ERROR\]|Tests run:.*(Failures|Errors): [1-9]|Caused by|Exception|expected|but was|ORA-\d'
+                           r'|^\s+- \S+ -> ')
           picked = [l for l in lines if key.search(l)][:80] or lines[-80:]
           text = '\n'.join(picked)[:60000]
           esc = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
