@@ -1201,4 +1201,15 @@ class CallPlannerTest {
         assertThatThrownBy(() -> PLANNER.plan(m("shortBag"), proc("PKG", "BAG").add(bagArg("NUMBER")).build()))
                 .hasMessageContaining("has no property for [ONE.ID] of P_B");
     }
+
+    /**
+     * Проверяет, что index-by таблица {@code NVARCHAR2} не считается таблицей, которую драйвер
+     * передаёт сам: на XE любая её привязка даёт PLS-00382, и вызов падал бы каждый раз.
+     */
+    @Test
+    void nationalIndexTablesAreNotBoundDirectly() {
+        SubprogramInfo sp = proc("PKG", "P").add(indexTable("P_NAMES", "IN", "NVARCHAR2")).build();
+        assertThat(CallPlanner.supportIssues(sp)).singleElement().asString().contains("P_NAMES")
+                .contains("NVARCHAR2");
+    }
 }

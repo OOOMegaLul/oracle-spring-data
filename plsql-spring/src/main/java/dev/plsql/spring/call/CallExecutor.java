@@ -5,6 +5,7 @@ import java.sql.Array;
 import java.sql.Blob;
 import java.sql.CallableStatement;
 import java.sql.Clob;
+import java.sql.NClob;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -514,12 +515,19 @@ public class CallExecutor {
                 }
             }
             case STRING -> {
+                // Национальная строка — через setNString: setString отправил бы текст в кодировке
+                // базы, и символы вне неё пропали бы ещё до вызова.
+                boolean national = isNational(b.arg());
                 if (v == null) {
-                    cs.setNull(idx, Types.VARCHAR);
+                    cs.setNull(idx, national ? Types.NVARCHAR : Types.VARCHAR);
                 } else {
                     String s = Values.toText(v);
                     guard(b.arg(), s);
-                    cs.setString(idx, s);
+                    if (national) {
+                        cs.setNString(idx, s);
+                    } else {
+                        cs.setString(idx, s);
+                    }
                 }
             }
             case DATE, TIMESTAMP -> {
@@ -530,15 +538,21 @@ public class CallExecutor {
                 }
             }
             case CLOB -> {
+                // NCLOB — во временном NCLOB: временный CLOB хранит текст в кодировке базы.
+                boolean national = isNational(b.arg());
                 if (v == null) {
-                    cs.setNull(idx, Types.CLOB);
+                    cs.setNull(idx, national ? Types.NCLOB : Types.CLOB);
                 } else {
                     String s = Values.toText(v);
                     guard(b.arg(), s);
-                    Clob c = oc.createClob();
+                    Clob c = national ? oc.createNClob() : oc.createClob();
                     temporaries.add(c);
                     c.setString(1, s);
-                    cs.setClob(idx, c);
+                    if (national) {
+                        cs.setNClob(idx, (NClob) c);
+                    } else {
+                        cs.setClob(idx, c);
+                    }
                 }
             }
             case BLOB -> {
@@ -587,8 +601,9 @@ public class CallExecutor {
      * Проверяет, что текст можно сохранить в кодировке базы, если аргумент её использует.
      *
      * <p>Типы, чьё имя начинается с {@code N} ({@code NVARCHAR2}, {@code NCHAR},
-     * {@code NCLOB}), хранятся в национальном наборе символов базы, а не в основном, поэтому
-     * для них проверка пропускается. В сообщении об ошибке указывается имя аргумента, а для
+     * {@code NCLOB}), хранятся в национальном наборе символов базы, а не в основном, и
+     * привязываются так, что текст идёт в национальной кодировке ({@code setNString},
+     * временный {@code NCLOB}), поэтому для них проверка пропускается. В сообщении об ошибке указывается имя аргумента, а для
      * безымянного значения — слово {@code value}.
      *
      * @param arg описание аргумента (или поля, атрибута), куда пойдёт текст
@@ -599,6 +614,38 @@ public class CallExecutor {
         if (!isNational(arg)) {
             charsetGuard.check(arg.name() == null ? "value" : arg.name(), s);
         }
+    }
+
+    /**
+     * Проверяет, добивает ли Oracle значение этого выхода пробелами до размера привязки: так
+     * бывает у {@code OUT}-аргумента {@code CHAR} и {@code NCHAR}. У параметра {@code CHAR} без
+     * длины размер берётся из фактического параметра, то есть из привязки, и {@code 'ab'} приходит
+     * строкой из 32 767 символов (проверено на XE). У поля записи {@code CHAR(n)} и результата
+     * функции длина своя, их это не касается.
+     *
+     * @param arg описание аргумента
+     * @return {@code true} для аргумента верхнего уровня типа {@code CHAR} или {@code NCHAR}
+     */
+    private static boolean padded(ArgumentInfo arg) {
+        return arg.name() != null && arg.dataLevel() == 0
+                && ("CHAR".equals(arg.dataType()) || "NCHAR".equals(arg.dataType()));
+    }
+
+    /**
+     * Отрезает хвостовые пробелы, которыми Oracle добил значение {@code CHAR}.
+     *
+     * @param s строка или {@code null}
+     * @return строка без пробелов в конце; {@code null} остаётся {@code null}
+     */
+    private static String withoutPadding(String s) {
+        if (s == null) {
+            return null;
+        }
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == ' ') {
+            end--;
+        }
+        return s.substring(0, end);
     }
 
     /**
@@ -885,10 +932,12 @@ public class CallExecutor {
      * <ul>
      *   <li>{@code NUMBER} и {@code BOOLEAN} — {@code NUMERIC} ({@code BOOLEAN} блок отдаёт
      *       числом 1 или 0);</li>
-     *   <li>{@code STRING} — {@code VARCHAR}; {@code DATE} и {@code TIMESTAMP} —
+     *   <li>{@code STRING} — {@code VARCHAR} ({@code NVARCHAR2}, {@code NCHAR} — {@code NVARCHAR},
+     *       чтобы текст шёл в национальной кодировке); {@code DATE} и {@code TIMESTAMP} —
      *       {@code TIMESTAMP}; {@code RAW} — {@code VARBINARY};</li>
-     *   <li>{@code CLOB} и {@code XMLTYPE} — {@code CLOB} ({@code XMLTYPE} блок отдаёт
-     *       текстом через {@code getClobVal()}); {@code BLOB} — {@code BLOB};</li>
+     *   <li>{@code CLOB} и {@code XMLTYPE} — {@code CLOB} ({@code NCLOB} — {@code NCLOB};
+     *       {@code XMLTYPE} блок отдаёт текстом через {@code getClobVal()}); {@code BLOB} —
+     *       {@code BLOB};</li>
      *   <li>{@code REF_CURSOR} — {@code OracleTypes.CURSOR}, код типа ojdbc для курсора;</li>
      *   <li>{@code SQL_COLLECTION} и {@code OBJECT} — {@code ARRAY} и {@code STRUCT} с полным
      *       именем типа SQL;</li>
@@ -906,9 +955,10 @@ public class CallExecutor {
     private void registerOut(CallableStatement cs, int idx, CallPlan.Bind b) throws SQLException {
         switch (b.kind()) {
             case NUMBER, BOOLEAN -> cs.registerOutParameter(idx, Types.NUMERIC);
-            case STRING -> cs.registerOutParameter(idx, Types.VARCHAR);
+            case STRING -> cs.registerOutParameter(idx, isNational(b.arg()) ? Types.NVARCHAR : Types.VARCHAR);
             case DATE, TIMESTAMP -> cs.registerOutParameter(idx, Types.TIMESTAMP);
-            case CLOB, XMLTYPE -> cs.registerOutParameter(idx, Types.CLOB);
+            case CLOB -> cs.registerOutParameter(idx, isNational(b.arg()) ? Types.NCLOB : Types.CLOB);
+            case XMLTYPE -> cs.registerOutParameter(idx, Types.CLOB);
             case BLOB -> cs.registerOutParameter(idx, Types.BLOB);
             case RAW -> cs.registerOutParameter(idx, Types.VARBINARY);
             case REF_CURSOR -> cs.registerOutParameter(idx, OracleTypes.CURSOR);
@@ -931,7 +981,8 @@ public class CallExecutor {
      * <ul>
      *   <li>{@code NUMBER} — {@link BigDecimal}; {@code BOOLEAN} — {@link Boolean}
      *       (не ноль — {@code true});</li>
-     *   <li>{@code STRING} — строка; {@code DATE} и {@code TIMESTAMP} —
+     *   <li>{@code STRING} — строка (у {@code OUT}-аргумента {@code CHAR} и {@code NCHAR} — без
+     *       пробелов, которыми Oracle добил её до размера привязки); {@code DATE} и {@code TIMESTAMP} —
      *       {@link java.sql.Timestamp}; {@code RAW} — массив байтов;</li>
      *   <li>{@code CLOB} и {@code XMLTYPE} — строка; LOB читается целиком и сразу
      *       освобождается;</li>
@@ -957,7 +1008,7 @@ public class CallExecutor {
                 BigDecimal n = cs.getBigDecimal(idx);
                 yield n == null ? null : n.intValue() != 0;
             }
-            case STRING -> cs.getString(idx);
+            case STRING -> padded(b.arg()) ? withoutPadding(cs.getString(idx)) : cs.getString(idx);
             case DATE, TIMESTAMP -> cs.getTimestamp(idx);
             case CLOB, XMLTYPE -> {
                 Clob c = cs.getClob(idx);
