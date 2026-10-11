@@ -45,12 +45,12 @@ public interface Hr {
 <dependency>
   <groupId>com.github.OOOMegaLul.oracle-spring-data</groupId>
   <artifactId>plsql-spring</artifactId>
-  <version>v0.5.0</version>
+  <version>v0.6.0</version>
 </dependency>
 ```
 
 Gradle: `maven { url 'https://jitpack.io' }` и
-`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.5.0'`.
+`implementation 'com.github.OOOMegaLul.oracle-spring-data:plsql-spring:v0.6.0'`.
 
 **Готовые файлы.** На странице [Releases](https://github.com/OOOMegaLul/oracle-spring-data/releases)
 у каждой версии лежат `plsql-spring-<версия>.jar`, исходники (`-sources.jar`) и
