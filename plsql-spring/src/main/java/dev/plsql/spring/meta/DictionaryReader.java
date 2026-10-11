@@ -491,8 +491,17 @@ public class DictionaryReader {
         List<ArgumentInfo> children = a.children();
         String typeOwner = a.typeOwner();
         String typeName = a.typeName();
+        String typeSubname = a.typeSubname();
         if (lacksStructure(a)) {
-            if (a.kind() == ArgKind.RECORD && a.typeSubname() != null) {
+            if (a.kind() == ArgKind.RECORD && "ROWTYPE".equals(a.plsType()) && a.typeSubname() != null) {
+                // %ROWTYPE курсора пакета: TYPE_NAME — пакет, TYPE_SUBNAME — курсор, а поля описаны под
+                // именем C_EMP%ROWTYPE. Переменная блока объявляется, как на 11.2, по OWNER.PKG.CURSOR.
+                children = plsqlAttributes(con, a.typeOwner(), a.typeName(), a.typeSubname() + "%ROWTYPE", a.inOut(),
+                        a.dataLevel() + 1);
+                typeOwner = null;
+                typeName = sqlName(a.typeOwner(), a.typeName(), a.typeSubname());
+                typeSubname = null;
+            } else if (a.kind() == ArgKind.RECORD && a.typeSubname() != null) {
                 children = plsqlAttributes(con, a.typeOwner(), a.typeName(), a.typeSubname(), a.inOut(), a.dataLevel() + 1);
             } else if (a.kind() == ArgKind.RECORD) {
                 // %ROWTYPE: на 18c+ TYPE_NAME — таблица, синоним или курсор пакета; после
@@ -526,7 +535,7 @@ public class DictionaryReader {
             completed.add(completePlsqlType(con, sp, c, depth + 1));
         }
         return new ArgumentInfo(a.name(), a.position(), a.dataLevel(), a.dataType(), a.plsType(), a.inOut(),
-                a.defaulted(), typeOwner, typeName, a.typeSubname(), completed, a.charLength());
+                a.defaulted(), typeOwner, typeName, typeSubname, completed, a.charLength());
     }
 
     /** Уже прочитанные поля типов PL/SQL пакетов: {@code ВЛАДЕЛЕЦ.ПАКЕТ.ТИП} → строки описаний. */
