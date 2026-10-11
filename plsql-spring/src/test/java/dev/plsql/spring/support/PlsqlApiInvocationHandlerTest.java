@@ -258,6 +258,24 @@ class PlsqlApiInvocationHandlerTest {
          */
         @SqlQuery("select name from t where id in (:ids) and state in (:states)")
         List<String> names(List<Long> ids, java.util.Set<State> states);
+
+        /**
+         * Имена по массиву номеров.
+         *
+         * @param ids номера
+         * @return имена
+         */
+        @SqlQuery("select name from t where id in (:ids)")
+        List<String> byArray(long[] ids);
+
+        /**
+         * Имена по парам «номер, состояние».
+         *
+         * @param pairs пары
+         * @return имена
+         */
+        @SqlQuery("select name from t where (id, state) in (:pairs)")
+        List<String> byPairs(List<Object[]> pairs);
     }
 
     /** Срок меньше {@code -1} — ошибка в аннотации. */
@@ -952,5 +970,32 @@ class PlsqlApiInvocationHandlerTest {
         List<Long> many = java.util.stream.LongStream.rangeClosed(1, 1001).boxed().toList();
         assertThatThrownBy(() -> q.names(many, java.util.EnumSet.of(State.ACTIVE)))
                 .hasMessageContaining("1001 values").hasMessageContaining("ORA-01795");
+    }
+
+    /**
+     * Проверяет, что массив раскладывается в {@code IN} так же, как коллекция, а значения внутри
+     * пар {@code (a, b) IN ((?, ?))} готовятся так же, как одиночные ({@code enum} — своим именем).
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void inListsTakeArraysAndTuples() throws SQLException {
+        PreparedStatement ps = mock(PreparedStatement.class);
+        java.sql.ResultSet rs = mock(java.sql.ResultSet.class);
+        when(con.prepareStatement(anyString())).thenReturn(ps);
+        when(ps.execute()).thenReturn(true);
+        when(ps.getResultSet()).thenReturn(rs);
+        when(rs.getMetaData()).thenReturn(mock(java.sql.ResultSetMetaData.class));
+        InLists q = factory().create(InLists.class);
+
+        q.byArray(new long[]{4, 5});
+        verify(con).prepareStatement("select name from t where id in (?, ?)");
+        verify(ps).setObject(1, 4L);
+        verify(ps).setObject(2, 5L);
+
+        q.byPairs(List.<Object[]>of(new Object[]{7L, State.ACTIVE}));
+        verify(con).prepareStatement("select name from t where (id, state) in ((?, ?))");
+        verify(ps).setObject(1, 7L);
+        verify(ps).setString(2, "ACTIVE");
     }
 }

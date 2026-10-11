@@ -117,16 +117,113 @@ class IndexTablesIT {
         Order orderEcho(Order o);
     }
 
+    /**
+     * Элемент {@code WHEN_T}: дата со временем и число.
+     *
+     * @param d {@code DATE} со временем суток
+     * @param n число
+     */
+    record When(LocalDateTime d, Long n) {
+    }
+
+    /**
+     * Запись {@code HOLDER_T}, чьи поля — таблицы, которые драйвер передаёт сам.
+     *
+     * @param id    номер
+     * @param nums  таблица чисел
+     * @param names таблица строк
+     * @param days  таблица дат со временем
+     */
+    record Holder(Long id, List<Long> nums, List<String> names, List<LocalDateTime> days) {
+    }
+
+    /**
+     * Строка {@code LAB_EMP} — элемент таблицы {@code LAB_EMP%ROWTYPE}.
+     *
+     * @param id    номер
+     * @param name  имя
+     * @param hired дата приёма
+     * @param flag  признак
+     */
+    record Emp(Long id, String name, LocalDate hired, Long flag) {
+    }
+
+    /** Функции {@code LAB_TAB2}: пограничные случаи index-by таблиц. */
+    @PlsqlApi(packageName = "LAB_TAB2")
+    interface Edges {
+        /**
+         * Таблица дат: функция прибавляет час.
+         *
+         * @param vals даты со временем
+         * @return те же даты на час позже
+         */
+        List<LocalDateTime> later(List<LocalDateTime> vals);
+
+        /**
+         * Таблица записей с полем {@code DATE}: функция прибавляет к нему час.
+         *
+         * @param vals записи
+         * @return записи после функции
+         */
+        List<When> whens(List<When> vals);
+
+        /**
+         * Запись с таблицами чисел, строк и дат в полях: функция пишет в {@code id} число элементов
+         * {@code nums}, прибавляет к числам единицу, строки переводит в верхний регистр, к датам
+         * прибавляет час.
+         *
+         * @param h запись
+         * @return запись после функции
+         */
+        Holder holderEcho(Holder h);
+
+        /**
+         * Таблица записей с ключом {@code VARCHAR2}: ключи {@code k1..kN} функция заполняет в
+         * обратном порядке.
+         *
+         * @param n сколько элементов
+         * @return элементы в порядке ключей
+         */
+        List<When> named(long n);
+
+        /**
+         * Таблица записей с ключом {@code VARCHAR2} на входе.
+         *
+         * @param vals элементы
+         * @return первый ключ и число из его элемента через двоеточие
+         */
+        String namedFirst(List<When> vals);
+
+        /**
+         * Таблица {@code TIMESTAMP WITH LOCAL TIME ZONE}: функция прибавляет час.
+         *
+         * @param vals моменты
+         * @return моменты на час позже
+         */
+        List<Instant> ltz(List<Instant> vals);
+
+        /**
+         * Таблица {@code LAB_EMP%ROWTYPE}: все строки таблицы по порядку номеров.
+         *
+         * @return строки
+         */
+        List<Emp> emps();
+    }
+
     /** Пул к тестовой схеме. */
     static HikariDataSource ds;
     /** Реализация {@link Tables}. */
     static Tables tables;
+    /** Реализация {@link Edges}. */
+    static Edges edges;
 
     /** Создаёт пул и реализацию; при этом каждый метод сверяется со словарём. */
     @BeforeAll
     static void setUp() {
         ds = ItDatabase.pool(1, true);
-        tables = PlsqlApiFactory.builder(ds).build().create(Tables.class);
+        PlsqlApiFactory factory = PlsqlApiFactory.builder(ds).build();
+        tables = factory.create(Tables.class);
+        edges = factory.create(Edges.class);
     }
 
     /** Закрывает пул. */
@@ -187,5 +284,53 @@ class IndexTablesIT {
         Order back = tables.orderEcho(new Order(10L, List.of(line, line)));
         assertThat(back.id()).isEqualTo(12L);
         assertThat(back.lines()).containsExactly(line, line);
+    }
+
+    /**
+     * Проверяет, что дата в index-by таблице не теряет время суток: и в таблице, которую драйвер
+     * передаёт сам, и в поле таблицы записей.
+     */
+    @Test
+    void datesKeepTheTimeOfDay() {
+        assertThat(edges.later(Arrays.asList(LocalDateTime.of(2024, 1, 1, 10, 15, 30), null)))
+                .containsExactly(LocalDateTime.of(2024, 1, 1, 11, 15, 30), null);
+        assertThat(edges.whens(List.of(new When(LocalDateTime.of(2024, 3, 5, 23, 30), 1L))))
+                .containsExactly(new When(LocalDateTime.of(2024, 3, 6, 0, 30), 1L));
+    }
+
+    /** Проверяет таблицы чисел, строк и дат как поля записи, в обе стороны. */
+    @Test
+    void directTablesAsRecordFields() {
+        Holder back = edges.holderEcho(new Holder(0L, List.of(1L, 2L, 3L), List.of("a", "Пётр"),
+                List.of(LocalDateTime.of(2024, 1, 1, 8, 0))));
+        assertThat(back).isEqualTo(new Holder(3L, List.of(2L, 3L, 4L), List.of("A", "ПЁТР"),
+                List.of(LocalDateTime.of(2024, 1, 1, 9, 0))));
+        assertThat(edges.holderEcho(new Holder(5L, List.of(), List.of(), List.of())))
+                .isEqualTo(new Holder(0L, List.of(), List.of(), List.of()));
+    }
+
+    /**
+     * Проверяет таблицу записей с ключом {@code VARCHAR2}: на выходе элементы идут в порядке
+     * ключей, на входе ключи — номера элементов с единицы.
+     */
+    @Test
+    void varchar2KeyedTable() {
+        assertThat(edges.named(3)).extracting(When::n).containsExactly(1L, 2L, 3L);
+        assertThat(edges.namedFirst(List.of(new When(null, 7L), new When(null, 8L)))).isEqualTo("1:7");
+    }
+
+    /** Проверяет таблицу {@code TIMESTAMP WITH LOCAL TIME ZONE} в обе стороны. */
+    @Test
+    void localTimeZoneTable() {
+        assertThat(edges.ltz(Arrays.asList(Instant.parse("2024-06-01T12:00:00.123456Z"), null)))
+                .containsExactly(Instant.parse("2024-06-01T13:00:00.123456Z"), null);
+    }
+
+    /** Проверяет таблицу {@code %ROWTYPE}: её поля берутся из столбцов таблицы. */
+    @Test
+    void rowtypeTable() {
+        List<Emp> emps = edges.emps();
+        assertThat(emps).extracting(Emp::id).containsExactly(1L, 2L, 3L);
+        assertThat(emps.get(2)).isEqualTo(new Emp(3L, "Smith", LocalDate.of(2022, 3, 10), 1L));
     }
 }

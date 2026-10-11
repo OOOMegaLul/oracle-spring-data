@@ -208,6 +208,15 @@ class CallPlannerTest {
         String addReturningText(List<Row> rows);
 
         /**
+         * Пакет с общим {@code byte[]}: массив байтов — значение {@code BLOB}, а не список пакета.
+         *
+         * @param photo идёт в {@code BPHOTO} каждого вызова
+         * @param rows  строки пакета
+         */
+        @Procedure(value = "ADD", batch = true)
+        void addWithPhoto(byte[] photo, List<Row> rows);
+
+        /**
          * Перегруженная процедура {@code PKG.OVER(P_X, P_OUT OUT VARCHAR2)}, где {@code P_X} в одной
          * перегрузке {@code NUMBER}, в другой {@code VARCHAR2}; тип {@code long} выбирает первую.
          *
@@ -726,6 +735,8 @@ class CallPlannerTest {
                 .hasMessageContaining("needs a list or array parameter");
         assertThatThrownBy(() -> PLANNER.plan(m("addReturningText"), proc("PKG", "ADD").in("SNAME", "VARCHAR2").build()))
                 .hasMessageContaining("returns void or the number of calls");
+        assertThat(PLANNER.plan(m("addWithPhoto"), proc("PKG", "ADD").in("BPHOTO", "BLOB").in("SNAME", "VARCHAR2")
+                .build()).batchParameter()).isEqualTo(1);
     }
 
     /**

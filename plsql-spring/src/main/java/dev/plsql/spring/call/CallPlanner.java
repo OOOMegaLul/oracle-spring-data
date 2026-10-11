@@ -889,7 +889,8 @@ public class CallPlanner {
     }
 
     /**
-     * Находит параметр-список пакетного метода: единственный параметр-коллекцию или массив.
+     * Находит параметр-список пакетного метода: единственный параметр-коллекцию или массив
+     * ({@code byte[]} не в счёт: это одно значение {@code RAW} или {@code BLOB}).
      *
      * @param method метод с {@code @Procedure(batch = true)}
      * @return номер параметра
@@ -899,7 +900,8 @@ public class CallPlanner {
         int found = -1;
         Class<?>[] types = method.getParameterTypes();
         for (int i = 0; i < types.length; i++) {
-            if (Iterable.class.isAssignableFrom(types[i]) || types[i].isArray()) {
+            // byte[] — одно значение (RAW, BLOB), а не список пакета.
+            if (Iterable.class.isAssignableFrom(types[i]) || (types[i].isArray() && types[i] != byte[].class)) {
                 if (found >= 0) {
                     throw new PlanException("a batch method needs exactly one list or array parameter, it has several");
                 }

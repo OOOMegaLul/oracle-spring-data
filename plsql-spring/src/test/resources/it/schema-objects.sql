@@ -367,3 +367,70 @@ create or replace package body lab_tab as
   end;
 end lab_tab;
 /
+-- Edge cases of index-by tables: DATE with a time of day, tables the driver binds itself as record
+-- fields, a table of records keyed by VARCHAR2, TIMESTAMP WITH LOCAL TIME ZONE, a table of %ROWTYPE.
+create or replace package lab_tab2 as
+  type date_tab is table of date index by pls_integer;
+  type num_tab is table of number index by pls_integer;
+  type str_tab is table of varchar2(20) index by pls_integer;
+  type when_t is record (d date, n number);
+  type when_tab is table of when_t index by pls_integer;
+  type holder_t is record (id number, nums num_tab, names str_tab, days date_tab);
+  type named_tab is table of when_t index by varchar2(30);
+  type ltz_tab is table of timestamp with local time zone index by pls_integer;
+  type emp_tab is table of lab_emp%rowtype index by pls_integer;
+  function later(p_vals date_tab) return date_tab;
+  function whens(p_vals when_tab) return when_tab;
+  function holder_echo(p_h holder_t) return holder_t;
+  function named(p_n number) return named_tab;
+  function named_first(p_vals named_tab) return varchar2;
+  function ltz(p_vals ltz_tab) return ltz_tab;
+  function emps return emp_tab;
+end lab_tab2;
+/
+create or replace package body lab_tab2 as
+  function later(p_vals date_tab) return date_tab is
+    r date_tab;
+  begin
+    for i in 1..p_vals.count loop r(i) := p_vals(i) + 1/24; end loop;
+    return r;
+  end;
+  function whens(p_vals when_tab) return when_tab is
+    r when_tab := p_vals;
+  begin
+    for i in 1..r.count loop r(i).d := r(i).d + 1/24; end loop;
+    return r;
+  end;
+  function holder_echo(p_h holder_t) return holder_t is
+    r holder_t := p_h;
+  begin
+    r.id := r.nums.count;
+    for i in 1..r.nums.count loop r.nums(i) := r.nums(i) + 1; end loop;
+    for i in 1..r.names.count loop r.names(i) := upper(r.names(i)); end loop;
+    for i in 1..r.days.count loop r.days(i) := r.days(i) + 1/24; end loop;
+    return r;
+  end;
+  function named(p_n number) return named_tab is
+    r named_tab;
+  begin
+    for i in reverse 1..p_n loop r('k' || i).n := i; end loop;
+    return r;
+  end;
+  function named_first(p_vals named_tab) return varchar2 is
+  begin
+    return p_vals.first || ':' || p_vals(p_vals.first).n;
+  end;
+  function ltz(p_vals ltz_tab) return ltz_tab is
+    r ltz_tab;
+  begin
+    for i in 1..p_vals.count loop r(i) := p_vals(i) + interval '1' hour; end loop;
+    return r;
+  end;
+  function emps return emp_tab is
+    r emp_tab;
+  begin
+    select * bulk collect into r from lab_emp order by id;
+    return r;
+  end;
+end lab_tab2;
+/

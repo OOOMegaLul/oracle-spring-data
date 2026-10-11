@@ -37,6 +37,7 @@ import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.jdbc.datasource.SingleConnectionDataSource;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.ClassUtils;
+import org.springframework.util.ObjectUtils;
 
 import dev.plsql.spring.annotation.Arg;
 import dev.plsql.spring.annotation.PlsqlApi;
@@ -876,7 +877,8 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
      * останавливает вызов до отправки. {@code enum} передаётся своим именем. Параметры
      * {@code Pageable} и {@code Sort} пропускаются: они меняют сам текст запроса.
      *
-     * <p>Коллекция — список для {@code IN}: {@code where id in (:ids)} со списком из трёх чисел
+     * <p>Коллекция или массив (кроме {@code byte[]}: это одно значение {@code RAW}) — список для
+     * {@code IN}: {@code where id in (:ids)} со списком из трёх чисел
      * становится {@code where id in (?, ?, ?)}, и каждое число — отдельное значение. Spring
      * раскрывает в тексте только знаки {@code ?}, а сами значения оставляет одним списком; здесь
      * они раскладываются по одному. Пустой список и список длиннее 1000 элементов — ошибка до
@@ -919,22 +921,20 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
 
     /**
      * Готовит значение одного именованного параметра: строку проверяет на кодировку базы,
-     * {@code enum} заменяет его именем, у коллекции делает то же для каждого элемента.
+     * {@code enum} заменяет его именем, у коллекции делает то же для каждого элемента (и для
+     * каждого значения пары {@code (a, b) IN ((?, ?))}). Массив, кроме {@code byte[]}, становится
+     * списком: Spring раскрывает в {@code IN} только коллекции.
      *
      * @param name имя параметра для сообщений
      * @param v    значение аргумента
      * @return значение для подстановки
      * @throws CharsetGuard.UnrepresentableCharacterException если строку нельзя сохранить в
      *         кодировке базы
-     * @throws InvalidDataAccessApiUsageException если коллекция пустая или длиннее 1000
+     * @throws InvalidDataAccessApiUsageException если коллекция или массив пустые или длиннее 1000
      */
     private Object value(String name, Object v) {
-        if (v instanceof CharSequence s) {
-            rt.charsetGuard().check(name, s);
-            return v;
-        }
-        if (v instanceof Enum<?> e) {
-            return e.name();
+        if (v != null && v.getClass().isArray() && !(v instanceof byte[])) {
+            v = Arrays.asList(ObjectUtils.toObjectArray(v));
         }
         if (v instanceof Collection<?> c) {
             if (c.isEmpty()) {
@@ -947,11 +947,36 @@ public final class PlsqlApiInvocationHandler implements InvocationHandler {
             }
             List<Object> out = new ArrayList<>(c.size());
             for (Object e : c) {
-                out.add(value(name, e));
+                if (e instanceof Object[] tuple) {
+                    Object[] t = new Object[tuple.length];
+                    for (int i = 0; i < tuple.length; i++) {
+                        t[i] = single(name, tuple[i]);
+                    }
+                    out.add(t);
+                } else {
+                    out.add(single(name, e));
+                }
             }
             return out;
         }
-        return v;
+        return single(name, v);
+    }
+
+    /**
+     * Готовит одно значение: строку проверяет на кодировку базы, {@code enum} заменяет его именем.
+     *
+     * @param name имя параметра для сообщений
+     * @param v    значение
+     * @return значение для подстановки
+     * @throws CharsetGuard.UnrepresentableCharacterException если строку нельзя сохранить в
+     *         кодировке базы
+     */
+    private Object single(String name, Object v) {
+        if (v instanceof CharSequence s) {
+            rt.charsetGuard().check(name, s);
+            return v;
+        }
+        return v instanceof Enum<?> e ? e.name() : v;
     }
 
     /**

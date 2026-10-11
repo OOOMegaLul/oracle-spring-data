@@ -5,6 +5,7 @@ import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -277,9 +278,12 @@ final class TableSplit {
                 if (!withZone(field)) {
                     yield Values.toTimestamp(v).toLocalDateTime().format(TS);
                 }
+                // Момент времени (Instant, Timestamp) — сразу в UTC: через местное время JVM час
+                // перевода часов осенью неоднозначен, и момент сдвинулся бы на час.
                 OffsetDateTime odt = v instanceof OffsetDateTime o ? o
                         : v instanceof ZonedDateTime z ? z.toOffsetDateTime()
-                        : Values.toTimestamp(v).toLocalDateTime().atZone(ZoneId.systemDefault()).toOffsetDateTime();
+                        : v instanceof LocalDateTime l ? l.atZone(ZoneId.systemDefault()).toOffsetDateTime()
+                        : Values.toTimestamp(v).toInstant().atOffset(ZoneOffset.UTC);
                 yield odt.format(TSTZ);
             }
             case BOOLEAN -> {
