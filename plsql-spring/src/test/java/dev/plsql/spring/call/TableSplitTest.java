@@ -64,9 +64,12 @@ class TableSplitTest {
         List<java.util.Map<String, Object>> rows = List.of(java.util.Map.of("doc", "ab", "data", new byte[]{1}),
                 java.util.Map.of("doc", "", "data", new byte[]{2, 3}), new java.util.HashMap<>());
         assertThat(TableSplit.lengths(rows, leaves.get(0))).containsExactly(2, 0, null);
-        assertThat(TableSplit.content(rows, leaves.get(0))).isEqualTo("ab");
+        TableSplit.Glued glued = (TableSplit.Glued) TableSplit.content(rows, leaves.get(0), "T");
+        assertThat(glued.text()).isEqualTo("ab");
+        assertThat(glued.parts()).containsExactly("ab", "", null);
+        assertThat(glued.name(1)).isEqualTo("T[2].DOC");
         assertThat(TableSplit.lengths(rows, leaves.get(1))).containsExactly(1, 2, null);
-        assertThat((byte[]) TableSplit.content(rows, leaves.get(1))).containsExactly(1, 2, 3);
+        assertThat((byte[]) TableSplit.content(rows, leaves.get(1), "T")).containsExactly(1, 2, 3);
 
         java.util.Map<String, Object> outs = new java.util.HashMap<>();
         outs.put("T[].DOC" + TableSplit.LENGTHS, java.util.Arrays.asList(new java.math.BigDecimal(2), java.math.BigDecimal.ZERO, null));

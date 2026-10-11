@@ -131,11 +131,12 @@ class LobTablesIT {
     /**
      * Проверяет таблицу записей с LOB в обе стороны: каждое поле доходит до PL/SQL и обратно,
      * пустой {@code CLOB} — не {@code NULL} (функция дописала к нему {@code "!"}), национальный
-     * текст не теряет ни одного символа.
+     * текст не теряет ни одного символа. В {@code CLOB} — только кириллица: он хранится в
+     * основной кодировке базы, а она бывает однобайтовой (CL8MSWIN1251).
      */
     @Test
     void lobFieldsTravelBothWays() {
-        String big = "\u0436".repeat(20_000) + TEXT;
+        String big = "\u0436".repeat(20_000) + "\u0416 end";
         byte[] bytes = new byte[70_000];
         Arrays.fill(bytes, (byte) 7);
         List<Doc> back = lobs.docsEcho(List.of(

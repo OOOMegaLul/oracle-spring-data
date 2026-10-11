@@ -476,8 +476,9 @@ public class CallPlanner {
             String type = TableSplit.lobType(leaf.field());
             String content = b.variable(type);
             ArgumentInfo lob = TableSplit.contentArg(table, leaf);
+            String name = table.name() == null ? "RETURN" : table.name();
             b.pre(content + " := ", new CallPlan.Bind(lob.kind(), lob,
-                    args -> TableSplit.content(in.apply(args), leaf), null, null), ";");
+                    args -> TableSplit.content(in.apply(args), leaf, name), null, null), ";");
             String pos = b.variable("PLS_INTEGER");
             b.pre(pos + " := 1;");
             lobs.add(new String[]{content, pos, TableSplit.needsScratch(leaf.field()) ? b.variable(type) : null});

@@ -369,15 +369,53 @@ final class TableSplit {
     }
 
     /**
-     * Склеивает значения поля всех элементов в одно (входная таблица): текст — в строку
+     * Текст поля всех элементов, который едет одним LOB, вместе со значениями по элементам: по
+     * ним исполнитель проверяет кодировку базы и называет в ошибке элемент
+     * ({@code P_DOCS[2].BODY}) и позицию внутри его значения, а не в склейке.
+     *
+     * @param table имя таблицы для сообщений
+     * @param field путь к полю ({@code .BODY}) или пустая строка
+     * @param parts значения по элементам; {@code null} — значение {@code NULL}
+     */
+    record Glued(String table, String field, List<String> parts) {
+
+        /**
+         * Склеивает значения, пропуская {@code null}.
+         *
+         * @return склеенный текст
+         */
+        String text() {
+            StringBuilder sb = new StringBuilder();
+            parts.forEach(p -> {
+                if (p != null) {
+                    sb.append(p);
+                }
+            });
+            return sb.toString();
+        }
+
+        /**
+         * Возвращает имя значения одного элемента для сообщений.
+         *
+         * @param i номер элемента с нуля
+         * @return имя вида {@code P_DOCS[2].BODY}
+         */
+        String name(int i) {
+            return table + "[" + (i + 1) + "]" + field;
+        }
+    }
+
+    /**
+     * Склеивает значения поля всех элементов в одно (входная таблица): текст — в {@link Glued}
      * ({@code XML} — своим текстом), байты — в массив; {@code null} пропускается.
      *
-     * @param list список (или массив) элементов; {@code null} — пустая таблица
-     * @param leaf поле, которое едет склеенным LOB
-     * @return строка или массив байтов
+     * @param list  список (или массив) элементов; {@code null} — пустая таблица
+     * @param leaf  поле, которое едет склеенным LOB
+     * @param table имя таблицы для сообщений
+     * @return {@link Glued} или массив байтов
      * @throws IllegalArgumentException если значение для {@code BLOB} или {@code RAW} не массив байтов
      */
-    static Object content(Object list, Leaf leaf) {
+    static Object content(Object list, Leaf leaf, String table) {
         if (leaf.transport() == ArgKind.BLOB) {
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             for (Object v : fieldValues(list, leaf)) {
@@ -387,13 +425,11 @@ final class TableSplit {
             }
             return out.toByteArray();
         }
-        StringBuilder sb = new StringBuilder();
+        List<String> parts = new ArrayList<>();
         for (Object v : fieldValues(list, leaf)) {
-            if (v != null) {
-                sb.append(Values.toText(v));
-            }
+            parts.add(v == null ? null : Values.toText(v));
         }
-        return sb.toString();
+        return new Glued(table, leaf.suffix(), parts);
     }
 
     /**

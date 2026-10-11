@@ -247,7 +247,7 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 Выпуск версии: тег `vX.Y.Z` (совпадающий с версией в `pom.xml`) запускает workflow
 `release`, который собирает jar, исходники и javadoc и выкладывает их в Releases.
 
-Юнит-тесты (180, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
+Юнит-тесты (181, база не нужна): планировщик, исполнитель на моках JDBC, прокси,
 сессия, автоконфигурация, `@EnablePlsqlApis`, разбор исходника, преобразования. CI гоняет их
 ещё и на Spring Boot 3.5 (Spring 6.2): `./mvnw test -Dspring-boot.version=3.5.6`.
 
@@ -265,8 +265,8 @@ ds.setInitSql("begin apex_application.g_user := ?; end;", currentUser::get);
 - Windows + Docker Desktop: добавьте `-Dplsql.it.port=1541` и `TESTCONTAINERS_RYUK_DISABLED=true`,
   там случайные порты контейнеров бывают недоступны.
 
-Проверено на Oracle 11.2.0.4 EE в CL8MSWIN1251, Oracle XE 11.2.0.2 и XE 21c, Oracle Free 23ai в
-AL32UTF8.
+Проверено на Oracle 11.2.0.4 и 11.2.0.2 EE в CL8MSWIN1251, Oracle XE 11.2.0.2 и XE 21c, Oracle Free
+23ai в AL32UTF8.
 
 ## Лицензия
 

@@ -543,8 +543,7 @@ public class CallExecutor {
                 if (v == null) {
                     cs.setNull(idx, national ? Types.NCLOB : Types.CLOB);
                 } else {
-                    String s = Values.toText(v);
-                    guard(b.arg(), s);
+                    String s = checkedText(b, v);
                     Clob c = national ? oc.createNClob() : oc.createClob();
                     temporaries.add(c);
                     c.setString(1, s);
@@ -649,6 +648,30 @@ public class CallExecutor {
     }
 
     /**
+     * Возвращает текст для {@code CLOB}, проверенный на кодировку базы. Склеенный текст поля
+     * index-by таблицы ({@link TableSplit.Glued}) проверяется по значениям элементов, чтобы ошибка
+     * называла элемент и позицию в его значении.
+     *
+     * @param b позиция плана
+     * @param v значение: текст, XML или {@link TableSplit.Glued}
+     * @return текст
+     * @throws CharsetGuard.UnrepresentableCharacterException если текст нельзя сохранить
+     */
+    private String checkedText(CallPlan.Bind b, Object v) {
+        if (!(v instanceof TableSplit.Glued g)) {
+            String s = Values.toText(v);
+            guard(b.arg(), s);
+            return s;
+        }
+        if (!isNational(b.arg())) {
+            for (int i = 0; i < g.parts().size(); i++) {
+                charsetGuard.check(g.name(i), g.parts().get(i));
+            }
+        }
+        return g.text();
+    }
+
+    /**
      * Проверяет, хранится ли текст этого типа в национальном наборе символов базы
      * ({@code NVARCHAR2}, {@code NCHAR}, {@code NCLOB}), а не в основном.
      *
@@ -675,7 +698,8 @@ public class CallExecutor {
             return;
         }
         switch (b.kind()) {
-            case STRING, CLOB -> guard(b.arg(), Values.toText(v));
+            case STRING -> guard(b.arg(), Values.toText(v));
+            case CLOB -> checkedText(b, v);
             case INDEX_TABLE -> elements(v, b.arg().children().get(0), b.arg());
             default -> {
             }

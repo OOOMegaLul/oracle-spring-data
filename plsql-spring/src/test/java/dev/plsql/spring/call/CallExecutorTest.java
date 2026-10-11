@@ -592,4 +592,24 @@ class CallExecutorTest {
         when(cs.getString(2)).thenReturn("  " + " ".repeat(16_381));
         assertThat(new CallExecutor(100).execute(con, n, new Object[]{"x"})).isEqualTo("");
     }
+
+    /**
+     * Проверяет, что текст поля, которое едет склеенным LOB, проверяется на кодировку базы по
+     * значениям: ошибка называет элемент ({@code P_VALS[2]}) и позицию внутри его значения, а не
+     * внутреннее имя склейки и позицию в ней. Вызов останавливается до отправки.
+     *
+     * @throws SQLException формально: так объявлены методы JDBC, которые настраиваются на моках
+     */
+    @Test
+    void gluedTextIsCheckedValueByValue() throws SQLException {
+        OracleCallableStatement ocs = mock(OracleCallableStatement.class);
+        when(cs.unwrap(OracleCallableStatement.class)).thenReturn(ocs);
+        CallExecutor strict = new CallExecutor(100, CharsetGuard.forDatabase("CL8MSWIN1251", CharsetGuard.Policy.FAIL));
+        CallPlan in = planner.plan(m("texts"), func("PKG", "TEXTS", "NUMBER").add(indexTable("P_VALS", "IN", "CLOB")).build());
+
+        assertThatThrownBy(() -> strict.execute(con, in, new Object[]{List.of("\u0436\u0436", "x\u4e2d")}))
+                .isInstanceOf(CharsetGuard.UnrepresentableCharacterException.class)
+                .hasMessageStartingWith("P_VALS[2]: character '\u4e2d' (U+4E2D) at position 2 ");
+        verify(cs, never()).execute();
+    }
 }
