@@ -434,3 +434,37 @@ create or replace package body lab_tab2 as
   end;
 end lab_tab2;
 /
+-- SQL collections and SQL object types as record fields.
+create or replace package lab_bag as
+  type bag_t is record (id number, nums lab_num_tab, objs lab_obj_tab, one lab_obj);
+  function bag_echo(p_b bag_t) return bag_t;
+  procedure bag_fill(p_n number, p_b out bag_t);
+end lab_bag;
+/
+create or replace package body lab_bag as
+  function bag_echo(p_b bag_t) return bag_t is
+    r bag_t := p_b;
+  begin
+    r.id := case when r.nums is null then -1 else r.nums.count end;
+    if r.nums is not null then
+      for i in 1..r.nums.count loop r.nums(i) := r.nums(i) + 1; end loop;
+    end if;
+    if r.objs is not null then
+      for i in 1..r.objs.count loop r.objs(i).name := upper(r.objs(i).name); end loop;
+    end if;
+    if r.one is not null then r.one.id := r.one.id + 1; end if;
+    return r;
+  end;
+  procedure bag_fill(p_n number, p_b out bag_t) is
+  begin
+    p_b.id := p_n;
+    p_b.nums := lab_num_tab();
+    p_b.objs := lab_obj_tab();
+    for i in 1..p_n loop
+      p_b.nums.extend; p_b.nums(i) := i * 10;
+      p_b.objs.extend; p_b.objs(i) := lab_obj(i, 'obj ' || i, date '2024-01-01' + i);
+    end loop;
+    p_b.one := lab_obj(0, 'one', null);
+  end;
+end lab_bag;
+/

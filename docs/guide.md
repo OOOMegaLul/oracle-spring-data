@@ -405,7 +405,8 @@ try (Stream<Employee> s = hr.activeStream()) {
 | `SYS_REFCURSOR` | `List<record>` | колонки по именам; неоткрытый курсор — пустой список |
 | объектный тип SQL (`CREATE TYPE ... AS OBJECT`) | record, бин, `Map` | |
 | коллекция SQL (`TABLE OF`, `VARRAY`) | `List`, массив | |
-| index-by таблица `NUMBER`/`VARCHAR2` | `List`, массив | см. ниже про память |
+| index-by таблица `NUMBER`/`VARCHAR2`/`DATE` | `List`, массив | см. ниже про память |
+| index-by таблица записей, `TIMESTAMP`, `BOOLEAN` | `List<record>`, `List` | по полям, см. ниже |
 
 **Записи и курсоры по именам.** Поле `FULL_NAME` ложится в компонент `fullName`, колонка
 `SNAME` — в `name` (типовой префикс снимается), а `@Arg("D_START")` на компоненте задаёт имя
@@ -429,6 +430,17 @@ Person savePerson(Person p);
 
 При старте проверяется и вложенный record: если в `Addr` нет поля для `VERIFIED`, ошибка
 назовёт путь `ADDR.VERIFIED`.
+
+Полем записи может быть и коллекция или объект SQL (`CREATE TYPE ... AS TABLE OF`,
+`... AS OBJECT`), и index-by таблица: в Java это `List` и record.
+
+```sql
+type order_t is record (id number, tags tag_list, buyer person_obj);   -- tag_list, person_obj: CREATE TYPE
+```
+
+```java
+record Order(Long id, List<String> tags, PersonObj buyer) {}
+```
 
 **Выходные index-by таблицы строк и память.** Драйвер Oracle заранее резервирует память под
 `plsql.index-table-max-length` элементов (по умолчанию 10 000) по объявленной длине каждый —
@@ -861,8 +873,6 @@ com.example.hr.HrApi does not match the database:
 
 Такие подпрограммы останавливают старт с понятной причиной (`not callable: ...`):
 
-- **Коллекция SQL как поле записи** (`lines line_list`, где `line_list` создан через
-  `CREATE TYPE`). Index-by таблица в поле записи поддерживается.
 - **Поля `CLOB`, `BLOB`, `XMLTYPE` и национальные строки (`NVARCHAR2`) внутри index-by таблицы
   записей.**
 - **Курсор на вход** (`p_cur IN SYS_REFCURSOR`): открытый курсор из Java не передать.

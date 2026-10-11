@@ -499,6 +499,57 @@ class CallPlannerTest {
          * @param p человек
          */
         void shortPerson(ShortPerson p);
+
+        /**
+         * Объект {@code APP.OBJ_T} с одним атрибутом.
+         *
+         * @param id номер
+         */
+        record Item(Long id) {
+        }
+
+        /**
+         * Запись с коллекцией SQL и объектом SQL в полях.
+         *
+         * @param id   номер
+         * @param nums коллекция {@code APP.NUM_LIST}
+         * @param one  объект {@code APP.OBJ_T}
+         */
+        record Bag(Long id, List<Long> nums, Item one) {
+        }
+
+        /**
+         * Запись с полями SQL-типов туда и обратно.
+         *
+         * @param b запись
+         * @return запись после процедуры
+         */
+        Bag bag(Bag b);
+
+        /**
+         * Объект без атрибута {@code ID}.
+         *
+         * @param name имя
+         */
+        record NoId(String name) {
+        }
+
+        /**
+         * Запись, у поля-объекта которой в Java не хватает атрибута.
+         *
+         * @param id   номер
+         * @param nums коллекция
+         * @param one  объект без {@code ID}
+         */
+        record ShortBag(Long id, List<Long> nums, NoId one) {
+        }
+
+        /**
+         * Запись, у поля-объекта которой в Java не хватает атрибута.
+         *
+         * @param b запись
+         */
+        void shortBag(ShortBag b);
     }
 
     /**
@@ -1110,5 +1161,44 @@ class CallPlannerTest {
         assertThat(p.binds()).extracting(CallPlan.Bind::outKey).contains(CallPlanner.RETURN_KEY + "[].ID",
                 CallPlanner.RETURN_KEY + "[].OK");
         assertThat(p.tableOuts()).containsExactly(CallPlanner.RETURN_KEY);
+    }
+
+    /**
+     * Строит запись {@code BAG_T} с полями {@code NUMS} (коллекция SQL {@code APP.NUM_LIST}) и
+     * {@code ONE} (объект {@code APP.OBJ_T}).
+     *
+     * @param one тип атрибута {@code ID} объекта
+     * @return описание аргумента {@code P_B IN OUT}
+     */
+    static ArgumentInfo bagArg(String one) {
+        ArgumentInfo nums = new ArgumentInfo("NUMS", 2, 1, "TABLE", null, "IN/OUT", false, "APP", "NUM_LIST", null,
+                List.of(new ArgumentInfo(null, 1, 2, "NUMBER", null, "IN/OUT", false, null, null, null, List.of(), null)),
+                null);
+        ArgumentInfo obj = new ArgumentInfo("ONE", 3, 1, "OBJECT", null, "IN/OUT", false, "APP", "OBJ_T", null,
+                List.of(new ArgumentInfo("ID", 1, 2, one, null, "IN/OUT", false, null, null, null, List.of(), null)), null);
+        return record("P_B", "IN/OUT", "PKG", "BAG_T", field("ID", "NUMBER"), nums, obj);
+    }
+
+    /**
+     * Проверяет коллекцию SQL и объект SQL как поля записи: каждое привязывается целиком в обе
+     * стороны; объект с атрибутом, который внутри {@code Struct} не передать, называется при
+     * старте; у Java-объекта поля должен быть каждый атрибут.
+     */
+    @Test
+    void sqlTypesAsRecordFieldsBindWhole() {
+        CallPlan p = PLANNER.plan(m("bag"), proc("PKG", "BAG").add(bagArg("NUMBER")).build());
+
+        assertThat(p.sql()).contains("v1.NUMS := ?;").contains("v1.ONE := ?;")
+                .contains("? := v1.NUMS;").contains("? := v1.ONE;");
+        assertThat(p.binds()).filteredOn(b -> b.in() != null).extracting(CallPlan.Bind::kind)
+                .containsExactly(ArgKind.NUMBER, ArgKind.SQL_COLLECTION, ArgKind.OBJECT);
+        Object[] args = {new Api.Bag(1L, List.of(5L), new Api.Item(7L))};
+        assertThat(p.binds()).filteredOn(b -> b.in() != null).extracting(b -> b.in().apply(args))
+                .containsExactly(1L, List.of(5L), new Api.Item(7L));
+
+        assertThat(CallPlanner.supportIssues(proc("PKG", "BAG").add(bagArg("OPAQUE/XMLTYPE")).build()))
+                .singleElement().asString().isEqualTo("P_B: record field ONE is OBJECT");
+        assertThatThrownBy(() -> PLANNER.plan(m("shortBag"), proc("PKG", "BAG").add(bagArg("NUMBER")).build()))
+                .hasMessageContaining("has no property for [ONE.ID] of P_B");
     }
 }

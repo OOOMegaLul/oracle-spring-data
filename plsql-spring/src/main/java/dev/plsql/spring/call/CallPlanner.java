@@ -659,8 +659,11 @@ public class CallPlanner {
      *
      * <p>Поддержаны скаляры, BOOLEAN, XMLTYPE и вложенные записи (в том числе {@code %ROWTYPE}),
      * если их поля тоже поддержаны, на любую глубину: блок обращается к ним по пути
-     * {@code v1.ADDR.CITY}, а тип вложенной записи объявлять не нужно. Коллекции, объектные типы и
-     * курсоры в полях — нет.
+     * {@code v1.ADDR.CITY}, а тип вложенной записи объявлять не нужно. Index-by таблица в поле —
+     * если её можно передать напрямую или разложить по полям. Коллекция SQL и объектный тип SQL в
+     * поле привязываются целиком ({@code Array}, {@code Struct}), как аргумент такого типа, —
+     * если их атрибуты и элементы передаются внутри {@code Struct}/{@code Array}. Курсоры в полях
+     * не поддержаны.
      *
      * @param f поле записи
      * @return {@code true}, если поле поддержано
@@ -673,6 +676,11 @@ public class CallPlanner {
             // Таблица в поле записи: напрямую или по полям, но без таблиц внутри её элементов.
             return !f.children().isEmpty() && (TableSplit.direct(f.children().get(0))
                     || TableSplit.splitIssue(f.children().get(0)) == null);
+        }
+        if (f.kind() == ArgKind.SQL_COLLECTION || f.kind() == ArgKind.OBJECT) {
+            List<String> issues = new ArrayList<>();
+            sqlTypeIssues(f.name(), f, issues);
+            return f.typeName() != null && issues.isEmpty();
         }
         return f.kind().isScalar() || f.kind() == ArgKind.BOOLEAN || f.kind() == ArgKind.XMLTYPE;
     }
@@ -700,15 +708,16 @@ public class CallPlanner {
      *
      * @param rec запись, которой принадлежит поле
      * @param f   поле записи
-     * @throws PlanException если поле (или поле вложенной записи) не скаляр, не BOOLEAN, не
-     *                       XMLTYPE и не запись из них
+     * @throws PlanException если поле (или поле вложенной записи) нельзя передать: см.
+     *                       {@link #fieldSupported}
      */
     private static void checkField(ArgumentInfo rec, ArgumentInfo f) {
         if (!fieldSupported(f)) {
             List<String> bad = new ArrayList<>();
             unsupportedFields(rec, "", bad);
             throw new PlanException("record " + rec.name() + " field " + String.join(", ", bad)
-                    + "; supported are scalar, BOOLEAN, XMLTYPE fields, records of them and index-by tables");
+                    + "; supported are scalar, BOOLEAN, XMLTYPE fields, SQL collections and object types,"
+                    + " records of them and index-by tables");
         }
     }
 
@@ -743,7 +752,7 @@ public class CallPlanner {
      * <p>Проверяются аргументы и возвращаемое значение функции:
      * <ul>
      *   <li>запись с неизвестным именем типа или с полями неподдерживаемых типов;</li>
-     *   <li>index-by таблица с элементами не {@code NUMBER} и не {@code VARCHAR2};</li>
+     *   <li>index-by таблица, которую нельзя ни передать напрямую, ни разложить по полям;</li>
      *   <li>тип, который библиотека не знает вовсе (например, {@code OPAQUE/ANYDATA});</li>
      *   <li>REF CURSOR только на вход: открытый курсор нельзя передать из Java;</li>
      *   <li>атрибут объектного типа SQL или элемент коллекции SQL, который через JDBC внутри
@@ -1067,8 +1076,9 @@ public class CallPlanner {
             ResolvableType type = Values.propertyType(raw, f.name());
             if (type == null) {
                 missing.add(f.name());
-            } else if (f.kind() == ArgKind.RECORD || f.kind() == ArgKind.OBJECT) {
-                // Вложенная запись или объект: те же правила для типа свойства.
+            } else if (f.kind() == ArgKind.RECORD || f.kind() == ArgKind.OBJECT || f.kind() == ArgKind.SQL_COLLECTION
+                    || f.kind() == ArgKind.INDEX_TABLE) {
+                // Вложенная запись, объект или коллекция: те же правила для типа свойства.
                 missingProperties(f, type).forEach(m -> missing.add(f.name() + "." + m));
             }
         }
