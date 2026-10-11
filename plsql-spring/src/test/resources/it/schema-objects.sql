@@ -467,6 +467,7 @@ create or replace package body lab_bag as
     p_b.one := lab_obj(0, 'one', null);
   end;
 end lab_bag;
+/
 -- National character types: NVARCHAR2, NCHAR, NCLOB, a record with an NVARCHAR2 field. Each echo
 -- appends U+4E2D, which is outside single-byte character sets.
 create or replace package lab_nchar as
