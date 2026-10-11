@@ -27,8 +27,10 @@ class DictionaryProbeIT {
         StringBuilder out = new StringBuilder();
         try (Connection c = DriverManager.getConnection(ItDatabase.url(), ItDatabase.USER, ItDatabase.PASSWORD)) {
             query(c, out, "select version from product_component_version where product like 'Oracle%' and rownum = 1");
-            query(c, out, "select object_name n, data_type t, pls_type p from user_arguments where package_name = 'LAB_PKG'"
-                    + " and object_name in ('ECHO_BOOL', 'NOOP')");
+            query(c, out, "select object_name n, argument_name a, position po, data_level l, data_type t, pls_type p,"
+                    + " type_owner o, type_name tn, type_subname ts, type_link tl, type_object_type tt"
+                    + " from user_arguments where package_name = 'LAB_PKG'"
+                    + " and object_name in ('EMP_BRIEF', 'EMP_ROW_SYN', 'EMP_ROW') order by object_name, sequence");
             query(c, out, "select procedure_name n, subprogram_id s, overload o from user_procedures"
                     + " where object_name = 'LAB_PKG' and procedure_name in ('NOOP', 'OVER', 'ECHO_BOOL')");
             query(c, out, "select package_name p, type_name t, typecode c from user_plsql_types"
